@@ -1,0 +1,6 @@
+/build/
+/target/
+/.work/
+__pycache__/
+*.pyc
+.ruff_cache/
