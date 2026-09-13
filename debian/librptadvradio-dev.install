@@ -1,0 +1,3 @@
+usr/include/rptadvradio/rptadvradio.h
+usr/lib/*/librptadvradio.so
+usr/lib/*/pkgconfig/rptadvradio.pc
