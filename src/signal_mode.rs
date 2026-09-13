@@ -236,6 +236,7 @@ pub(crate) extern "C" fn radio_signal_mode_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         CTCSS_NONE, MODE_CTCSS, MODE_DCS, MODE_NONE, SignalModeConfig, SignalModeInput,

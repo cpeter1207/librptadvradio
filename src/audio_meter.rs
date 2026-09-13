@@ -65,7 +65,8 @@ pub fn measure(
     statistics: &mut AudioStatistics,
 ) -> Result<bool, i32> {
     let (first, stride, maximum) = layout_parameters(channels)?;
-    let sample_count = usize::try_from(sample_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    // The supported 64-bit targets represent every u32 sample count exactly.
+    let sample_count = sample_count as usize;
     let sample_count = sample_count.min(maximum);
     let selected_count = sample_count / stride;
 

@@ -163,6 +163,7 @@ pub(crate) extern "C" fn radio_dcs_turnoff_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         DcsTurnoffConfig, DcsTurnoffInput, DcsTurnoffState, STATE_ACTIVE, STATE_TOC,

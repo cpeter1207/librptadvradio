@@ -100,7 +100,7 @@ pub(crate) unsafe fn process_with_trace(
         decay_factor,
         state,
     } = request;
-    let sample_count = usize::try_from(sample_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    let sample_count = sample_count as usize;
     if sample_count != 0
         && (input.is_null() || centered_output.is_null() || limited_output.is_null())
     {
@@ -195,7 +195,65 @@ pub(crate) unsafe fn process_with_trace(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
+    #[test]
+    fn trace_validation_and_alternating_extrema_remain_bounded() {
+        let input = [0.0_f32; 16];
+        let mut centered = [9.0; 16];
+        let mut limited = [9.0; 16];
+        let mut state = super::State::default();
+        let mut phase = 0;
+        let request = super::Request {
+            input: input.as_ptr(),
+            centered_output: centered.as_mut_ptr(),
+            limited_output: limited.as_mut_ptr(),
+            sample_count: 16,
+            limit: 10,
+            setpoint: 10,
+            decay_factor: 1,
+            state: &mut state,
+        };
+        assert_eq!(
+            unsafe {
+                super::process_with_trace(
+                    request,
+                    Some(super::Trace {
+                        output: core::ptr::null_mut(),
+                        phase: &mut phase,
+                    }),
+                )
+            },
+            Err(crate::RADIO_INVALID_ARGUMENT)
+        );
+        assert_eq!(centered, [9.0; 16]);
+        let mut trace = [9.0; 16];
+        let request = super::Request {
+            input: input.as_ptr(),
+            centered_output: centered.as_mut_ptr(),
+            limited_output: limited.as_mut_ptr(),
+            sample_count: 16,
+            limit: 10,
+            setpoint: 10,
+            decay_factor: 1,
+            state: &mut state,
+        };
+        assert_eq!(
+            unsafe {
+                super::process_with_trace(
+                    request,
+                    Some(super::Trace {
+                        output: trace.as_mut_ptr(),
+                        phase: &mut phase,
+                    }),
+                )
+            },
+            Ok(())
+        );
+        assert_eq!(phase, 16);
+        assert_eq!(trace, [0.0; 16]);
+        assert_eq!(centered, [0.0; 16]);
+    }
     use super::{Request, State, process};
 
     fn samples(codes: &[i16]) -> Vec<f32> {

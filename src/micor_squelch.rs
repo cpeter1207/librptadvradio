@@ -95,6 +95,7 @@ pub fn update(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{SETTLE_SAMPLES, State, update};
 

@@ -103,6 +103,7 @@ pub(crate) extern "C" fn radio_rx_cpu_saver_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         ACTION_ENTER, ACTION_LEAVE, ACTION_NONE, RxCpuSaverInput, RxCpuSaverState,

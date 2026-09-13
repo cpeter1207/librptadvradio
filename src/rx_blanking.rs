@@ -92,6 +92,7 @@ pub(crate) extern "C" fn radio_rx_blanking_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{RxBlankingInput, RxBlankingState, radio_rx_blanking_advance};
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};

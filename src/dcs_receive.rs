@@ -137,6 +137,7 @@ impl ReceiveState {
 
     /// Return whether the 134.4 Hz turn-off detector is currently coherent.
     #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub(crate) fn turnoff_active(&self) -> bool {
         self.turnoff_active
     }
@@ -307,6 +308,7 @@ fn process_received_symbol(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
 

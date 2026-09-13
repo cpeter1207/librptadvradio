@@ -64,7 +64,7 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
         output_gain,
         state,
     } = request;
-    let sample_count = usize::try_from(sample_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    let sample_count = sample_count as usize;
     if sample_count != 0 && (input.is_null() || output.is_null()) {
         return Err(RADIO_INVALID_ARGUMENT);
     }
@@ -96,6 +96,7 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Request, State, process};
 

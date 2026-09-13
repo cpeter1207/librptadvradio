@@ -116,6 +116,7 @@ impl ReceiveState {
 
     /// Set one detector to a deterministic focused-test configuration.
     #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub(crate) fn test_prepare_detector(&mut self, tone_index: usize) {
         let detector = &mut self.detectors[tone_index];
 
@@ -132,6 +133,7 @@ impl ReceiveState {
 
     /// Change deterministic test detector thresholds without exposing state.
     #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub(crate) fn test_set_detector_release(&mut self, tone_index: usize) {
         let detector = &mut self.detectors[tone_index];
 
@@ -143,12 +145,14 @@ impl ReceiveState {
 
     /// Read a focused-test release blanking count.
     #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub(crate) fn test_blanking_samples(&self) -> i32 {
         self.blanking_samples
     }
 
     /// Read one focused-test detector qualification counter.
     #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub(crate) fn test_detector_decode(&self, tone_index: usize) -> i16 {
         self.detectors[tone_index].decode
     }
@@ -326,8 +330,51 @@ impl ReceiveState {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaxed_release_and_saturated_decode_preserve_correlator_rules() {
+        let mut detector = Detector {
+            fudge_factor: 1,
+            decode: 32,
+            set_point: -100,
+            ..Detector::default()
+        };
+        assert!(ReceiveState::process_sample(
+            &mut detector,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(detector.decode, 32);
+        detector.set_point = 1000;
+        detector.hysteresis = 1000;
+        detector.decode = 10;
+        assert!(ReceiveState::process_sample(
+            &mut detector,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(detector.decode, 9);
+    }
+
+    #[test]
+    fn disabled_and_multitone_probe_and_expired_blanking_are_deterministic() {
+        let mut state = ReceiveState::default();
+        assert_eq!(unsafe { state.process(core::ptr::null(), 0, true) }, -1);
+        state.configure(3, false);
+        state.test_prepare_detector(0);
+        state.detectors[0].set_point = -100;
+        state.decoded = 0;
+        state.blanking_samples = 1;
+        assert_eq!(unsafe { state.process([0.0; 2].as_ptr(), 2, true) }, 0);
+        assert_eq!(state.blanking_samples, 0);
+    }
 
     /// Prime one selected production-divider detector without changing its clock.
     fn activate_selected_detector(state: &mut ReceiveState, tone_index: usize) {

@@ -289,6 +289,7 @@ pub fn advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         CarrierSource, Config, Inputs, MAX_TX_OFF_DELAY_FRAMES, Output,

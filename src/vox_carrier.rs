@@ -88,6 +88,7 @@ pub(crate) extern "C" fn radio_vox_carrier_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{VoxCarrierInput, VoxCarrierState, radio_vox_carrier_advance};
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};

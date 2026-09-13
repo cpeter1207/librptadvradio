@@ -576,13 +576,9 @@ fn duration_frames(milliseconds: i32) -> Result<u32, Error> {
     if milliseconds < 0 {
         return Err(Error::InvalidConfigurationOrState);
     }
-    u32::try_from(
-        u64::try_from(milliseconds)
-            .map_err(|_| Error::InvalidConfigurationOrState)?
-            .checked_mul(u64::from(timer::FRAMES_PER_MILLISECOND))
-            .ok_or(Error::InvalidConfigurationOrState)?,
-    )
-    .map_err(|_| Error::InvalidConfigurationOrState)
+    // A nonnegative i32 multiplied by 48 is always representable in u64.
+    u32::try_from(milliseconds as u64 * u64::from(timer::FRAMES_PER_MILLISECOND))
+        .map_err(|_| Error::InvalidConfigurationOrState)
 }
 
 /// Report an exact native-frame countdown through the retained millisecond API.
@@ -952,7 +948,189 @@ fn output_from_state(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
+    #[test]
+    fn timeline_capacity_overflow_and_every_intent_field_are_preserved() {
+        use super::{MAX_RENDER_SPANS, RenderSpan, RenderTimeline};
+        let mut timeline = RenderTimeline::default();
+        let initial = RenderSpan::default();
+        assert_eq!(timeline.append(0, initial), Ok(()));
+        assert_eq!(timeline.count, 0);
+        assert_eq!(timeline.append(1, initial), Ok(()));
+        assert_eq!(timeline.append(1, initial), Ok(()));
+        assert_eq!(timeline.spans[0].frame_count, 2);
+        let mut changed = initial;
+        changed.ctcss_frequency_tenths_hz = 1000;
+        assert_eq!(timeline.append(1, changed), Ok(()));
+        assert_eq!(timeline.count, 2);
+        changed.dcs_turnoff_active = true;
+        assert_eq!(timeline.append(1, changed), Ok(()));
+        assert_eq!(timeline.count, 3);
+        while timeline.count < MAX_RENDER_SPANS {
+            changed.logical_ptt = !changed.logical_ptt;
+            assert_eq!(timeline.append(1, changed), Ok(()));
+        }
+        changed.logical_ptt = !changed.logical_ptt;
+        assert_eq!(
+            timeline.append(1, changed),
+            Err(Error::InvalidConfigurationOrState)
+        );
+        let mut overflow = RenderTimeline::default();
+        assert_eq!(overflow.append(u32::MAX, initial), Ok(()));
+        assert_eq!(
+            overflow.append(1, initial),
+            Err(Error::InvalidConfigurationOrState)
+        );
+        changed = initial;
+        changed.logical_ptt = true;
+        assert_eq!(overflow.append(1, changed), Ok(()));
+        assert_eq!(
+            overflow.append(1, initial),
+            Err(Error::InvalidConfigurationOrState)
+        );
+    }
+
+    #[test]
+    fn private_transitions_validate_restored_state_without_rendering_invalid_spans() {
+        use super::{RenderTimeline, State, TickActions, TurnoffPhase};
+        assert_eq!(
+            super::duration_frames(-1),
+            Err(Error::InvalidConfigurationOrState)
+        );
+        assert_eq!(
+            super::duration_frames(i32::MAX),
+            Err(Error::InvalidConfigurationOrState)
+        );
+        let cfg = config();
+        let mut state = State::default();
+        assert_eq!(
+            super::append_current_span(&mut RenderTimeline::default(), &mut state, 0),
+            Ok(())
+        );
+        for (tx_state, phase) in [(STATE_TOC, TurnoffPhase::None), (99, TurnoffPhase::None)] {
+            state.transmitter_state = tx_state;
+            state.turnoff_phase = phase;
+            assert_eq!(
+                super::advance_render_timeline(
+                    &cfg,
+                    &input(1, false),
+                    &mut state,
+                    &mut TickActions::default(),
+                    &mut RenderTimeline::default()
+                ),
+                Err(Error::InvalidConfigurationOrState)
+            );
+        }
+        for (tx_state, phase) in [
+            (STATE_TOC, TurnoffPhase::NoTone),
+            (STATE_FINISHING, TurnoffPhase::None),
+        ] {
+            state = State {
+                transmitter_state: tx_state,
+                turnoff_phase: phase,
+                ..State::default()
+            };
+            assert_eq!(
+                super::advance_render_timeline(
+                    &cfg,
+                    &input(1, false),
+                    &mut state,
+                    &mut TickActions::default(),
+                    &mut RenderTimeline::default()
+                ),
+                Ok(())
+            );
+            assert_eq!(state.transmitter_state, STATE_IDLE);
+        }
+        let mut tx = TransmitSignaling::new(cfg).unwrap();
+        for decoded in [-2, crate::signal_mode::TONE_COUNT as i32] {
+            let before = tx.snapshot();
+            assert_eq!(
+                tx.tick(Input {
+                    decoded_ctcss: decoded,
+                    ..input(1, false)
+                }),
+                Err(Error::InvalidInput)
+            );
+            assert_eq!(tx.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn startup_and_rekey_respect_disabled_or_receive_only_ctcss() {
+        use super::{State, TickActions, TurnoffPhase};
+        let mut cfg = config();
+        cfg.dcs_transmit_enabled = true;
+        cfg.dcs_turnoff_enabled = false;
+        assert!(TransmitSignaling::new(cfg).is_ok());
+        cfg.signal_mode.default_tx_ctcss_frequency_tenths_hz = 0;
+        let mut state = State::default();
+        super::select_start_ctcss(&cfg, &input(1, true), &mut state);
+        assert_eq!(state.signal_mode.tx_ctcss_frequency_tenths_hz, 0);
+        state.signal_mode.smode = MODE_CTCSS;
+        super::select_start_ctcss(&cfg, &input(1, true), &mut state);
+        assert_eq!(state.signal_mode.tx_ctcss_frequency_tenths_hz, 0);
+        cfg = config();
+        state = State {
+            transmitter_state: STATE_ACTIVE,
+            logical_ptt: true,
+            ..State::default()
+        };
+        state.ctcss_render.enabled = 1;
+        super::prepare_transmitter(
+            &cfg,
+            &Input {
+                ctcss_inhibit: true,
+                ..input(1, false)
+            },
+            &mut state,
+            &mut TickActions::default(),
+        )
+        .unwrap();
+        assert_eq!(state.transmitter_state, STATE_FINISHING);
+        state = State::default();
+        super::select_start_ctcss(
+            &cfg,
+            &Input {
+                ctcss_inhibit: true,
+                ..input(1, true)
+            },
+            &mut state,
+        );
+        assert_eq!(state.ctcss_render.enabled, 0);
+        cfg.signal_mode.ctcss_tx_enabled = 0;
+        cfg.dcs_transmit_enabled = true;
+        cfg.dcs_turnoff_enabled = false;
+        state = State {
+            transmitter_state: STATE_ACTIVE,
+            logical_ptt: true,
+            ..State::default()
+        };
+        state.ctcss_render.enabled = 1;
+        super::prepare_transmitter(
+            &cfg,
+            &input(1, false),
+            &mut state,
+            &mut TickActions::default(),
+        )
+        .unwrap();
+        assert_eq!(state.transmitter_state, STATE_FINISHING);
+        state = State {
+            transmitter_state: STATE_TOC,
+            turnoff_phase: TurnoffPhase::CtcssGap,
+            ..State::default()
+        };
+        super::prepare_transmitter(
+            &cfg,
+            &input(1, true),
+            &mut state,
+            &mut TickActions::default(),
+        )
+        .unwrap();
+        assert_eq!(state.transmitter_state, STATE_TOC);
+    }
+
     use std::mem::size_of;
 
     use super::{

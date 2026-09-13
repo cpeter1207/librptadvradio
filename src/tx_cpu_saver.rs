@@ -80,6 +80,7 @@ pub(crate) extern "C" fn radio_tx_cpu_saver_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{TxCpuSaverInput, TxCpuSaverState, radio_tx_cpu_saver_advance};
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};

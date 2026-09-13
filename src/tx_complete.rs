@@ -111,6 +111,7 @@ pub(crate) extern "C" fn radio_tx_complete(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{STATE_IDLE, TxCompleteConfig, TxCompleteState, radio_tx_complete};
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};

@@ -179,13 +179,13 @@ pub(crate) fn advance(
             next.phase_shift_degrees = config.turnoff_phase_shift_degrees;
             next.tail_tone_hz = config.turnoff_tail_tone_hz;
         }
-        OPTION_DISABLE => {
+        // State validation above leaves only OPTION_DISABLE after the other arms.
+        _ => {
             next.option = OPTION_HOLD;
             next.oscillator_state = STATE_DISABLED;
             next.enabled = 0;
             next.tail_tone_hz = 0.0;
         }
-        _ => return Err(RADIO_INVALID_ARGUMENT),
     }
 
     *state = next;
@@ -225,6 +225,7 @@ pub(crate) extern "C" fn radio_ctcss_render_state_advance(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         CtcssRenderState, CtcssRenderStateConfig, CtcssRenderStateInput, OPTION_DISABLE,

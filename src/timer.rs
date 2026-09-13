@@ -48,6 +48,7 @@ pub(crate) fn consume(timer: &mut i32, milliseconds: i32) -> i32 {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{FRAMES_PER_MILLISECOND, NATIVE_SAMPLE_RATE_HZ, consume, elapsed_ms};
 

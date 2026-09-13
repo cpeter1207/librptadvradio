@@ -145,6 +145,7 @@ pub(crate) extern "C" fn radio_parse_tone_off_mode(text: *const c_char, output: 
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
     use std::ffi::CString;

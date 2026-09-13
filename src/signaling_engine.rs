@@ -39,6 +39,42 @@ mod tests {
     use crate::receive_path::{FilterConfig, FrontendConfig};
     use crate::receive_qualification::{CarrierSource, SubaudibleSource};
 
+    #[test]
+    fn renderer_coalescing_keeps_frequency_ctcss_and_dcs_boundaries() {
+        let mut engine = SignalingEngine::new(config()).unwrap();
+        let mut output = engine.tick(&[0.0, 0.0], keyed()).unwrap();
+        let start = engine.render_spans.len();
+        output.transmit.render_spans[0].ctcss_frequency_tenths_hz += 1;
+        engine.collect_frame(&output, 1);
+        assert_eq!(engine.render_spans.len(), start + 1);
+        output.transmit.render_spans[0].ctcss_render.tail_tone_hz = 55.0;
+        engine.collect_frame(&output, 2);
+        assert_eq!(engine.render_spans.len(), start + 2);
+        output.transmit.render_spans[0].dcs_turnoff_active = true;
+        engine.collect_frame(&output, 3);
+        assert_eq!(engine.render_spans.len(), start + 3);
+    }
+
+    #[test]
+    fn bad_pcm_and_restored_internal_saver_are_rejected() {
+        assert_eq!(qualification_mode(signal_mode::MODE_DCS), SignalMode::Dcs);
+        assert_eq!(qualification_mode(-1), SignalMode::Other);
+        assert_eq!(
+            component_invariant(transmit_signaling::Error::InvalidInput),
+            Error::ComponentInvariant
+        );
+        let mut engine = SignalingEngine::new(config()).unwrap();
+        assert_eq!(
+            engine.tick(&[f32::NAN, 0.0], keyed()),
+            Err(Error::InvalidInput)
+        );
+        engine.receive_cpu_saver.halted = 2;
+        assert_eq!(
+            engine.tick(&[0.0, 0.0], keyed()),
+            Err(Error::ComponentInvariant)
+        );
+    }
+
     fn config() -> Config<'static> {
         const IDENTITY: [i16; 1] = [32_767];
         const NOISE: [i16; 1] = [1];
@@ -528,6 +564,21 @@ pub enum Error {
     ComponentInvariant,
 }
 
+/// Preserve the composition boundary's common failure mapping for each primitive.
+fn component_invariant<T>(_: T) -> Error {
+    Error::ComponentInvariant
+}
+
+/// Preserve all historical signaling-mode labels at the qualification boundary.
+fn qualification_mode(mode: i32) -> SignalMode {
+    match mode {
+        signal_mode::MODE_NONE => SignalMode::None,
+        signal_mode::MODE_CTCSS => SignalMode::Ctcss,
+        signal_mode::MODE_DCS => SignalMode::Dcs,
+        _ => SignalMode::Other,
+    }
+}
+
 /// Last status values used only to derive end-of-tick edge notifications.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Status {
@@ -723,13 +774,10 @@ impl SignalingEngine {
             },
             &mut self.receive_cpu_saver,
         )
-        .map_err(|_| Error::ComponentInvariant)?;
+        .map_err(component_invariant)?;
         let receive_halted = self.receive_cpu_saver.halted != 0;
         self.receive.set_voice_processing_active(!receive_halted);
-        let receive = self
-            .receive
-            .process(pcm)
-            .map_err(|_| Error::ComponentInvariant)?;
+        let receive = self.receive.process(pcm).map_err(component_invariant)?;
         let transmit = self
             .transmit
             .tick(transmit_signaling::Input {
@@ -741,16 +789,11 @@ impl SignalingEngine {
                 dcs_valid: receive.dcs_valid,
                 ctcss_inhibit: inputs.ctcss_inhibit,
             })
-            .map_err(|_| Error::ComponentInvariant)?;
+            .map_err(component_invariant)?;
         if let Some(blanking) = transmit.receiver_blanking_arm {
             self.receive.arm_receive_blanking(blanking.duration_ms);
         }
-        let signal_mode = match transmit.signal_mode.smode {
-            signal_mode::MODE_NONE => SignalMode::None,
-            signal_mode::MODE_CTCSS => SignalMode::Ctcss,
-            signal_mode::MODE_DCS => SignalMode::Dcs,
-            _ => SignalMode::Other,
-        };
+        let signal_mode = qualification_mode(transmit.signal_mode.smode);
         let qualification = receive_qualification::advance(
             &self.qualification_config,
             &receive_qualification::Inputs {

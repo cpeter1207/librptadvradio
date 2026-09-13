@@ -1426,4 +1426,5 @@ pub extern "C" fn rptadv_radio_descriptor() -> *const RadioDescriptor {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests;

@@ -1,6 +1,12 @@
 use super::*;
 use std::ffi::CStr;
 
+#[path = "tests/abi_boundaries.rs"]
+mod abi_boundaries;
+
+#[path = "tests/state_boundaries.rs"]
+mod state_boundaries;
+
 fn valid_config() -> RadioConfig {
     RadioConfig {
         struct_size: size_of::<RadioConfig>() as u32,

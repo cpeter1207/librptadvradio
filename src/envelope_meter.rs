@@ -46,7 +46,7 @@ pub unsafe fn measure(
     threshold: i16,
     state: &mut State,
 ) -> Result<bool, i32> {
-    let sample_count = usize::try_from(sample_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    let sample_count = sample_count as usize;
     if sample_count != 0 && input.is_null() {
         return Err(RADIO_INVALID_ARGUMENT);
     }
@@ -101,6 +101,7 @@ pub unsafe fn measure(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{State, measure};
 

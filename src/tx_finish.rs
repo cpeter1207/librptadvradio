@@ -163,6 +163,7 @@ pub(crate) extern "C" fn radio_tx_finish_continue(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         STATE_COMPLETE, STATE_FINISHING, TxFinishInput, TxFinishState, radio_tx_finish_advance,

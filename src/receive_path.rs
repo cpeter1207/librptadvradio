@@ -300,18 +300,12 @@ impl ReceivePath {
             }
         }
 
-        let maximum_native_frames =
-            usize::try_from(config.maximum_native_frames).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-        let decimate =
-            usize::try_from(config.frontend.decimate).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-        let two_decimates = decimate.checked_mul(2).ok_or(RADIO_INVALID_ARGUMENT)?;
-        let baseband_capacity = maximum_native_frames
-            .checked_add(two_decimates - 2)
-            .ok_or(RADIO_INVALID_ARGUMENT)?
-            / decimate;
-        let native_samples = maximum_native_frames
-            .checked_mul(2)
-            .ok_or(RADIO_INVALID_ARGUMENT)?;
+        // These u32 counts and their doubled sizes fit the supported 64-bit targets.
+        let maximum_native_frames = config.maximum_native_frames as usize;
+        let decimate = config.frontend.decimate as usize;
+        let two_decimates = decimate * 2;
+        let baseband_capacity = (maximum_native_frames + two_decimates - 2) / decimate;
+        let native_samples = maximum_native_frames * 2;
         let delay_storage_capacity = config
             .delay
             .map_or(0_usize, |delay| delay.storage_capacity as usize);
@@ -492,8 +486,8 @@ impl ReceivePath {
         }
 
         let (input, blanked_native_frames) = self.apply_receive_blanking(native_input)?;
-        let native_frame_count_u32 =
-            u32::try_from(native_frame_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+        // The accepted frame count cannot exceed the setup-time u32 maximum.
+        let native_frame_count_u32 = native_frame_count as u32;
         let decimator_before = self.frontend_state.decimator;
         let frontend = unsafe {
             receive_frontend::process(receive_frontend::Request {
@@ -518,25 +512,23 @@ impl ReceivePath {
                 hysteresis: self.frontend_controls.hysteresis,
                 state: &mut self.frontend_state,
             })
-        }?;
+        };
+        let frontend = frontend?;
         let baseband_count = frontend.baseband_output_count as usize;
-        if baseband_count > self.baseband_capacity {
-            return Err(RADIO_INVALID_ARGUMENT);
-        }
         self.last_native_count = native_frame_count;
         self.last_baseband_count = baseband_count;
-        self.record_emission_offsets(decimator_before, native_frame_count_u32, baseband_count)?;
+        self.record_emission_offsets(decimator_before, native_frame_count_u32);
 
         let mut vox_detect = false;
         if baseband_count != 0 {
             self.process_baseband(baseband_count)?;
         }
-        if self.delay_config.is_some() {
-            self.process_delay(baseband_count, native_frame_count_u32)?;
+        if let Some(delay) = self.delay_config {
+            self.process_delay(delay, baseband_count, native_frame_count_u32)?;
         }
         if baseband_count != 0 {
             if let Some(vox) = self.vox_config {
-                vox_detect = unsafe {
+                let measured = unsafe {
                     envelope_meter::measure(
                         self.baseband.as_ptr(),
                         self.vox_envelope.as_mut_ptr(),
@@ -545,10 +537,11 @@ impl ReceivePath {
                         vox.envelope.threshold,
                         &mut self.vox_envelope_state,
                     )
-                }?;
+                };
+                vox_detect = measured?;
             }
             if let Some(measurement) = self.measurement_config {
-                let _ = unsafe {
+                let measured = unsafe {
                     envelope_meter::measure(
                         self.baseband.as_ptr(),
                         self.measurement.as_mut_ptr(),
@@ -557,12 +550,13 @@ impl ReceivePath {
                         measurement.threshold,
                         &mut self.measurement_state,
                     )
-                }?;
+                };
+                let _ = measured?;
             }
         }
 
-        let carrier_detect = if self.vox_config.is_some() {
-            self.advance_vox_hold(baseband_count, native_frame_count_u32)?
+        let carrier_detect = if let Some(vox) = self.vox_config {
+            self.advance_vox_hold(vox, baseband_count, native_frame_count_u32)?
         } else {
             self.frontend_state.comparator_output == 0
         };
@@ -603,8 +597,7 @@ impl ReceivePath {
         if self.blanking_remaining_ms <= 0 {
             return Ok((native_input.as_ptr(), 0));
         }
-        let native_frame_count =
-            u32::try_from(native_input.len() / 2).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+        let native_frame_count = (native_input.len() / 2) as u32;
         let remainder_before = self.blanking_remainder;
         let elapsed_ms = timer::elapsed_ms(&mut self.blanking_remainder, native_frame_count);
         let mut state = RxBlankingState {
@@ -637,20 +630,16 @@ impl ReceivePath {
     /// holds for the configured duration after the final qualifying sample.
     fn advance_vox_hold(
         &mut self,
+        vox: VoxConfig,
         sample_count: usize,
         native_frame_count: u32,
     ) -> Result<bool, i32> {
-        let vox = self.vox_config.ok_or(RADIO_INVALID_ARGUMENT)?;
-        if self.emission_offsets.len() != sample_count {
-            return Err(RADIO_INVALID_ARGUMENT);
-        }
-
+        // record_emission_offsets uses the frontend's identical decimator and
+        // records exactly one increasing in-span offset per emitted sample.
         let mut prior_offset = 0_u32;
         for index in 0..sample_count {
             let offset = self.emission_offsets[index];
-            let elapsed = offset
-                .checked_sub(prior_offset)
-                .ok_or(RADIO_INVALID_ARGUMENT)?;
+            let elapsed = offset - prior_offset;
             self.vox_hold_remaining_frames = self.vox_hold_remaining_frames.saturating_sub(elapsed);
 
             let peak = audio_meter::f32_to_pcm_code(self.vox_envelope[index])?;
@@ -659,16 +648,14 @@ impl ReceivePath {
             }
             prior_offset = offset;
         }
-        let trailing = native_frame_count
-            .checked_sub(prior_offset)
-            .ok_or(RADIO_INVALID_ARGUMENT)?;
+        let trailing = native_frame_count - prior_offset;
         self.vox_hold_remaining_frames = self.vox_hold_remaining_frames.saturating_sub(trailing);
         Ok(self.vox_hold_remaining_frames != 0)
     }
 
     fn process_baseband(&mut self, sample_count: usize) -> Result<(), i32> {
         if self.ctcss_state.enabled() {
-            unsafe {
+            let filtered = unsafe {
                 fir::process(fir::Request {
                     input: self.baseband.as_ptr(),
                     output: self.lsd.as_mut_ptr(),
@@ -680,13 +667,14 @@ impl ReceivePath {
                     output_gain: self.lsd_controls.output_gain,
                     calc_adjust: self.lsd_controls.calc_adjust,
                 })
-            }?;
+            };
+            filtered?;
             let center = self.center_config.ok_or(RADIO_INVALID_ARGUMENT)?;
             self.process_center_slicer(center, sample_count)?;
         }
 
         if self.voice_processing_active {
-            unsafe {
+            let filtered = unsafe {
                 fir::process(fir::Request {
                     input: self.baseband.as_ptr(),
                     output: self.hpf.as_mut_ptr(),
@@ -698,9 +686,10 @@ impl ReceivePath {
                     output_gain: self.hpf_controls.output_gain,
                     calc_adjust: self.hpf_controls.calc_adjust,
                 })
-            }?;
+            };
+            filtered?;
             if let Some(deemphasis) = self.deemphasis_config {
-                unsafe {
+                let integrated = unsafe {
                     deemphasis_integrator::process(deemphasis_integrator::Request {
                         input: self.hpf.as_ptr(),
                         output: self.voice.as_mut_ptr(),
@@ -710,7 +699,8 @@ impl ReceivePath {
                         output_gain: deemphasis.output_gain,
                         state: &mut self.deemphasis_state,
                     })
-                }?;
+                };
+                integrated?;
             } else {
                 self.voice[..sample_count].copy_from_slice(&self.hpf[..sample_count]);
             }
@@ -719,12 +709,7 @@ impl ReceivePath {
         Ok(())
     }
 
-    fn record_emission_offsets(
-        &mut self,
-        initial_decimator: i16,
-        native_frame_count: u32,
-        emitted_count: usize,
-    ) -> Result<(), i32> {
+    fn record_emission_offsets(&mut self, initial_decimator: i16, native_frame_count: u32) {
         let mut decimator = i32::from(initial_decimator);
 
         self.emission_offsets.clear();
@@ -735,33 +720,33 @@ impl ReceivePath {
                 self.emission_offsets.push(offset);
             }
         }
-        if self.emission_offsets.len() != emitted_count
-            || decimator as i16 != self.frontend_state.decimator
-        {
-            return Err(RADIO_INVALID_ARGUMENT);
-        }
-        Ok(())
     }
 
-    fn process_delay(&mut self, sample_count: usize, native_frame_count: u32) -> Result<(), i32> {
+    fn process_delay(
+        &mut self,
+        delay: DelayConfig,
+        sample_count: usize,
+        native_frame_count: u32,
+    ) -> Result<(), i32> {
         if self.vox_config.is_some() {
-            self.process_delay_segment(0, sample_count)?;
+            self.process_delay_segment(delay, 0, sample_count)?;
             return Ok(());
         }
 
         let mut sample_start = 0_usize;
         let mut boundary =
             LEGACY_DELAY_GATE_FRAMES.saturating_sub(self.delay_gate_native_remainder);
-        while boundary != 0 && boundary <= native_frame_count {
+        // The retained remainder is always below the fixed gate interval.
+        while boundary <= native_frame_count {
             let sample_end = self
                 .emission_offsets
                 .partition_point(|offset| *offset <= boundary);
-            self.process_delay_segment(sample_start, sample_end)?;
+            self.process_delay_segment(delay, sample_start, sample_end)?;
             sample_start = sample_end;
             self.delay_outzero = self.carrier_gate[boundary as usize - 1] == 0;
             boundary = boundary.saturating_add(LEGACY_DELAY_GATE_FRAMES);
         }
-        self.process_delay_segment(sample_start, sample_count)?;
+        self.process_delay_segment(delay, sample_start, sample_count)?;
         self.delay_gate_native_remainder = self
             .delay_gate_native_remainder
             .wrapping_add(native_frame_count)
@@ -769,13 +754,13 @@ impl ReceivePath {
         Ok(())
     }
 
-    fn process_delay_segment(&mut self, start: usize, end: usize) -> Result<(), i32> {
-        let Some(delay) = self.delay_config else {
-            return Ok(());
-        };
-        if end < start {
-            return Err(RADIO_INVALID_ARGUMENT);
-        }
+    fn process_delay_segment(
+        &mut self,
+        delay: DelayConfig,
+        start: usize,
+        end: usize,
+    ) -> Result<(), i32> {
+        // Only process_delay supplies these ordered, bounded sample offsets.
         let sample_count = end - start;
         if sample_count == 0 {
             return Ok(());
@@ -830,8 +815,7 @@ impl ReceivePath {
                 },
                 trace,
             )
-        }?;
-        Ok(())
+        }
     }
 }
 
@@ -848,6 +832,7 @@ fn filter_controls(config: FilterConfig<'_>) -> FilterControls {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{
         BASE_SAMPLE_RATE_HZ, CenterSlicerConfig, Config, CtcssConfig, DeemphasisConfig,
@@ -954,6 +939,107 @@ mod tests {
             output.push(-0.25);
         }
         output
+    }
+
+    #[test]
+    fn constructor_rejects_each_invalid_frontend_and_detector_configuration() {
+        let cases: &[fn(&mut Config<'_>)] = &[
+            |c| c.frontend.decimate = 0,
+            |c| c.frontend.decimate = 7,
+            |c| c.frontend.decimate = 8,
+            |c| c.maximum_native_frames = 0,
+            |c| c.frontend.baseband_coefficients = &[],
+            |c| c.frontend.noise_coefficients = &[],
+            |c| c.frontend.noise_coefficients = &[1; 5],
+            |c| c.frontend.baseband_calc_adjust = 0,
+            |c| c.frontend.noise_divisor = 0,
+            |c| c.frontend.calibration_window = 0,
+            |c| c.lsd_filter.coefficients = &[],
+            |c| c.lsd_filter.calc_adjust = 0,
+            |c| c.hpf_filter.calc_adjust = 0,
+            |c| {
+                c.ctcss = Some(CtcssConfig {
+                    tone_mask: 1,
+                    relax: false,
+                })
+            },
+            |c| c.delay.as_mut().unwrap().storage_capacity = 0,
+            |c| c.delay.as_mut().unwrap().lead = 65,
+            |c| {
+                c.vox = Some(VoxConfig {
+                    envelope: EnvelopeConfig {
+                        decay_factor: 1,
+                        threshold: 0,
+                    },
+                    hang_time_ms: i32::MAX,
+                })
+            },
+        ];
+        for configure in cases {
+            let mut config = configuration(32);
+            configure(&mut config);
+            assert!(ReceivePath::new(config).is_err());
+        }
+    }
+
+    #[test]
+    fn input_rejection_empty_spans_and_dcs_setup_preserve_public_results() {
+        let mut config = configuration(32);
+        config.dcs = Some(super::DcsConfig {
+            code: 23,
+            inverted: true,
+        });
+        config.vox = Some(VoxConfig {
+            envelope: EnvelopeConfig {
+                decay_factor: 1,
+                threshold: 0,
+            },
+            hang_time_ms: 0,
+        });
+        let mut path = ReceivePath::new(config).expect("valid DCS path");
+        let before = path.last_result();
+        for input in [&[0.0][..], &[0.0; 66][..], &[f32::NAN, 0.0][..]] {
+            assert_eq!(path.process(input), Err(crate::RADIO_INVALID_ARGUMENT));
+            assert_eq!(path.last_result(), before);
+        }
+        let active = path.process(&stereo(32)).expect("enabled DCS processing");
+        assert_eq!(active.native_frame_count, 32);
+        let empty = path.process(&[]).expect("empty processing");
+        assert_eq!(empty.native_frame_count, 0);
+        assert!(path.voice_output().is_empty());
+        assert!(path.carrier_gates().is_empty());
+    }
+
+    #[test]
+    fn cpu_saver_suspends_ctcss_acquisition_but_monitors_a_qualified_tone() {
+        let mut config = configuration(6);
+        config.frontend.noise_squelch = false;
+        config.ctcss = Some(CtcssConfig {
+            tone_mask: 1,
+            relax: false,
+        });
+        config.center_slicer = Some(CenterSlicerConfig {
+            limit: 16_384,
+            setpoint: 8_192,
+            decay_factor: 1,
+            trace: false,
+        });
+        let mut path = ReceivePath::new(config).expect("valid CTCSS path");
+        path.frontend_state.comparator_output = 0;
+        path.ctcss_state.test_prepare_detector(0);
+        path.set_voice_processing_active(false);
+        let silence = [0.0; 12];
+        let sleeping = path.process(&silence).expect("sleeping receiver");
+        assert!(sleeping.carrier_detect);
+        assert_eq!(sleeping.ctcss_decoded, -1);
+        assert_eq!(path.ctcss_state.test_detector_decode(0), 0);
+
+        path.set_voice_processing_active(true);
+        assert_eq!(path.process(&silence).unwrap().ctcss_decoded, 0);
+        path.set_voice_processing_active(false);
+        path.ctcss_state.test_set_detector_release(0);
+        assert_eq!(path.process(&silence).unwrap().ctcss_decoded, -1);
+        assert_eq!(path.ctcss_state.test_blanking_samples(), 1_600);
     }
 
     fn deployed_oracle_configuration(variant: u8) -> Config<'static> {

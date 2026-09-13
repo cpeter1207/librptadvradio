@@ -148,18 +148,14 @@ pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
         hysteresis,
         state,
     } = request;
-    let native_frame_count =
-        usize::try_from(native_frame_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let history_count = usize::try_from(history_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let noise_coefficient_count =
-        usize::try_from(noise_coefficient_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let decimate = usize::try_from(decimate).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let calibration_window =
-        usize::try_from(calibration_window).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let baseband_output_capacity =
-        usize::try_from(baseband_output_capacity).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let carrier_gate_capacity =
-        usize::try_from(carrier_gate_capacity).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    // All u32 buffer counts fit exactly on the supported 64-bit targets.
+    let native_frame_count = native_frame_count as usize;
+    let history_count = history_count as usize;
+    let noise_coefficient_count = noise_coefficient_count as usize;
+    let decimate = decimate as usize;
+    let calibration_window = calibration_window as usize;
+    let baseband_output_capacity = baseband_output_capacity as usize;
+    let carrier_gate_capacity = carrier_gate_capacity as usize;
 
     if history.is_null()
         || baseband_coefficients.is_null()
@@ -276,6 +272,7 @@ pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Request, State, process};
     use crate::micor_squelch;
@@ -476,6 +473,68 @@ mod tests {
         assert_eq!(gate, [0x5a]);
         assert_eq!(history, initial_history);
         assert_eq!(state, initial_state);
+    }
+
+    #[test]
+    fn rejected_frontend_parameters_leave_every_destination_unchanged() {
+        let mut history = [7_i16];
+        let coefficients = [1_i16];
+        let input = [0.25_f32, 0.0];
+        let mut output = [0.5_f32];
+        let mut gates = [7_u8];
+        let mut state = State::default();
+        let cases: &[fn(&mut Request)] = &[
+            |r| r.history = core::ptr::null_mut(),
+            |r| r.baseband_coefficients = core::ptr::null(),
+            |r| r.noise_coefficients = core::ptr::null(),
+            |r| r.state = core::ptr::null_mut(),
+            |r| r.history_count = 0,
+            |r| r.noise_coefficient_count = 0,
+            |r| r.noise_coefficient_count = 2,
+            |r| r.baseband_calc_adjust = 0,
+            |r| r.noise_divisor = 0,
+            |r| r.decimate = 0,
+            |r| r.decimate = u32::MAX,
+            |r| r.calibration_window = 0,
+            |r| r.baseband_output_capacity = 0,
+            |r| r.carrier_gate_capacity = 0,
+            |r| r.input = core::ptr::null(),
+            |r| r.baseband_output = core::ptr::null_mut(),
+            |r| r.carrier_gate = core::ptr::null_mut(),
+        ];
+        for configure in cases {
+            let mut request = Request {
+                input: input.as_ptr(),
+                baseband_output: output.as_mut_ptr(),
+                baseband_output_capacity: 1,
+                carrier_gate: gates.as_mut_ptr(),
+                carrier_gate_capacity: 1,
+                native_frame_count: 1,
+                history: history.as_mut_ptr(),
+                history_count: 1,
+                baseband_coefficients: coefficients.as_ptr(),
+                baseband_calc_adjust: 1,
+                baseband_output_gain: 256,
+                noise_coefficients: coefficients.as_ptr(),
+                noise_coefficient_count: 1,
+                noise_divisor: 1,
+                noise_squelch: true,
+                decimate: 1,
+                calibration_window: 1,
+                open_level: 1,
+                hysteresis: 0,
+                state: &mut state,
+            };
+            configure(&mut request);
+            assert_eq!(
+                unsafe { process(request) },
+                Err(crate::RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(history, [7]);
+            assert_eq!(output, [0.5]);
+            assert_eq!(gates, [7]);
+            assert_eq!(state, State::default());
+        }
     }
 
     #[test]

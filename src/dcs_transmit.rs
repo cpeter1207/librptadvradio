@@ -127,6 +127,7 @@ pub(crate) unsafe fn generate(
 
 /// Expose a known vector to module-local tests without expanding the C ABI.
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) fn test_wire_word(code: i32) -> u32 {
     wire_word(code)
 }

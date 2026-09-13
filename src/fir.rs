@@ -69,6 +69,7 @@ fn process_code(
 /// It performs no allocation, locking, I/O, interpolation, mixing, or
 /// amplitude detection.
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 fn process_codes(
     input: &[i16],
     output: &mut [i16],
@@ -113,12 +114,8 @@ fn process_normalized(
         f32_to_pcm_code(*sample)?;
     }
     for (input, output) in input.iter().zip(output.iter_mut()) {
-        let sample = process_code(
-            f32_to_pcm_code(*input)? as i16,
-            history,
-            coefficients,
-            controls,
-        )?;
+        let input_code = f32_to_pcm_code(*input)? as i16;
+        let sample = process_code(input_code, history, coefficients, controls)?;
         *output = f32::from(sample) / PCM_SCALE;
     }
     Ok(())
@@ -176,8 +173,8 @@ pub unsafe fn process(request: Request) -> Result<(), i32> {
         output_gain,
         calc_adjust,
     } = request;
-    let sample_count = usize::try_from(sample_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
-    let history_count = usize::try_from(history_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    let sample_count = sample_count as usize;
+    let history_count = history_count as usize;
 
     if sample_count == 0 {
         return Ok(());
@@ -218,8 +215,94 @@ pub unsafe fn process(request: Request) -> Result<(), i32> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Controls, Request, process, process_codes};
+
+    #[test]
+    fn each_safe_core_precondition_rejects_before_mutation() {
+        let controls = Controls {
+            nx: 2,
+            input_gain: 256,
+            output_gain: 256,
+            calc_adjust: 1,
+        };
+        for field in 0..4 {
+            let mut controls = controls;
+            let mut history = [7, 8];
+            let coefficients = [1, 1];
+            let mut output = [9.0];
+            if field == 0 {
+                controls.nx = 0;
+            }
+            if field == 3 {
+                controls.calc_adjust = 0;
+            }
+            let history_len = if field == 1 { 1 } else { 2 };
+            let coefficient_len = if field == 2 { 1 } else { 2 };
+            assert_eq!(
+                super::process_code(
+                    1,
+                    &mut history[..history_len],
+                    &coefficients[..coefficient_len],
+                    controls
+                ),
+                Err(crate::RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(
+                super::process_normalized(
+                    &[0.0],
+                    &mut output,
+                    &mut history[..history_len],
+                    &coefficients[..coefficient_len],
+                    controls
+                ),
+                Err(crate::RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(history, [7, 8]);
+            assert_eq!(output, [9.0]);
+        }
+        assert_eq!(
+            super::process_normalized(&[], &mut [9.0], &mut [7, 8], &[1, 1], controls),
+            Err(crate::RADIO_INVALID_ARGUMENT)
+        );
+        for field in 0..5 {
+            let input = [0.0];
+            let mut output = [9.0];
+            let mut history = [7];
+            let coefficients = [1];
+            assert_eq!(
+                unsafe {
+                    process(Request {
+                        input: input.as_ptr(),
+                        output: if field == 0 {
+                            core::ptr::null_mut()
+                        } else {
+                            output.as_mut_ptr()
+                        },
+                        sample_count: 1,
+                        history: if field == 1 {
+                            core::ptr::null_mut()
+                        } else {
+                            history.as_mut_ptr()
+                        },
+                        history_count: if field == 3 { 0 } else { 1 },
+                        coefficients: if field == 2 {
+                            core::ptr::null()
+                        } else {
+                            coefficients.as_ptr()
+                        },
+                        input_gain: 256,
+                        output_gain: 256,
+                        calc_adjust: if field == 4 { 0 } else { 1 },
+                    })
+                },
+                Err(crate::RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(output, [9.0]);
+            assert_eq!(history, [7]);
+        }
+    }
 
     fn samples(codes: &[i16]) -> Vec<f32> {
         codes

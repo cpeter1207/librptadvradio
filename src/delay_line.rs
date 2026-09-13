@@ -57,7 +57,7 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
     if storage_capacity == 0 || lead > storage_capacity {
         return Err(RADIO_INVALID_ARGUMENT);
     }
-    let sample_count = usize::try_from(sample_count).map_err(|_| RADIO_INVALID_ARGUMENT)?;
+    let sample_count = sample_count as usize;
 
     if !enabled || outzero {
         if state.dirty == 0 {
@@ -111,6 +111,7 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Request, State, process};
 
