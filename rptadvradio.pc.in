@@ -1,0 +1,9 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=${prefix}/include
+
+Name: librptadvradio
+Description: Portable f32 radio-core ABI for rpt_advanced
+Version: @VERSION@
+Libs: -L${libdir} -lrptadvradio
+Cflags: -I${includedir}
