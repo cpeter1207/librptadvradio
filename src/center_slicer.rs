@@ -69,6 +69,8 @@ pub(crate) struct Trace<'a> {
 ///
 /// For nonzero `sample_count`, all pointers must designate readable or
 /// writable F32 spans of that size. `state` is a valid mutable state object.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
     // SAFETY: `process_with_trace` retains this request's documented span and
     // state requirements. No trace storage is requested by this wrapper.
@@ -80,12 +82,13 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
 /// The trace is Rust-internal composition state rather than a new adapter ABI.
 /// Its output receives the historical signed-16 extrema mapped to canonical
 /// F32 after each centered sample.  The operation otherwise has the same
-/// validation, arithmetic, and mutation contract as [`process`].
+/// validation, arithmetic, and mutation contract as the non-trace operation.
 ///
 /// # Safety
 ///
-/// In addition to [`process`]'s requirements, when `trace` is present its
-/// output identifies a writable F32 span with `sample_count` entries.
+/// For nonzero `sample_count`, the request pointers identify readable or
+/// writable F32 spans of that size and `state` is valid. When `trace` is
+/// present, its output identifies another writable span of that size.
 pub(crate) unsafe fn process_with_trace(
     request: Request<'_>,
     mut trace: Option<Trace<'_>>,
@@ -197,6 +200,46 @@ pub(crate) unsafe fn process_with_trace(
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
+    #[test]
+    fn null_pcm_spans_reject_before_mutation() {
+        for missing in 0..3 {
+            let input = [0.0];
+            let mut centered = [0.25];
+            let mut limited = [-0.25];
+            let mut state = super::State::default();
+            assert_eq!(
+                unsafe {
+                    super::process(super::Request {
+                        input: if missing == 0 {
+                            core::ptr::null()
+                        } else {
+                            input.as_ptr()
+                        },
+                        centered_output: if missing == 1 {
+                            core::ptr::null_mut()
+                        } else {
+                            centered.as_mut_ptr()
+                        },
+                        limited_output: if missing == 2 {
+                            core::ptr::null_mut()
+                        } else {
+                            limited.as_mut_ptr()
+                        },
+                        sample_count: 1,
+                        limit: 100,
+                        setpoint: 1000,
+                        decay_factor: 1,
+                        state: &mut state,
+                    })
+                },
+                Err(crate::RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(state, super::State::default());
+            assert_eq!(centered, [0.25]);
+            assert_eq!(limited, [-0.25]);
+        }
+    }
+
     #[test]
     fn trace_validation_and_alternating_extrema_remain_bounded() {
         let input = [0.0_f32; 16];

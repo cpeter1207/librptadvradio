@@ -135,13 +135,6 @@ impl ReceiveState {
         self.enabled
     }
 
-    /// Return whether the 134.4 Hz turn-off detector is currently coherent.
-    #[cfg(test)]
-    #[cfg_attr(coverage, coverage(off))]
-    pub(crate) fn turnoff_active(&self) -> bool {
-        self.turnoff_active
-    }
-
     /// Process one bounded, interleaved canonical-F32 native PCM span.
     ///
     /// # Safety
@@ -312,11 +305,156 @@ fn process_received_symbol(
 mod tests {
     use super::*;
 
+    const WORD_023N: u32 = 0x76_3813;
+
+    /// Existing 023N wire-word fixture, independent of the transmitter.
+    fn discriminator_pcm(frames: usize, inverted: bool) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|index| {
+                let symbol = (index as u64 * u64::from(CLOCK_INCREMENT)
+                    / u64::from(NATIVE_SAMPLE_RATE_HZ * CLOCK_SCALE))
+                    % u64::from(SYMBOL_COUNT);
+                let high = ((WORD_023N >> symbol) & 1 != 0) ^ inverted;
+                let sample = if high { 0.375 } else { -0.375 };
+                // The right channel is deliberately unrelated to discriminator input.
+                [sample, -sample]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn golay_corrects_every_three_bit_error_and_rejects_other_codes() {
+        let syndrome = syndrome_table();
+        assert!(decode_word(&syndrome, 0o023, WORD_023N));
+        for first in 0..23 {
+            let one = 1 << first;
+            assert!(decode_word(&syndrome, 0o023, WORD_023N ^ one));
+            for second in first + 1..23 {
+                let two = one | (1 << second);
+                assert!(decode_word(&syndrome, 0o023, WORD_023N ^ two));
+                for third in second + 1..23 {
+                    assert!(decode_word(
+                        &syndrome,
+                        0o023,
+                        WORD_023N ^ two ^ (1 << third)
+                    ));
+                }
+            }
+        }
+        assert!(!decode_word(&syndrome, 0o025, WORD_023N));
+        assert!(!decode_word(&syndrome, 0o023, 0));
+    }
+
+    #[test]
+    fn consecutive_words_qualify_refresh_hold_and_expire_after_missing_symbols() {
+        let syndrome = syndrome_table();
+        let mut receiver = ReceivePhase::default();
+        for word in 1..=3 {
+            for symbol in 0..SYMBOL_COUNT {
+                process_received_symbol(
+                    &syndrome,
+                    0o023,
+                    &mut receiver,
+                    WORD_023N & (1 << symbol) != 0,
+                );
+            }
+            assert_eq!(receiver.match_count, word.min(2));
+            assert_eq!(receiver.qualified, word >= 2);
+            assert_eq!(receiver.symbols_since_match, 0);
+            if word >= 2 {
+                assert_eq!(receiver.hold, SYMBOL_COUNT);
+            }
+        }
+        // A non-code shift register cannot refresh qualification during dropout.
+        receiver.word = 0;
+        for remaining in (0..SYMBOL_COUNT).rev() {
+            process_received_symbol(&syndrome, 0o023, &mut receiver, false);
+            assert_eq!(receiver.hold, remaining);
+            assert_eq!(receiver.qualified, remaining != 0);
+        }
+        assert_eq!(receiver.match_count, 0);
+    }
+
+    #[test]
+    fn native_pcm_acquires_both_polarities_and_configuration_resets_state() {
+        for inverted in [false, true] {
+            let mut state = ReceiveState::default();
+            assert!(!state.enabled());
+            assert!(!state.valid());
+            state.configure(0o023, u32::from(inverted));
+            assert!(state.enabled());
+            let pcm = discriminator_pcm(NATIVE_SAMPLE_RATE_HZ as usize, inverted);
+            // An odd block size exercises retained fractional clocks at boundaries.
+            for block in pcm.chunks(514) {
+                unsafe { state.process(block.as_ptr(), (block.len() / 2) as u32) };
+            }
+            assert!(state.valid(), "polarity {inverted}");
+            assert!(state.phase_bank_valid());
+            state.configure(0o777, 0);
+            assert!(state.enabled());
+            assert!(!state.valid());
+            assert_eq!(state.dc_estimate_q15, 0);
+            assert!(state.receive_phase.iter().all(|phase| !phase.qualified));
+            for invalid in [-1, 0o1000] {
+                state.configure(invalid, 0);
+                assert!(!state.enabled());
+                assert_eq!(state.receive_code, -1);
+                assert!(!unsafe { state.process(ptr::null(), 0) });
+            }
+        }
+        assert!(code_supported(0));
+        assert!(code_supported(0o777));
+    }
+
+    #[test]
+    fn turnoff_requires_sustained_coherent_energy_and_clears_qualified_dcs() {
+        let mut state = ReceiveState::default();
+        state.configure(0o023, 0);
+        let pcm = discriminator_pcm(NATIVE_SAMPLE_RATE_HZ as usize, false);
+        assert!(unsafe { state.process(pcm.as_ptr(), NATIVE_SAMPLE_RATE_HZ) });
+        // Start the detector at an exact window boundary without resetting DCS.
+        state.reset_turnoff_detector();
+        let window = state.turnoff_window_length as usize;
+        for block in 0..6 {
+            let tone: Vec<f32> = (0..window)
+                .flat_map(|index| {
+                    let phase = TAU * TURNOFF_FREQUENCY_HZ * (block * window + index) as f64
+                        / f64::from(NATIVE_SAMPLE_RATE_HZ);
+                    [(phase.sin() * 0.375) as f32, 0.0]
+                })
+                .collect();
+            unsafe { state.process(tone.as_ptr(), window as u32) };
+            assert_eq!(state.turnoff_active, block >= 4);
+        }
+        assert!(!state.valid());
+        assert!(
+            state
+                .receive_phase
+                .iter()
+                .all(|phase| { !phase.qualified && phase.hold == 0 && phase.match_count == 0 })
+        );
+        let silence = vec![0.0; window * 2];
+        unsafe { state.process(silence.as_ptr(), window as u32) };
+        assert!(!state.turnoff_active);
+        assert_eq!(state.turnoff_consecutive_samples, 0);
+        // Strong off-frequency input exceeds the RMS gate but not coherence.
+        state.reset_turnoff_detector();
+        for index in 0..window {
+            let sample = (12_000.0
+                * (TAU * 1_000.0 * index as f64 / f64::from(NATIVE_SAMPLE_RATE_HZ)).sin())
+                as i32;
+            assert!(!state.process_turnoff_sample(sample));
+        }
+        // Pure silence separately fails the energy gate.
+        for _ in 0..window {
+            assert!(!state.process_turnoff_sample(0));
+        }
+    }
+
     /// A matching word at the wrong spacing restarts, rather than advances,
     /// legacy two-word qualification.
     #[test]
     fn nonconsecutive_matching_word_restarts_qualification() {
-        const WORD_023N: u32 = 0x76_3813;
         let state = ReceiveState::default();
         let mut receiver = ReceivePhase {
             word: (WORD_023N << 1) & WORD_MASK,

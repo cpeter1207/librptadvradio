@@ -266,7 +266,7 @@ mod tests {
             super::process_normalized(&[], &mut [9.0], &mut [7, 8], &[1, 1], controls),
             Err(crate::RADIO_INVALID_ARGUMENT)
         );
-        for field in 0..5 {
+        for field in 0..6 {
             let input = [0.0];
             let mut output = [9.0];
             let mut history = [7];
@@ -274,7 +274,11 @@ mod tests {
             assert_eq!(
                 unsafe {
                     process(Request {
-                        input: input.as_ptr(),
+                        input: if field == 5 {
+                            core::ptr::null()
+                        } else {
+                            input.as_ptr()
+                        },
                         output: if field == 0 {
                             core::ptr::null_mut()
                         } else {

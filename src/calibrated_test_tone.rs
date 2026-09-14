@@ -45,9 +45,39 @@ impl State {
             }
         }
     }
+}
 
-    /// Return the callback-owned phase without changing it.
-    pub(crate) fn phase_radians(&self) -> f64 {
-        self.phase_radians
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibrated_waveform_is_partition_invariant_and_disable_resets_phase() {
+        let mut whole = State::default();
+        let mut split = State::default();
+        let mut expected = [0.0; 97];
+        let mut actual = [0.0; 97];
+        unsafe { whole.render(expected.as_mut_ptr(), 97, 1) };
+        for block in actual.chunks_mut(7) {
+            unsafe { split.render(block.as_mut_ptr(), block.len() as u32, 1) };
+        }
+        assert_eq!(actual, expected);
+        for (index, sample) in actual.iter().enumerate() {
+            let oracle =
+                (7518.0 / 32767.0 * (std::f64::consts::TAU * index as f64 / 48.0).sin()) as f32;
+            assert!((sample - oracle).abs() < 1e-7);
+        }
+        assert_eq!(actual[12], (7518.0 / 32767.0) as f32);
+        assert_eq!(whole.phase_radians, split.phase_radians);
+        let phase = split.phase_radians;
+        unsafe { split.render(std::ptr::null_mut(), 0, 1) };
+        assert_eq!(split.phase_radians, phase);
+        let mut program = [0.625; 3];
+        unsafe { split.render(program.as_mut_ptr(), 3, 0) };
+        assert_eq!(program, [0.625; 3]);
+        assert_eq!(split.phase_radians, 0.0);
+        unsafe { split.render(program.as_mut_ptr(), 1, 1) };
+        assert_eq!(program, [0.0, 0.625, 0.625]);
     }
 }

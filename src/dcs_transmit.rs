@@ -48,11 +48,6 @@ impl TransmitState {
         self.inverted = inverted != 0;
         self.bit_accumulator = 0;
     }
-
-    /// Return the independent DCS turn-off oscillator phase.
-    pub(crate) fn tail_phase_radians(&self) -> f64 {
-        self.tail_phase_radians
-    }
 }
 
 /// Encode one TIA/ETSI DCS word in least-significant-bit-first wire layout.
@@ -125,9 +120,99 @@ pub(crate) unsafe fn generate(
     }
 }
 
-/// Expose a known vector to module-local tests without expanding the C ABI.
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
-pub(crate) fn test_wire_word(code: i32) -> u32 {
-    wire_word(code)
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_wire_word_and_fractional_clock_survive_partitioning_and_inversion() {
+        const WORD_023N: u32 = 0x76_3813;
+        assert_eq!(wire_word(0o023), WORD_023N);
+        assert_eq!(configured_code(-1), -1);
+        assert_eq!(configured_code(0o1000), -1);
+        assert_eq!(configured_code(0), 0);
+        assert_eq!(configured_code(0o777), 0o777);
+        for inverted in [0, 1] {
+            let mut whole = TransmitState::default();
+            let mut split = TransmitState::default();
+            whole.configure(0o023, inverted);
+            split.configure(0o023, inverted);
+            let config = GenerateConfig {
+                peak: 0.25,
+                enabled: 1,
+                turnoff: 0,
+            };
+            let mut expected = [0.0; 9217];
+            let mut actual = [0.0; 9217];
+            unsafe { generate(&mut whole, expected.as_mut_ptr(), 9217, config) };
+            for block in actual.chunks_mut(791) {
+                unsafe { generate(&mut split, block.as_mut_ptr(), block.len() as u32, config) };
+            }
+            assert_eq!(actual, expected);
+            for (index, sample) in actual.iter().enumerate() {
+                let bit = (index as u64 * 1344 / 480_000) % 23;
+                let high = (WORD_023N & (1 << bit) != 0) ^ (inverted != 0);
+                assert_eq!(*sample, if high { 0.25 } else { -0.25 });
+            }
+            assert_eq!(whole.phase, (9217 * 1344 / 480_000) % 23);
+            assert_eq!(whole.bit_accumulator, (9217 * 1344) % 480_000);
+            assert_eq!(whole.phase, split.phase);
+            assert_eq!(whole.bit_accumulator, split.bit_accumulator);
+            let phase = split.phase;
+            split.configure(0o777, inverted);
+            assert_eq!(split.phase, phase);
+            assert_eq!(split.bit_accumulator, 0);
+        }
+    }
+
+    #[test]
+    fn inactive_and_nonpositive_peak_clear_output_without_advancing_clocks() {
+        for (enabled, peak) in [(0, 0.25), (1, 0.0), (1, -0.25)] {
+            let mut state = TransmitState {
+                phase: 3,
+                bit_accumulator: 42,
+                tail_phase_radians: 0.75,
+                ..TransmitState::default()
+            };
+            let config = GenerateConfig {
+                peak,
+                enabled,
+                turnoff: 1,
+            };
+            let mut output = [1.0; 3];
+            unsafe {
+                generate(&mut state, output.as_mut_ptr(), 3, config);
+                generate(&mut state, ptr::null_mut(), 0, config);
+            }
+            assert!(output.iter().all(|sample| sample.to_bits() == 0));
+            assert_eq!(state.phase, 3);
+            assert_eq!(state.bit_accumulator, 42);
+            assert_eq!(state.tail_phase_radians, 0.75);
+        }
+    }
+
+    #[test]
+    fn turnoff_sine_wraps_without_advancing_the_digital_word() {
+        let mut state = TransmitState {
+            phase: 3,
+            bit_accumulator: 42,
+            tail_phase_radians: 0.25,
+            ..TransmitState::default()
+        };
+        let config = GenerateConfig {
+            peak: 0.25,
+            enabled: 1,
+            turnoff: 1,
+        };
+        let mut output = [0.0; 1000];
+        unsafe { generate(&mut state, output.as_mut_ptr(), 1000, config) };
+        for (index, sample) in output.iter().enumerate() {
+            let expected = (0.25 * (0.25 + TAU * 134.4 * index as f64 / 48_000.0).sin()) as f32;
+            assert!((sample - expected).abs() < 1e-7);
+        }
+        assert_eq!(state.phase, 3);
+        assert_eq!(state.bit_accumulator, 42);
+        assert!((0.0..TAU).contains(&state.tail_phase_radians));
+    }
 }

@@ -115,6 +115,87 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
 mod tests {
     use super::{Request, State, process};
 
+    #[test]
+    fn invalid_storage_and_pcm_spans_fail_transactionally() {
+        // Each malformed boundary gets otherwise-valid storage and dirty state.
+        for case in 0..7 {
+            let input = [1.0];
+            let mut output = [9.0];
+            let mut storage = [3.0];
+            let mut state = State {
+                input_index: 0,
+                dirty: 1,
+            };
+            assert_eq!(
+                unsafe {
+                    process(Request {
+                        input: if case == 4 {
+                            core::ptr::null()
+                        } else {
+                            input.as_ptr()
+                        },
+                        output: if case == 3 || case == 5 {
+                            core::ptr::null_mut()
+                        } else {
+                            output.as_mut_ptr()
+                        },
+                        sample_count: 1,
+                        storage: if case == 2 || case == 6 {
+                            core::ptr::null_mut()
+                        } else {
+                            storage.as_mut_ptr()
+                        },
+                        storage_capacity: if case == 0 { 0 } else { 1 },
+                        lead: if case == 1 { 2 } else { 0 },
+                        state: &mut state,
+                        enabled: case != 2 && case != 3,
+                        outzero: false,
+                    })
+                },
+                Err(crate::RADIO_INVALID_ARGUMENT),
+                "case {case}"
+            );
+            assert_eq!(
+                state,
+                State {
+                    input_index: 0,
+                    dirty: 1
+                }
+            );
+            assert_eq!(output, [9.0]);
+            assert_eq!(storage, [3.0]);
+        }
+    }
+
+    #[test]
+    fn empty_active_and_dirty_reset_spans_accept_absent_pcm() {
+        for enabled in [true, false] {
+            let mut storage = [3.0];
+            let mut state = State {
+                input_index: 0,
+                dirty: 1,
+            };
+            assert_eq!(
+                unsafe {
+                    process(Request {
+                        input: core::ptr::null(),
+                        output: core::ptr::null_mut(),
+                        sample_count: 0,
+                        storage: storage.as_mut_ptr(),
+                        storage_capacity: 1,
+                        lead: 0,
+                        state: &mut state,
+                        enabled,
+                        outzero: false,
+                    })
+                },
+                Ok(())
+            );
+            assert_eq!(storage, [if enabled { 3.0 } else { 0.0 }]);
+            assert_eq!(state.dirty, u32::from(enabled));
+        }
+    }
+
     fn run(input: &[f32], storage: &mut [f32], lead: u32, state: &mut State) -> Vec<f32> {
         let mut output = vec![0.0; input.len()];
 

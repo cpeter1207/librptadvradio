@@ -1,16 +1,16 @@
-//! Legacy-compatible CTCSS render-state transitions.
+//! CTCSS render-state transitions owned by the whole-session engine.
 //!
-//! This narrow operation consumes only a request that the compatibility
-//! transmitter state machine has already selected.  It does not select a
-//! CTCSS frequency, key PTT, generate PCM, or inspect DCS state.  Keeping the
-//! boundary this small lets an older compatibility adapter retain its exact C
-//! fallback when a descriptor is unavailable or rejects a snapshot.
+//! This component consumes only a request that the transmitter state machine
+//! has already selected. It does not select a CTCSS frequency, key hardware,
+//! generate PCM, or inspect DCS state.
 
 use std::ffi::c_int;
-use std::mem::size_of;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK, timer};
+#[cfg(test)]
+use crate::RADIO_OK;
+use crate::{RADIO_INVALID_ARGUMENT, timer};
 
 /// Keep the current CTCSS render state unchanged apart from the phase reset.
 pub const OPTION_HOLD: u32 = 0;
@@ -28,16 +28,9 @@ pub const STATE_ACTIVE: u32 = 1;
 /// CTCSS oscillator emits a configured turn-off sequence.
 pub const STATE_TURNOFF: u32 = 2;
 
-/// Immutable C-compatible CTCSS turn-off configuration.
-///
-/// The compatibility adapter snapshots the live legacy values after its
-/// transmitter state machine has selected phase-shift or tail-tone behavior.
-/// This operation neither normalizes nor retains the supplied values.
-#[repr(C)]
+/// Immutable CTCSS turn-off configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CtcssRenderStateConfig {
-    /// Size supplied by the caller for append-only ABI validation.
-    pub struct_size: u32,
     /// Duration of one CTCSS turn-off sequence in milliseconds.
     pub turnoff_duration_ms: i32,
     /// Phase adjustment supplied to the first turn-off PCM callback.
@@ -49,9 +42,10 @@ pub struct CtcssRenderStateConfig {
 impl CtcssRenderStateConfig {
     /// Return a valid disabled configuration for a caller that has no TOC.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn disabled() -> Self {
         Self {
-            struct_size: size_of::<Self>() as u32,
             turnoff_duration_ms: 0,
             turnoff_phase_shift_degrees: 0.0,
             turnoff_tail_tone_hz: 0.0,
@@ -108,8 +102,7 @@ impl Default for CtcssRenderState {
 /// This remains crate-private because the public C ABI validates the same
 /// copied structure at its descriptor boundary.
 pub(crate) fn validate_config(config: &CtcssRenderStateConfig) -> Result<(), c_int> {
-    if config.struct_size < size_of::<CtcssRenderStateConfig>() as u32
-        || config.turnoff_duration_ms < 0
+    if config.turnoff_duration_ms < 0
         || !config.turnoff_phase_shift_degrees.is_finite()
         || !config.turnoff_tail_tone_hz.is_finite()
     {
@@ -175,7 +168,12 @@ pub(crate) fn advance(
         OPTION_TURNOFF => {
             next.option = OPTION_HOLD;
             next.oscillator_state = STATE_TURNOFF;
-            next.turnoff_remaining_ms = config.turnoff_duration_ms.saturating_sub(input.elapsed_ms);
+            // A short tail still emits this callback's phase/tone request, but
+            // must leave a valid zero timer for the next hold/disable transition.
+            next.turnoff_remaining_ms = config
+                .turnoff_duration_ms
+                .saturating_sub(input.elapsed_ms)
+                .max(0);
             next.phase_shift_degrees = config.turnoff_phase_shift_degrees;
             next.tail_tone_hz = config.turnoff_tail_tone_hz;
         }
@@ -197,6 +195,8 @@ pub(crate) fn advance(
 /// All state is copied before it is advanced.  Invalid arguments therefore
 /// leave caller storage untouched so a compatibility adapter can execute its
 /// established C branch transactionally.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_ctcss_render_state_advance(
     config: *const CtcssRenderStateConfig,
     input: *const CtcssRenderStateInput,
@@ -239,12 +239,136 @@ mod tests {
             turnoff_duration_ms: 180,
             turnoff_phase_shift_degrees: 120.0,
             turnoff_tail_tone_hz: 55.0,
-            ..CtcssRenderStateConfig::disabled()
         }
     }
 
     fn input(elapsed_ms: i32) -> CtcssRenderStateInput {
         CtcssRenderStateInput { elapsed_ms }
+    }
+
+    #[test]
+    fn short_turnoff_keeps_a_valid_timer_and_defers_disable() {
+        for duration in [0, 5, 20] {
+            let config = CtcssRenderStateConfig {
+                turnoff_duration_ms: duration,
+                ..config()
+            };
+            let mut state = CtcssRenderState {
+                option: OPTION_TURNOFF,
+                oscillator_state: STATE_ACTIVE,
+                enabled: 1,
+                ..CtcssRenderState::default()
+            };
+            assert_eq!(
+                radio_ctcss_render_state_advance(&config, &input(20), &mut state),
+                RADIO_OK
+            );
+            assert_eq!(state.turnoff_remaining_ms, 0);
+            assert_eq!(state.option, OPTION_HOLD);
+            assert_eq!(state.oscillator_state, STATE_TURNOFF);
+            assert_eq!(state.enabled, 1);
+            assert_eq!(state.phase_shift_degrees, 120.0);
+            assert_eq!(state.tail_tone_hz, 55.0);
+            assert_eq!(
+                radio_ctcss_render_state_advance(&config, &input(0), &mut state),
+                RADIO_OK
+            );
+            assert_eq!(state.option, OPTION_DISABLE);
+            assert_eq!(state.enabled, 1);
+            assert_eq!(state.phase_shift_degrees, 0.0);
+            assert_eq!(
+                radio_ctcss_render_state_advance(&config, &input(20), &mut state),
+                RADIO_OK
+            );
+            assert_eq!(state.oscillator_state, STATE_DISABLED);
+            assert_eq!(state.enabled, 0);
+            assert_eq!(state.tail_tone_hz, 0.0);
+        }
+    }
+
+    #[test]
+    fn hold_without_a_tail_preserves_controls_and_clears_only_the_phase_request() {
+        let config = CtcssRenderStateConfig::disabled();
+        assert_eq!(config.turnoff_duration_ms, 0);
+        assert_eq!(config.turnoff_phase_shift_degrees, 0.0);
+        assert_eq!(config.turnoff_tail_tone_hz, 0.0);
+        for oscillator_state in [STATE_DISABLED, STATE_ACTIVE] {
+            let mut state = CtcssRenderState {
+                oscillator_state,
+                enabled: 1,
+                turnoff_remaining_ms: 42,
+                phase_shift_degrees: 120.0,
+                tail_tone_hz: 55.0,
+                ..CtcssRenderState::default()
+            };
+            let expected = CtcssRenderState {
+                phase_shift_degrees: 0.0,
+                ..state
+            };
+            assert_eq!(
+                radio_ctcss_render_state_advance(&config, &input(20), &mut state),
+                RADIO_OK
+            );
+            assert_eq!(state, expected);
+        }
+    }
+
+    #[test]
+    fn every_rejected_config_or_state_field_is_transactional() {
+        let baseline = CtcssRenderState {
+            option: OPTION_START,
+            oscillator_state: STATE_ACTIVE,
+            enabled: 1,
+            turnoff_remaining_ms: 20,
+            phase_shift_degrees: 120.0,
+            tail_tone_hz: 55.0,
+        };
+        for invalid_config in [
+            CtcssRenderStateConfig {
+                turnoff_duration_ms: -1,
+                ..config()
+            },
+            CtcssRenderStateConfig {
+                turnoff_tail_tone_hz: f64::INFINITY,
+                ..config()
+            },
+        ] {
+            let mut state = baseline;
+            assert_eq!(
+                radio_ctcss_render_state_advance(&invalid_config, &input(20), &mut state),
+                RADIO_INVALID_ARGUMENT
+            );
+            assert_eq!(state, baseline);
+        }
+        for original in [
+            CtcssRenderState {
+                oscillator_state: 3,
+                ..baseline
+            },
+            CtcssRenderState {
+                enabled: 2,
+                ..baseline
+            },
+            CtcssRenderState {
+                turnoff_remaining_ms: -1,
+                ..baseline
+            },
+            CtcssRenderState {
+                phase_shift_degrees: f64::INFINITY,
+                ..baseline
+            },
+            CtcssRenderState {
+                tail_tone_hz: f64::NEG_INFINITY,
+                ..baseline
+            },
+        ] {
+            let mut state = original;
+            assert_eq!(
+                radio_ctcss_render_state_advance(&config(), &input(20), &mut state),
+                RADIO_INVALID_ARGUMENT
+            );
+            assert_eq!(state, original);
+        }
     }
 
     #[test]

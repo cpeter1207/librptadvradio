@@ -61,8 +61,6 @@ pub enum SignalMode {
     Ctcss,
     /// The DCS mode owns the current received code.
     Dcs,
-    /// A legacy non-CTCSS/DCS mode owns the current code.
-    Other,
 }
 
 /// Immutable receive-qualification policy resolved by the control plane.
@@ -159,22 +157,36 @@ fn dsp_subaudible_active(inputs: &Inputs) -> bool {
         && inputs.signal_mode == SignalMode::Ctcss
 }
 
+/// Resolve published external COS, leaving DSP noise/VOX to their detectors.
+pub(crate) fn external_carrier(
+    source: CarrierSource,
+    hardware: bool,
+    parallel: bool,
+) -> Option<bool> {
+    match source {
+        CarrierSource::Ignore => Some(false),
+        CarrierSource::Hardware => Some(hardware),
+        CarrierSource::HardwareInverted => Some(!hardware),
+        CarrierSource::Parallel => Some(parallel),
+        CarrierSource::ParallelInverted => Some(!parallel),
+        CarrierSource::DspNoise | CarrierSource::DspVox => None,
+    }
+}
+
 /// Resolve immediate carrier and subaudible indications for one tick.
 fn resolve_indications(config: &Config, inputs: &Inputs, state: &mut State) {
-    let raw_carrier = match config.carrier_source {
-        CarrierSource::Ignore => false,
-        CarrierSource::Hardware => {
-            state.external_carrier_detect = inputs.hardware_carrier;
-            inputs.hardware_carrier
-        }
-        CarrierSource::HardwareInverted => {
-            state.external_carrier_detect = !inputs.hardware_carrier;
-            !inputs.hardware_carrier
-        }
-        CarrierSource::DspNoise | CarrierSource::DspVox => inputs.dsp_carrier,
-        CarrierSource::Parallel => inputs.parallel_carrier,
-        CarrierSource::ParallelInverted => !inputs.parallel_carrier,
-    };
+    let raw_carrier = external_carrier(
+        config.carrier_source,
+        inputs.hardware_carrier,
+        inputs.parallel_carrier,
+    )
+    .unwrap_or(inputs.dsp_carrier);
+    if matches!(
+        config.carrier_source,
+        CarrierSource::Hardware | CarrierSource::HardwareInverted
+    ) {
+        state.external_carrier_detect = raw_carrier;
+    }
 
     let mut carrier =
         raw_carrier && (!inputs.tx_ptt_out || config.advanced_transport || config.radio_duplex);
@@ -406,6 +418,41 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_decodes_and_external_subaudible_sources_keep_their_precedence() {
+        let mut config = enabled_config();
+        let mut inputs = active_inputs();
+        inputs.ctcss_receive_enabled = true;
+        inputs.signal_mode = SignalMode::Ctcss;
+        for (available, decoded, mode) in [
+            (false, true, SignalMode::Ctcss),
+            (true, false, SignalMode::Ctcss),
+            (true, true, SignalMode::None),
+        ] {
+            inputs.ctcss_decoder_available = available;
+            inputs.ctcss_decoded = decoded;
+            inputs.signal_mode = mode;
+            assert!(!advance(&config, &inputs, 0, &mut State::default()).subaudible_active);
+        }
+        inputs.dcs_receive_enabled = true;
+        inputs.dcs_valid = false;
+        inputs.signal_mode = SignalMode::Dcs;
+        assert!(!advance(&config, &inputs, 0, &mut State::default()).subaudible_active);
+        config.carrier_source = CarrierSource::Ignore;
+        for source in [
+            SubaudibleSource::Hardware,
+            SubaudibleSource::ParallelInverted,
+        ] {
+            config.subaudible_source = source;
+            inputs.hardware_subaudible = true;
+            inputs.parallel_subaudible = false;
+            let output = advance(&config, &inputs, 0, &mut State::default());
+            assert!(!output.carrier_active);
+            assert!(output.subaudible_active);
+            assert!(!output.rx_keyed);
+        }
+    }
+
+    #[test]
     fn configured_delays_use_exact_elapsed_native_frames() {
         let mut state = State::default();
         let mut config = enabled_config();
@@ -574,23 +621,5 @@ mod tests {
         assert_eq!(state.rx_admission_elapsed_frames, 0);
         assert_eq!(state.tx_release_elapsed_frames, 0);
         assert!(!state.rx_keyed);
-    }
-
-    #[test]
-    fn legacy_other_signal_mode_never_qualifies_a_dsp_ctcss_or_dcs_decoder() {
-        let mut state = State::default();
-        let mut inputs = active_inputs();
-        let mut config = enabled_config();
-
-        config.subaudible_source = SubaudibleSource::Dsp;
-        inputs.ctcss_receive_enabled = true;
-        inputs.ctcss_decoder_available = true;
-        inputs.ctcss_decoded = true;
-        inputs.signal_mode = SignalMode::Other;
-        assert!(!advance(&config, &inputs, 0, &mut state).subaudible_active);
-
-        inputs.dcs_receive_enabled = true;
-        inputs.dcs_valid = true;
-        assert!(!advance(&config, &inputs, 0, &mut state).subaudible_active);
     }
 }

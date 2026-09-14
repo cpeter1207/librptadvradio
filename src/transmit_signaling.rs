@@ -7,7 +7,6 @@
 //! admission remain outside this portable component.
 
 use std::ffi::c_int;
-use std::mem::size_of;
 
 use crate::{
     CtcssRenderState, CtcssRenderStateConfig, CtcssRenderStateInput, DcsTurnoffConfig,
@@ -87,13 +86,13 @@ pub struct Config {
 impl Config {
     /// Return a valid no-signaling policy suitable for a disabled transmitter.
     #[must_use]
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             signal_mode: SignalModeConfig::disabled(),
             dcs_turnoff: DcsTurnoffConfig::default(),
             ctcss_render: CtcssRenderStateConfig::disabled(),
             tx_complete: TxCompleteConfig {
-                struct_size: size_of::<TxCompleteConfig>() as u32,
                 txrx_blanking_time_ms: 0,
             },
             tone_off_mode: ToneOffMode::None,
@@ -122,6 +121,8 @@ pub struct Input {
     pub dcs_valid: bool,
     /// One while transient control inhibits transmit CTCSS selection/tails.
     pub ctcss_inhibit: bool,
+    /// Forced CTCSS frequency in tenths of a hertz, or zero for normal selection.
+    pub forced_ctcss_tenths_hz: i32,
 }
 
 /// Failure from a malformed signaling snapshot or immutable policy.
@@ -338,8 +339,8 @@ impl Default for State {
 /// Complete portable owner for one transmitter signaling state machine.
 ///
 /// [`TransmitSignaling::tick`] performs no allocation, lock, I/O, or PCM
-/// rendering.  It is deliberately a Rust-only composition surface until the
-/// complete M1 engine replaces primitive descriptor calls as one unit.
+/// rendering. The whole-session ABI owns this component and exposes only the
+/// resulting transmitter state and actions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransmitSignaling {
     config: Config,
@@ -362,6 +363,7 @@ impl TransmitSignaling {
 
     /// Return the current state without advancing signaling time.
     #[must_use]
+    #[cfg(test)]
     pub fn snapshot(&self) -> Output {
         output_from_state(
             &self.state,
@@ -382,6 +384,8 @@ impl TransmitSignaling {
         if input.native_frame_count == 0
             || input.decoded_ctcss < signal_mode::CTCSS_NONE
             || input.decoded_ctcss >= signal_mode::TONE_COUNT as i32
+            || (input.forced_ctcss_tenths_hz != 0
+                && !(500..=3_000).contains(&input.forced_ctcss_tenths_hz))
         {
             return Err(Error::InvalidInput);
         }
@@ -523,7 +527,9 @@ fn select_start_ctcss(config: &Config, input: &Input, state: &mut State) {
         return;
     }
 
-    let selected = if state.signal_mode.smode == signal_mode::MODE_CTCSS
+    let selected = if input.forced_ctcss_tenths_hz != 0 {
+        input.forced_ctcss_tenths_hz
+    } else if state.signal_mode.smode == signal_mode::MODE_CTCSS
         && input.decoded_ctcss != signal_mode::CTCSS_NONE
     {
         config.signal_mode.mapped_tx_ctcss_frequency_tenths_hz[input.decoded_ctcss as usize]
@@ -1131,8 +1137,6 @@ mod tests {
         assert_eq!(state.transmitter_state, STATE_TOC);
     }
 
-    use std::mem::size_of;
-
     use super::{
         Config, Error, Input, Output, STATE_ACTIVE, STATE_FINISHING, STATE_IDLE, STATE_TOC,
         ToneOffMode, TransmitSignaling,
@@ -1158,13 +1162,11 @@ mod tests {
                 turnoff_duration_ms: 180,
             },
             ctcss_render: CtcssRenderStateConfig {
-                struct_size: size_of::<CtcssRenderStateConfig>() as u32,
                 turnoff_duration_ms: 180,
                 turnoff_phase_shift_degrees: 120.0,
                 turnoff_tail_tone_hz: 55.0,
             },
             tx_complete: TxCompleteConfig {
-                struct_size: size_of::<TxCompleteConfig>() as u32,
                 txrx_blanking_time_ms: 37,
             },
             tone_off_mode: ToneOffMode::PhaseShift,
@@ -1184,6 +1186,7 @@ mod tests {
             decoded_ctcss: CTCSS_NONE,
             dcs_valid: false,
             ctcss_inhibit: false,
+            forced_ctcss_tenths_hz: 0,
         }
     }
 
@@ -1247,6 +1250,7 @@ mod tests {
             decoded_ctcss: CTCSS_NONE,
             dcs_valid: false,
             ctcss_inhibit: false,
+            forced_ctcss_tenths_hz: 0,
         }
     }
 
@@ -1376,6 +1380,28 @@ mod tests {
         assert!(!output.cpu_halted);
         assert_eq!(output.rx_timer_remainder_frames, 0);
         assert_eq!(output.tx_timer_remainder_frames, 0);
+    }
+
+    #[test]
+    fn forced_ctcss_overrides_configured_selection_and_rejects_invalid_frequency() {
+        let mut transmitter = TransmitSignaling::new(config()).unwrap();
+        let forced = transmitter
+            .tick(Input {
+                forced_ctcss_tenths_hz: 1_234,
+                ..input(960, true)
+            })
+            .unwrap();
+        assert_eq!(forced.signal_mode.tx_ctcss_frequency_tenths_hz, 1_234);
+
+        let before = transmitter.snapshot();
+        assert_eq!(
+            transmitter.tick(Input {
+                forced_ctcss_tenths_hz: 3_001,
+                ..input(960, true)
+            }),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(transmitter.snapshot(), before);
     }
 
     #[test]
@@ -1883,13 +1909,6 @@ mod tests {
         invalid_ctcss.ctcss_render.turnoff_tail_tone_hz = f64::NAN;
         assert_eq!(
             TransmitSignaling::new(invalid_ctcss),
-            Err(Error::InvalidConfigurationOrState)
-        );
-
-        let mut invalid_complete = config();
-        invalid_complete.tx_complete.struct_size = 0;
-        assert_eq!(
-            TransmitSignaling::new(invalid_complete),
             Err(Error::InvalidConfigurationOrState)
         );
 

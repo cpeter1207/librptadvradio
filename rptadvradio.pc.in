@@ -1,6 +1,7 @@
 prefix=@PREFIX@
 libdir=@LIBDIR@
 includedir=${prefix}/include
+abi_version=@ABI_VERSION@
 
 Name: librptadvradio
 Description: Portable f32 radio-core ABI for rpt_advanced

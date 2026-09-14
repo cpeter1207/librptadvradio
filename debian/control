@@ -2,12 +2,12 @@ Source: librptadvradio
 Section: libs
 Priority: optional
 Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
-Build-Depends: cargo, debhelper-compat (= 13), pkg-config, rustc
+Build-Depends: cargo (>= 1.85), debhelper-compat (= 13), pkg-config, rustc (>= 1.85)
 Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/librptadvradio
 Rules-Requires-Root: no
 
-Package: librptadvradio1
+Package: librptadvradio3
 Architecture: any
 Multi-Arch: same
 Depends: ${misc:Depends}, ${shlibs:Depends}
@@ -17,7 +17,7 @@ Description: portable f32 radio core for rpt_advanced
 Package: librptadvradio-dev
 Architecture: any
 Multi-Arch: same
-Depends: ${misc:Depends}, librptadvradio1 (= ${binary:Version})
+Depends: ${misc:Depends}, librptadvradio3 (= ${binary:Version})
 Description: development files for the rpt_advanced radio core
  Public C header and pkg-config metadata for dynamic consumers of the
  portable native radio-core ABI.

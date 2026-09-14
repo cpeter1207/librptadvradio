@@ -1,9 +1,9 @@
-//! Owned native receive path for the forthcoming M1 radio engine.
+//! Owned native receive path for the whole-session radio engine.
 //!
 //! This module composes the existing legacy-compatible fixed-point primitives
 //! without crossing the C descriptor for each stage.  Construction copies the
 //! selected coefficient tables and preallocates every history and PCM span;
-//! [`crate::receive_path::ReceivePath::process`] only advances caller-owned
+//! [`crate::receive_path::ReceivePath::process_with_carrier`] only advances caller-owned
 //! stream state.
 
 use super::{
@@ -142,14 +142,14 @@ pub struct DcsConfig {
 pub struct Config<'a> {
     /// Fixed native stream rate for the lifetime of this path.
     pub native_sample_rate_hz: u32,
-    /// Largest native frame span accepted by [`ReceivePath::process`].
+    /// Largest native frame span accepted by [`ReceivePath::process_with_carrier`].
     pub maximum_native_frames: u32,
     /// Native discriminator frontend controls.
     pub frontend: FrontendConfig<'a>,
     /// CTCSS low-pass FIR controls.
     pub lsd_filter: FilterConfig<'a>,
     /// Receiver voice high-pass FIR controls.
-    pub hpf_filter: FilterConfig<'a>,
+    pub hpf_filter: Option<FilterConfig<'a>>,
     /// CTCSS centering and limiting, enabled with CTCSS detection.
     pub center_slicer: Option<CenterSlicerConfig>,
     /// Optional flat-discriminator receiver deemphasis.
@@ -167,7 +167,7 @@ pub struct Config<'a> {
 }
 
 /// Observable result of one native receive span.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ProcessResult {
     /// Native frames consumed from the supplied stereo span.
     pub native_frame_count: u32,
@@ -183,6 +183,8 @@ pub struct ProcessResult {
     pub ctcss_decoded: i16,
     /// Whether the configured DCS decoder is qualified.
     pub dcs_valid: bool,
+    /// Post-decoder-gain CTCSS half peak-to-peak level as normalized PCM.
+    pub ctcss_decoder_peak: f32,
     /// Most recent completed legacy RSSI result.
     pub rssi_peak: i16,
     /// Whether this span completed one fixed RSSI window.
@@ -220,7 +222,7 @@ pub struct ReceivePath {
     baseband_capacity: usize,
     frontend_controls: FrontendControls,
     lsd_controls: FilterControls,
-    hpf_controls: FilterControls,
+    hpf_controls: Option<FilterControls>,
     center_config: Option<CenterSlicerConfig>,
     deemphasis_config: Option<DeemphasisConfig>,
     delay_config: Option<DelayConfig>,
@@ -289,8 +291,12 @@ impl ReceivePath {
             || config.frontend.noise_squelch && config.frontend.noise_divisor == 0
             || config.frontend.calibration_window == 0
             || !valid_filter(config.lsd_filter)
-            || !valid_filter(config.hpf_filter)
+            || config
+                .hpf_filter
+                .is_some_and(|filter| !valid_filter(filter))
             || (config.ctcss.is_some() != config.center_slicer.is_some())
+            || config.hpf_filter.is_none()
+                && (config.deemphasis.is_some() || config.delay.is_some())
         {
             return Err(RADIO_INVALID_ARGUMENT);
         }
@@ -340,7 +346,7 @@ impl ReceivePath {
                 noise_squelch: config.frontend.noise_squelch,
             },
             lsd_controls: filter_controls(config.lsd_filter),
-            hpf_controls: filter_controls(config.hpf_filter),
+            hpf_controls: config.hpf_filter.map(filter_controls),
             center_config: config.center_slicer,
             deemphasis_config: config.deemphasis,
             delay_config: config.delay,
@@ -349,10 +355,17 @@ impl ReceivePath {
             baseband_coefficients: config.frontend.baseband_coefficients.to_vec(),
             noise_coefficients: config.frontend.noise_coefficients.to_vec(),
             lsd_coefficients: config.lsd_filter.coefficients.to_vec(),
-            hpf_coefficients: config.hpf_filter.coefficients.to_vec(),
+            hpf_coefficients: config
+                .hpf_filter
+                .map_or_else(Vec::new, |filter| filter.coefficients.to_vec()),
             frontend_history: vec![0; config.frontend.baseband_coefficients.len()],
             lsd_history: vec![0; config.lsd_filter.coefficients.len()],
-            hpf_history: vec![0; config.hpf_filter.coefficients.len()],
+            hpf_history: vec![
+                0;
+                config
+                    .hpf_filter
+                    .map_or(0, |filter| filter.coefficients.len())
+            ],
             frontend_state: receive_frontend::State {
                 decimator: config.frontend.decimate as i16,
                 comparator_output: 1,
@@ -413,15 +426,21 @@ impl ReceivePath {
 
     /// Return the conservative baseband workspace capacity allocated at setup.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn baseband_capacity(&self) -> usize {
         self.baseband_capacity
     }
 
     /// Return the final receiver audio emitted by the latest call.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn voice_output(&self) -> &[f32] {
         let span = self.last_baseband_count;
-        if self.delay_config.is_some() {
+        if self.hpf_controls.is_none() {
+            &[]
+        } else if self.delay_config.is_some() {
             &self.delayed[..span]
         } else {
             &self.voice[..span]
@@ -430,6 +449,8 @@ impl ReceivePath {
 
     /// Return decimated native-frontend output from the latest call.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn baseband_output(&self) -> &[f32] {
         &self.baseband[..self.last_baseband_count]
     }
@@ -442,6 +463,8 @@ impl ReceivePath {
 
     /// Return the optional center-slicer diagnostic trace from the latest call.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn center_trace(&self) -> Option<&[f32]> {
         self.center_config
             .filter(|config| config.trace)
@@ -450,6 +473,8 @@ impl ReceivePath {
 
     /// Return the most recently published receive state.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn last_result(&self) -> ProcessResult {
         self.last_result
     }
@@ -460,7 +485,19 @@ impl ReceivePath {
     /// cannot exceed the construction-time maximum.  Every native sample
     /// advances blanking, RSSI, MICOR, and DCS timing; the 8 kHz stages run
     /// only for the exact number of decimated samples emitted this call.
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn process(&mut self, native_input: &[f32]) -> Result<ProcessResult, i32> {
+        self.process_with_carrier(native_input, None)
+    }
+
+    /// Qualify CTCSS using external COS when noise/VOX carrier detection is bypassed.
+    /// `None` retains the sample-clocked DSP carrier decision.
+    pub(crate) fn process_with_carrier(
+        &mut self,
+        native_input: &[f32],
+        external_carrier: Option<bool>,
+    ) -> Result<ProcessResult, i32> {
         if native_input.len() % 2 != 0 {
             return Err(RADIO_INVALID_ARGUMENT);
         }
@@ -478,6 +515,7 @@ impl ReceivePath {
             self.last_native_count = 0;
             self.last_result = ProcessResult {
                 ctcss_decoded: self.ctcss_state.decoded(),
+                ctcss_decoder_peak: f32::from(self.center_state.peak) / 32_768.0,
                 dcs_valid: self.dcs_state.valid(),
                 rssi_peak: self.frontend_state.rssi_peak,
                 ..ProcessResult::default()
@@ -572,7 +610,7 @@ impl ReceivePath {
                 self.ctcss_state.process(
                     self.limited.as_ptr(),
                     baseband_count as u32,
-                    carrier_detect,
+                    external_carrier.unwrap_or(carrier_detect),
                 )
             }
         } else {
@@ -587,6 +625,7 @@ impl ReceivePath {
             vox_detect,
             ctcss_decoded,
             dcs_valid: self.dcs_state.valid(),
+            ctcss_decoder_peak: f32::from(self.center_state.peak) / 32_768.0,
             rssi_peak: self.frontend_state.rssi_peak,
             rssi_updated: frontend.rssi_updated,
         };
@@ -673,7 +712,7 @@ impl ReceivePath {
             self.process_center_slicer(center, sample_count)?;
         }
 
-        if self.voice_processing_active {
+        if let Some(hpf_controls) = self.hpf_controls.filter(|_| self.voice_processing_active) {
             let filtered = unsafe {
                 fir::process(fir::Request {
                     input: self.baseband.as_ptr(),
@@ -682,9 +721,9 @@ impl ReceivePath {
                     history: self.hpf_history.as_mut_ptr(),
                     history_count: self.hpf_history.len() as u32,
                     coefficients: self.hpf_coefficients.as_ptr(),
-                    input_gain: self.hpf_controls.input_gain,
-                    output_gain: self.hpf_controls.output_gain,
-                    calc_adjust: self.hpf_controls.calc_adjust,
+                    input_gain: hpf_controls.input_gain,
+                    output_gain: hpf_controls.output_gain,
+                    calc_adjust: hpf_controls.calc_adjust,
                 })
             };
             filtered?;
@@ -905,12 +944,12 @@ mod tests {
                 output_gain: 256,
                 calc_adjust: 16_384,
             },
-            hpf_filter: FilterConfig {
+            hpf_filter: Some(FilterConfig {
                 coefficients: &HPF,
                 input_gain: 256,
                 output_gain: 256,
                 calc_adjust: 32_767,
-            },
+            }),
             center_slicer: None,
             deemphasis: Some(DeemphasisConfig {
                 output_coefficient: 6_878,
@@ -944,6 +983,7 @@ mod tests {
     #[test]
     fn constructor_rejects_each_invalid_frontend_and_detector_configuration() {
         let cases: &[fn(&mut Config<'_>)] = &[
+            |c| c.native_sample_rate_hz = 8_000,
             |c| c.frontend.decimate = 0,
             |c| c.frontend.decimate = 7,
             |c| c.frontend.decimate = 8,
@@ -956,7 +996,12 @@ mod tests {
             |c| c.frontend.calibration_window = 0,
             |c| c.lsd_filter.coefficients = &[],
             |c| c.lsd_filter.calc_adjust = 0,
-            |c| c.hpf_filter.calc_adjust = 0,
+            |c| c.hpf_filter.as_mut().unwrap().calc_adjust = 0,
+            |c| c.hpf_filter = None,
+            |c| {
+                c.hpf_filter = None;
+                c.deemphasis = None;
+            },
             |c| {
                 c.ctcss = Some(CtcssConfig {
                     tone_mask: 1,
@@ -980,6 +1025,11 @@ mod tests {
             configure(&mut config);
             assert!(ReceivePath::new(config).is_err());
         }
+        let mut native_only = configuration(32);
+        native_only.hpf_filter = None;
+        native_only.deemphasis = None;
+        native_only.delay = None;
+        assert!(ReceivePath::new(native_only).is_ok());
     }
 
     #[test]
@@ -1027,6 +1077,11 @@ mod tests {
         let mut path = ReceivePath::new(config).expect("valid CTCSS path");
         path.frontend_state.comparator_output = 0;
         path.ctcss_state.test_prepare_detector(0);
+        path.center_state.peak = 2_400;
+        assert_eq!(
+            path.process(&[]).unwrap().ctcss_decoder_peak,
+            2_400.0 / 32_768.0
+        );
         path.set_voice_processing_active(false);
         let silence = [0.0; 12];
         let sleeping = path.process(&silence).expect("sleeping receiver");
@@ -1081,12 +1136,12 @@ mod tests {
                 output_gain: 256,
                 calc_adjust: 16_384,
             },
-            hpf_filter: FilterConfig {
+            hpf_filter: Some(FilterConfig {
                 coefficients: &DEPLOYED_RXHPF,
                 input_gain: 256,
                 output_gain: 256,
                 calc_adjust: 32_768,
-            },
+            }),
             center_slicer: None,
             deemphasis: if speaker_audio {
                 None
@@ -1183,12 +1238,12 @@ mod tests {
                 output_gain: 256,
                 calc_adjust: 32_767,
             },
-            hpf_filter: FilterConfig {
+            hpf_filter: Some(FilterConfig {
                 coefficients: &VOX_IDENTITY,
                 input_gain: 256,
                 output_gain: 256,
                 calc_adjust: 32_767,
-            },
+            }),
             center_slicer: None,
             deemphasis: None,
             delay: None,

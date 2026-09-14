@@ -19,41 +19,6 @@ pub(crate) const FREQUENCIES: [f64; 38] = [
     179.9, 186.2, 192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3,
 ];
 
-/// Measured XPMR reference peaks for the legacy 215 Hz detector filter.
-const PEAK_215: [i64; 38] = [
-    16_573, 16_619, 16_638, 16_670, 16_701, 16_734, 16_768, 16_812, 16_843, 16_943, 16_915, 16_952,
-    16_981, 17_020, 17_049, 17_083, 17_104, 17_101, 17_096, 17_065, 17_015, 16_960, 16_824, 16_653,
-    16_467, 16_173, 15_855, 15_456, 14_954, 14_429, 13_719, 12_475, 11_519, 10_591, 9_428, 8_287,
-    7_070, 5_876,
-];
-
-/// Measured XPMR reference peaks for the legacy 250 Hz detector filter.
-const PEAK_250: [i64; 38] = [
-    17_435, 17_558, 17_614, 17_684, 17_751, 17_819, 17_887, 17_965, 18_024, 18_157, 18_148, 18_204,
-    18_258, 18_318, 18_365, 18_417, 18_451, 18_465, 18_476, 18_470, 18_444, 18_425, 18_329, 18_218,
-    18_106, 17_903, 17_698, 17_443, 17_118, 16_813, 16_338, 15_540, 14_926, 14_348, 13_524, 12_731,
-    11_836, 10_905,
-];
-
-/// Measured positive/negative peak differences for the 215 Hz table.
-const BIAS_215: [i64; 38] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, 0, 0, 0, -2, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, -1, 0, 0, 0, 0, 0, 0,
-];
-
-/// Measured positive/negative peak differences for the 250 Hz table.
-const BIAS_250: [i64; 38] = [
-    0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0,
-    -1, 0, 0, 0, 0, 0, 0,
-];
-
-/// Return whether a frequency is an exact signaling-table entry.
-pub(crate) fn frequency_supported(frequency_hz: f32) -> bool {
-    FREQUENCIES
-        .iter()
-        .any(|reference| frequency_hz == *reference as f32)
-}
-
 /// Reproduce the XPMR 8 kHz fixed-increment oscillator frequency.
 pub(crate) fn legacy_frequency(frequency_hz: f64) -> f64 {
     // The compatibility interface only passes supported finite CTCSS tones.
@@ -62,78 +27,6 @@ pub(crate) fn legacy_frequency(frequency_hz: f64) -> f64 {
     let frequency_tenths = (frequency_hz * 10.0) as i64;
     let step = LEGACY_SINE_STEPS * frequency_tenths * 128 / 8_000 / 10;
     step as f64 * 8_000.0 / (LEGACY_SINE_STEPS * 128) as f64
-}
-
-fn closest_frequency(frequency_hz: f64) -> usize {
-    let mut best = 0_usize;
-    for (index, reference) in FREQUENCIES.iter().enumerate().skip(1) {
-        if (*reference - frequency_hz).abs() < (FREQUENCIES[best] - frequency_hz).abs() {
-            best = index;
-        }
-    }
-    best
-}
-
-/// Return the measured reference peak in signed-16 PCM codes.
-pub(crate) fn legacy_peak(frequency_hz: f64, filter_250: bool) -> f64 {
-    let index = closest_frequency(frequency_hz);
-    if filter_250 {
-        PEAK_250[index] as f64
-    } else {
-        PEAK_215[index] as f64
-    }
-}
-
-/// Calculate legacy calibrated amplitude and DC bias in signed-16 PCM codes.
-pub(crate) fn legacy_scaled_levels(
-    frequency_hz: f64,
-    filter_250: bool,
-    tone_gain_q8: i32,
-    output_gain_q8: i32,
-) -> (f64, f64) {
-    let index = closest_frequency(frequency_hz);
-    let maximum = if filter_250 {
-        PEAK_250[index]
-    } else {
-        PEAK_215[index]
-    };
-    let difference = if filter_250 {
-        BIAS_250[index]
-    } else {
-        BIAS_215[index]
-    };
-    let mut positive = if difference > 0 {
-        maximum
-    } else {
-        maximum + difference
-    };
-    let mut negative = if difference < 0 {
-        maximum
-    } else {
-        maximum - difference
-    };
-
-    // Preserve XPMR's two separately truncated Q8 gain stages.
-    positive = positive * i64::from(tone_gain_q8) / 256;
-    positive = positive * i64::from(output_gain_q8) / 256;
-    negative = negative * i64::from(tone_gain_q8) / 256;
-    negative = negative * i64::from(output_gain_q8) / 256;
-    (
-        (positive + negative) as f64 / 2.0,
-        (positive - negative) as f64 / 2.0,
-    )
-}
-
-/// Calculate the maximum absolute legacy calibrated level in PCM codes.
-pub(crate) fn legacy_scaled_peak(
-    frequency_hz: f64,
-    filter_250: bool,
-    tone_gain_q8: i32,
-    output_gain_q8: i32,
-) -> f64 {
-    let (amplitude, bias) =
-        legacy_scaled_levels(frequency_hz, filter_250, tone_gain_q8, output_gain_q8);
-    amplitude + bias.abs()
 }
 
 /// Render a continuous sine wave in canonical f32 PCM without allocating.
@@ -175,4 +68,104 @@ pub(crate) unsafe fn generate(
         cosine = next_cosine;
     }
     *phase = (*phase + step * f64::from(frame_count)) % TAU;
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_nonpositive_frequency_and_nonpositive_peak_silence_without_advancing() {
+        for (enabled, frequency, peak) in [
+            (0, 114.8, 0.25),
+            (1, 0.0, 0.25),
+            (1, -1.0, 0.25),
+            (1, 114.8, 0.0),
+            (1, 114.8, -0.25),
+        ] {
+            let mut phase = 0.75;
+            let mut output = [1.0; 3];
+            unsafe {
+                generate(
+                    &mut phase,
+                    output.as_mut_ptr(),
+                    3,
+                    frequency,
+                    peak,
+                    enabled,
+                    120.0,
+                );
+                generate(
+                    &mut phase,
+                    ptr::null_mut(),
+                    0,
+                    frequency,
+                    peak,
+                    enabled,
+                    120.0,
+                );
+            }
+            assert!(output.iter().all(|sample| sample.to_bits() == 0));
+            assert_eq!(phase, 0.75);
+        }
+    }
+
+    #[test]
+    fn legacy_frequency_and_phase_shift_preserve_the_calibrated_waveform() {
+        assert_eq!(legacy_frequency(67.0), 66.89453125);
+        assert_eq!(legacy_frequency(114.8), 114.74609375);
+        assert_eq!(legacy_frequency(250.3), 250.244140625);
+        let frequency = legacy_frequency(114.8);
+        let initial = TAU - 0.01;
+        let shifted = (initial + TAU / 3.0) % TAU;
+        let mut whole_phase = initial;
+        let mut split_phase = initial;
+        let mut whole = [0.0; 960];
+        let mut split = [0.0; 960];
+        unsafe {
+            generate(
+                &mut whole_phase,
+                whole.as_mut_ptr(),
+                960,
+                frequency,
+                0.25,
+                1,
+                120.0,
+            );
+        }
+        for (block_index, block) in split.chunks_mut(137).enumerate() {
+            unsafe {
+                generate(
+                    &mut split_phase,
+                    block.as_mut_ptr(),
+                    block.len() as u32,
+                    frequency,
+                    0.25,
+                    1,
+                    if block_index == 0 { 120.0 } else { 0.0 },
+                );
+            }
+        }
+        for (index, (whole, split)) in whole.iter().zip(split).enumerate() {
+            let expected =
+                (0.25 * (shifted + TAU * frequency * index as f64 / 48_000.0).sin()) as f32;
+            assert!((whole - expected).abs() < 1e-7);
+            assert!((whole - split).abs() < 1e-7);
+        }
+        assert!((whole_phase - split_phase).abs() < 1e-12);
+        let phase = whole_phase;
+        unsafe {
+            generate(
+                &mut whole_phase,
+                ptr::null_mut(),
+                0,
+                frequency,
+                0.25,
+                1,
+                0.0,
+            )
+        };
+        assert_eq!(whole_phase, phase);
+    }
 }

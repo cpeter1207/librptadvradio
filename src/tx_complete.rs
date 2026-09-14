@@ -1,16 +1,18 @@
-//! Legacy-compatible transmitter completion cleanup.
+//! Transmitter completion cleanup for the whole-session engine.
 //!
 //! This operation owns the small state update that follows a completed
 //! transmitter drain.  It deliberately does not key hardware, clear the
-//! compatibility display string, select CTCSS/DCS, or render PCM.  Those
-//! responsibilities remain with the compatibility adapter, which can retain
-//! its established C cleanup when an older descriptor lacks this member.
+//! adapter's display string, select CTCSS/DCS, or render PCM. Those concerns
+//! remain outside this state transition.
 
 use std::ffi::c_int;
-use std::mem::size_of;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+#[cfg(test)]
+use crate::RADIO_INVALID_ARGUMENT;
+#[cfg(test)]
+use crate::RADIO_OK;
 
 /// Legacy idle transmitter state after the final drain has completed.
 pub const STATE_IDLE: i32 = 0;
@@ -23,11 +25,8 @@ const CTCSS_OPTION_DISABLE: u32 = 3;
 /// as it stores it.  In particular, this primitive does not normalize a
 /// legacy negative value; retaining it lets the C fallback and portable path
 /// produce the same observable timer state.
-#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxCompleteConfig {
-    /// Size supplied by the caller for append-only ABI validation.
-    pub struct_size: u32,
     /// Receiver blanking duration armed immediately after transmitter release.
     pub txrx_blanking_time_ms: i32,
 }
@@ -56,10 +55,7 @@ pub struct TxCompleteState {
 }
 
 /// Validate immutable post-transmit cleanup policy before a stream starts.
-pub(crate) fn validate_config(config: &TxCompleteConfig) -> Result<(), c_int> {
-    if config.struct_size < size_of::<TxCompleteConfig>() as u32 {
-        return Err(RADIO_INVALID_ARGUMENT);
-    }
+pub(crate) fn validate_config(_config: &TxCompleteConfig) -> Result<(), c_int> {
     Ok(())
 }
 
@@ -88,6 +84,8 @@ pub(crate) fn complete(
 /// The call allocates nothing, locks nothing, and performs no device I/O.
 /// Failure leaves the caller state unchanged so the compatibility adapter can
 /// run its retained cleanup branch unchanged.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_tx_complete(
     config: *const TxCompleteConfig,
     state: *mut TxCompleteState,
@@ -118,7 +116,6 @@ mod tests {
 
     fn config(blanking_time_ms: i32) -> TxCompleteConfig {
         TxCompleteConfig {
-            struct_size: std::mem::size_of::<TxCompleteConfig>() as u32,
             txrx_blanking_time_ms: blanking_time_ms,
         }
     }
@@ -152,8 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_configuration_and_nulls_do_not_commit_state() {
-        let mut invalid = config(20);
+    fn null_arguments_do_not_commit_state() {
         let initial = TxCompleteState {
             tx_state: 5,
             tx_ptt_out: 1,
@@ -164,12 +160,6 @@ mod tests {
         };
         let mut state = initial;
 
-        invalid.struct_size = 0;
-        assert_eq!(
-            radio_tx_complete(&invalid, &mut state),
-            RADIO_INVALID_ARGUMENT
-        );
-        assert_eq!(state, initial);
         assert_eq!(
             radio_tx_complete(std::ptr::null(), &mut state),
             RADIO_INVALID_ARGUMENT

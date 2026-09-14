@@ -1,3 +1,17 @@
+librptadvradio (0.1.0~alpha3-1) unstable; urgency=medium
+
+  * Replace granular ABI 2 operations with a complete prepared session.
+  * Publish independent variable-frame receive and transmit callbacks.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Mon, 14 Sep 2026 00:00:00 +0000
+
+librptadvradio (0.1.0~alpha2-1) unstable; urgency=medium
+
+  * Remove unused native repeat and parrot operations from the initial alpha.
+  * Publish descriptor ABI 2 with SONAME 2 and the matching runtime package.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Sun, 13 Sep 2026 00:00:00 +0000
+
 librptadvradio (0.1.0~alpha1-1) unstable; urgency=medium
 
   * Initial portable radio-core ABI package.

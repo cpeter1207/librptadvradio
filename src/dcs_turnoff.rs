@@ -7,9 +7,12 @@
 //! transition without moving any audio or device behavior.
 
 use std::ffi::c_int;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK, timer};
+#[cfg(test)]
+use crate::RADIO_OK;
+use crate::{RADIO_INVALID_ARGUMENT, timer};
 
 /// Legacy transmitter state while normal DCS program audio is active.
 pub const STATE_ACTIVE: i32 = 1;
@@ -135,6 +138,8 @@ pub(crate) fn advance(
 /// The function copies state before validation and advancement. It allocates
 /// nothing, locks nothing, renders no PCM, and performs no I/O. A rejected
 /// call leaves caller storage untouched for the exact compatibility fallback.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_dcs_turnoff_advance(
     config: *const DcsTurnoffConfig,
     input: *const DcsTurnoffInput,
@@ -182,6 +187,53 @@ mod tests {
             elapsed_ms,
             tx_ptt_in,
             begin_turnoff,
+        }
+    }
+
+    #[test]
+    fn invalid_controls_and_transition_states_leave_every_field_unchanged() {
+        for (tx_state, remaining, controls) in [
+            (STATE_ACTIVE, 7, input(-1, 0, 1)),
+            (STATE_ACTIVE, 7, input(20, 0, 2)),
+            (STATE_ACTIVE, 7, input(20, 1, 1)),
+            (STATE_ACTIVE, 7, input(20, 0, 0)),
+            (STATE_TOC, 7, input(20, 0, 1)),
+            (STATE_TOC, 0, input(20, 0, 0)),
+            (-1, 7, input(20, 0, 0)),
+        ] {
+            let original = DcsTurnoffState {
+                tx_state,
+                dcs_turnoff_remaining_ms: remaining,
+                tx_hang_remaining_ms: 8,
+                finish_requested: 1,
+                finish_elapsed_ms: 9,
+            };
+            let mut state = original;
+            assert_eq!(
+                radio_dcs_turnoff_advance(&config(), &controls, &mut state),
+                RADIO_INVALID_ARGUMENT
+            );
+            assert_eq!(state, original);
+        }
+    }
+
+    #[test]
+    fn an_entire_tail_can_expire_on_its_entry_callback() {
+        for (elapsed, residual) in [(180, 0), (187, 7)] {
+            let mut state = DcsTurnoffState {
+                tx_state: STATE_ACTIVE,
+                tx_hang_remaining_ms: 99,
+                ..DcsTurnoffState::default()
+            };
+            assert_eq!(
+                radio_dcs_turnoff_advance(&config(), &input(elapsed, 0, 1), &mut state),
+                RADIO_OK
+            );
+            assert_eq!(state.tx_state, STATE_TOC);
+            assert_eq!(state.tx_hang_remaining_ms, 0);
+            assert_eq!(state.dcs_turnoff_remaining_ms, 0);
+            assert_eq!(state.finish_requested, 1);
+            assert_eq!(state.finish_elapsed_ms, residual);
         }
     }
 

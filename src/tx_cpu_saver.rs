@@ -6,9 +6,12 @@
 //! while the C caller retains the exact early-return behavior.
 
 use std::ffi::c_int;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+use crate::RADIO_INVALID_ARGUMENT;
+#[cfg(test)]
+use crate::RADIO_OK;
 
 /// Immutable transmitter activity snapshot for one CPU-saver update.
 #[repr(C)]
@@ -57,6 +60,8 @@ pub(crate) fn advance(input: &TxCpuSaverInput, state: &mut TxCpuSaverState) -> R
 /// This function allocates nothing, locks nothing, and performs no I/O. It
 /// stages state before publishing it, so rejected snapshots leave the caller's
 /// compatibility state untouched for the exact C fallback.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_tx_cpu_saver_advance(
     input: *const TxCpuSaverInput,
     state: *mut TxCpuSaverState,
@@ -84,6 +89,26 @@ pub(crate) extern "C" fn radio_tx_cpu_saver_advance(
 mod tests {
     use super::{TxCpuSaverInput, TxCpuSaverState, radio_tx_cpu_saver_advance};
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+
+    #[test]
+    fn each_invalid_boolean_preserves_the_halt_state() {
+        for field in 0..4 {
+            let mut input = TxCpuSaverInput::default();
+            let fields = [
+                &mut input.enabled,
+                &mut input.tx_ptt_in,
+                &mut input.tx_ptt_out,
+                &mut input.tx_idle,
+            ];
+            *fields[field] = 2;
+            let mut state = TxCpuSaverState { halted: 1 };
+            assert_eq!(
+                super::advance(&input, &mut state),
+                Err(RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(state.halted, 1);
+        }
+    }
 
     fn advance(
         state: &mut TxCpuSaverState,

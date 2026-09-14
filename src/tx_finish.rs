@@ -8,9 +8,12 @@
 //! descriptor member is unavailable or rejects a snapshot.
 
 use std::ffi::c_int;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK, timer};
+#[cfg(test)]
+use crate::RADIO_OK;
+use crate::{RADIO_INVALID_ARGUMENT, timer};
 
 /// Legacy transmitter state while the final output drain is in progress.
 pub const STATE_FINISHING: i32 = 4;
@@ -22,6 +25,7 @@ const NORMAL_BUFFER_CLEAR_FRAMES: i32 = 3;
 /// Duration of one historical transmitter processing span in milliseconds.
 const LEGACY_FRAME_MS: i32 = 20;
 /// Largest normal or 55 Hz-tail historical buffer-clear count.
+#[cfg(test)]
 const MAX_COMPATIBILITY_BUFFER_CLEAR_FRAMES: i32 = 8;
 
 /// Elapsed native PCM duration for one normal finishing-drain entry.
@@ -77,6 +81,8 @@ pub(crate) fn advance(input: &TxFinishInput, state: &mut TxFinishState) -> Resul
 /// is `STATE_FINISHING`.  A restored historical buffer count with no timer
 /// re-seeds the duration exactly as the retained C continuation does; this is
 /// needed for the existing 55 Hz tail and persisted compatibility state.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) fn advance_continuation(
     input: &TxFinishInput,
     state: &mut TxFinishState,
@@ -112,6 +118,8 @@ pub(crate) fn advance_continuation(
 /// transition can complete in the same native callback exactly as the legacy
 /// C helper does.  The call allocates nothing, locks nothing, and performs no
 /// I/O.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_tx_finish_advance(
     input: *const TxFinishInput,
     state: *mut TxFinishState,
@@ -140,6 +148,8 @@ pub(crate) extern "C" fn radio_tx_finish_advance(
 /// completion state.  It allocates nothing, locks nothing, and performs no
 /// I/O.  Rejected snapshots leave caller state untouched so the compatibility
 /// adapter can execute its retained C continuation.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_tx_finish_continue(
     input: *const TxFinishInput,
     state: *mut TxFinishState,

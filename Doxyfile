@@ -1,6 +1,6 @@
 PROJECT_NAME = librptadvradio
 PROJECT_BRIEF = Portable f32 radio-core ABI for rpt_advanced
-INPUT = README.md include
+INPUT = include
 RECURSIVE = YES
 WARNINGS = YES
 WARN_IF_UNDOCUMENTED = YES

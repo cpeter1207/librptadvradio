@@ -105,6 +105,48 @@ pub unsafe fn measure(
 mod tests {
     use super::{State, measure};
 
+    #[test]
+    fn empty_missing_and_optional_output_spans_keep_the_documented_state() {
+        let mut state = State {
+            peak: 17,
+            ..State::default()
+        };
+        assert_eq!(
+            unsafe {
+                measure(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    1,
+                    1,
+                    1,
+                    &mut state,
+                )
+            },
+            Err(crate::RADIO_INVALID_ARGUMENT)
+        );
+        assert_eq!(state.peak, 17);
+        assert_eq!(
+            unsafe {
+                measure(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    0,
+                    1,
+                    1,
+                    &mut state,
+                )
+            },
+            Ok(false)
+        );
+        assert_eq!(state.peak, 0);
+        let input = [100.0 / 32768.0];
+        assert_eq!(
+            unsafe { measure(input.as_ptr(), core::ptr::null_mut(), 1, 1, 1, &mut state) },
+            Ok(true)
+        );
+        assert_eq!(state.peak, 50);
+    }
+
     fn samples(codes: &[i16]) -> Vec<f32> {
         codes
             .iter()

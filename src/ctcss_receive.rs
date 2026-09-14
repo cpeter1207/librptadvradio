@@ -335,6 +335,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hysteresis_release_and_reverse_burst_reset_selected_decode() {
+        let mut detector = Detector {
+            fudge_factor: 1,
+            decode: 10,
+            peak: 100,
+            z: [100, 0, 0, 0],
+            set_point: 1000,
+            hysteresis: 10,
+            ..Detector::default()
+        };
+        assert!(ReceiveState::process_sample(
+            &mut detector,
+            0,
+            true,
+            false,
+            true
+        ));
+        assert_eq!(detector.decode, 9);
+        detector.dvu = 30;
+        assert!(!ReceiveState::process_sample(
+            &mut detector,
+            0,
+            true,
+            false,
+            true
+        ));
+        assert_eq!(detector.decode, 0);
+        assert_eq!(detector.z, [0; 4]);
+        assert_eq!(detector.dvu, 0);
+    }
+
+    #[test]
     fn relaxed_release_and_saturated_decode_preserve_correlator_rules() {
         let mut detector = Detector {
             fudge_factor: 1,

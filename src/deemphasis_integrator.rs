@@ -100,6 +100,39 @@ pub unsafe fn process(request: Request<'_>) -> Result<(), i32> {
 mod tests {
     use super::{Request, State, process};
 
+    #[test]
+    fn null_input_or_output_preserves_the_accumulator() {
+        for missing_input in [true, false] {
+            let input = [0.0];
+            let mut output = [0.25];
+            let mut state = State { accumulator: 123 };
+            assert_eq!(
+                unsafe {
+                    process(Request {
+                        input: if missing_input {
+                            core::ptr::null()
+                        } else {
+                            input.as_ptr()
+                        },
+                        output: if missing_input {
+                            output.as_mut_ptr()
+                        } else {
+                            core::ptr::null_mut()
+                        },
+                        sample_count: 1,
+                        output_coefficient: 6878,
+                        feedback_coefficient: 25889,
+                        output_gain: 256,
+                        state: &mut state,
+                    })
+                },
+                Err(crate::RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(state.accumulator, 123);
+            assert_eq!(output, [0.25]);
+        }
+    }
+
     fn samples(codes: &[i16]) -> Vec<f32> {
         codes
             .iter()

@@ -1,35 +1,33 @@
 # librptadvradio
 
-`librptadvradio` is the portable, versioned radio-core boundary shared by
-rpt_advanced and USBRadioPlus adapters. It owns no device, Asterisk, OSS,
-PortAudio, ALSA, Hamlib, HID, FFmpeg, or external-library dependency.
+`librptadvradio` is the portable, versioned radio engine shared by
+rpt_advanced and USBRadioPlus adapters. It has no dependency on Asterisk,
+ASL3, OSS, ALSA, PortAudio, Hamlib, HID, FFmpeg, or RNNoise.
 
-This initial ABI establishes the bounded variable-frame native-tick contract:
-canonical interleaved normalized `f32` PCM at 48 kHz, fixed stream setup, opaque state,
-and a real-time tick that does no allocation, I/O, logging, locking, or
-configuration work. CTCSS and DCS decoding, tone generation, parrot storage,
-transmit routing, metering, and receiver/signaling primitives are implemented
-in Rust. USBRadioPlus currently invokes these operations through its C
-compatibility boundary.
+ABI 3 owns one prepared runtime generation with independent serial receive and
+transmit callbacks. Both callbacks accept bounded variable frame counts and
+operate on normalized `f32` PCM at the fixed 48 kHz native rate. Setup copies
+high-level radio policy, selects the engine's fixed detector profiles,
+preallocates every workspace and event queue, and warms borrowed processing
+objects before real-time work starts. Callback work performs no allocation,
+locking, blocking, logging, or device I/O.
 
-Only 48 kHz native streams are supported. Creation rejects other rates; codec
-and app_rpt conversion belongs to their adapters, not this core. RNNoise and
-native processing run at 48 kHz without rate conversion. The shared PCM ring
-still corrects drift between independent clocks at equal nominal rates.
-See rpt_advanced ADR 0035.
+External FFmpeg graphs, RNNoise, and the rate-adjusting program ring are
+represented by narrow borrowed ports. The session owns their ordering but not
+their implementation or lifetime. Prepared per-tone CTCSS notch ports let the
+session select the decoded tone without rebuilding a graph in real time.
+CTCSS qualification follows the configured carrier source: published hardware
+COS for GPIO or parallel inputs, otherwise the native noise or VOX detector.
+Receive processing is returned to the adapter with qualification; ABI 3
+intentionally has no direct software local repeat path. Transmit consumes only
+the prepared program-ring port before native signaling and output routing.
+Normal DCS NRZ and the DCS turn-off sine use distinct prepared shaping ports so
+their established levels remain independent.
 
-The top-level tick remains a silence bootstrap; it is not yet the complete
-radio engine. Channel orchestration and processing are still being migrated.
-The Rust-only `signaling_engine` now owns the composed receive detectors,
-source qualification, transmitter signaling, and status-publication timing.
-It retains sample-offset renderer intents and preallocated diagnostics;
-adapters do not yet select it. Legacy receive voice output is a calibration
-tap only, not a replacement for the delivered FFmpeg-processed audio.
-The transitional transmitter-render interface converts canonical mono f32
-program/signaling input to signed-16 stereo PCM at the existing hardware
-boundary. It performs no device I/O.
-
-Build a release library with `make`. Run `make ci` for formatting, strict
-analysis, Doxygen, Rustdoc, tests, archive, staged-install, and Debian-package
-checks. The public ABI is documented in
+ABI 3 replaces ABI 2 rather than retaining its granular migration operations.
+Consumers must validate the descriptor and SONAME before creating a session.
+The complete C contract is documented in
 `include/rptadvradio/rptadvradio.h`.
+
+Build the shared object with `make`. Run `make ci` for the complete local
+quality gate.

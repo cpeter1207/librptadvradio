@@ -7,9 +7,12 @@
 //! position immediately before the native receive frontend.
 
 use std::ffi::c_int;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+use crate::RADIO_INVALID_ARGUMENT;
+#[cfg(test)]
+use crate::RADIO_OK;
 
 /// No receiver CPU-saver transition is required.
 const ACTION_NONE: u32 = 0;
@@ -80,6 +83,8 @@ pub(crate) fn advance(input: &RxCpuSaverInput, state: &mut RxCpuSaverState) -> R
 /// The operation allocates nothing, locks nothing, and performs no I/O.  It
 /// stages the result before publishing it, so a rejected snapshot leaves the
 /// compatibility caller's state available to its exact C fallback.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_rx_cpu_saver_advance(
     input: *const RxCpuSaverInput,
     state: *mut RxCpuSaverState,
@@ -110,6 +115,31 @@ mod tests {
         radio_rx_cpu_saver_advance,
     };
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+
+    #[test]
+    fn each_invalid_boolean_preserves_the_halt_state() {
+        for field in 0..5 {
+            let mut input = RxCpuSaverInput::default();
+            let fields = [
+                &mut input.enabled,
+                &mut input.carrier_detect,
+                &mut input.signal_mode_null,
+                &mut input.tx_ptt_in,
+                &mut input.tx_ptt_out,
+            ];
+            *fields[field] = 2;
+            let initial = RxCpuSaverState {
+                halted: 1,
+                action: ACTION_ENTER,
+            };
+            let mut state = initial;
+            assert_eq!(
+                super::advance(&input, &mut state),
+                Err(RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(state, initial);
+        }
+    }
 
     #[test]
     fn every_boolean_snapshot_preserves_the_legacy_transition() {

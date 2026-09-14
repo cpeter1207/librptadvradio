@@ -8,9 +8,12 @@
 //! fallback without changing callback ordering.
 
 use std::ffi::c_int;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK, timer::FRAMES_PER_MILLISECOND};
+#[cfg(test)]
+use crate::RADIO_OK;
+use crate::{RADIO_INVALID_ARGUMENT, timer::FRAMES_PER_MILLISECOND};
 
 /// Input snapshot for one post-transmit receive-blanking advance.
 #[repr(C)]
@@ -69,6 +72,8 @@ pub(crate) fn advance(input: &RxBlankingInput, state: &mut RxBlankingState) -> R
 /// performs the resulting PCM mute afterward.  This operation allocates
 /// nothing, locks nothing, and performs no I/O.  On failure it leaves state
 /// unchanged so the compatibility adapter can retain its C arithmetic.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_rx_blanking_advance(
     input: *const RxBlankingInput,
     state: *mut RxBlankingState,
@@ -96,6 +101,22 @@ pub(crate) extern "C" fn radio_rx_blanking_advance(
 mod tests {
     use super::{RxBlankingInput, RxBlankingState, radio_rx_blanking_advance};
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+
+    #[test]
+    fn inactive_blanking_timer_rejects_without_changing_the_prefix() {
+        for remaining_ms in [0, -1] {
+            let initial = RxBlankingState {
+                remaining_ms,
+                blanked_frame_count: 19,
+            };
+            let mut state = initial;
+            assert_eq!(
+                super::advance(&RxBlankingInput::default(), &mut state),
+                Err(RADIO_INVALID_ARGUMENT)
+            );
+            assert_eq!(state, initial);
+        }
+    }
 
     #[test]
     fn whole_callback_blanks_and_expires_at_the_legacy_boundary() {

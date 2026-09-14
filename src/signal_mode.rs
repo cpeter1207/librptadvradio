@@ -1,16 +1,18 @@
-//! Legacy-compatible receive signaling-mode selection.
+//! Receive signaling-mode selection for the whole-session engine.
 //!
 //! This narrow operation owns only the CTCSS/DCS mode hold and CTCSS
 //! transmit-tone selection from the historical radio-signaling loop.  It has
 //! no PCM, device, Asterisk, allocation, logging, or synchronization
-//! dependency.  The compatibility adapter retains configuration parsing and
-//! copies its selected fields into the caller-owned ABI state transactionally.
+//! dependency. The session copies semantic configuration into its owned state
+//! before callbacks begin.
 
 use std::ffi::c_int;
-use std::mem::size_of;
+#[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK, ctcss_receive, timer};
+#[cfg(test)]
+use crate::RADIO_OK;
+use crate::{RADIO_INVALID_ARGUMENT, ctcss_receive, timer};
 
 /// Legacy no-signaling mode.
 pub const MODE_NONE: i32 = 0;
@@ -25,18 +27,15 @@ pub const CTCSS_NONE: i32 = -1;
 /// Number of CTCSS mapping entries in the public ABI.
 pub const TONE_COUNT: usize = ctcss_receive::TONE_COUNT;
 
-/// Immutable C-compatible signaling-mode configuration.
+/// Immutable signaling-mode configuration.
 ///
 /// The compatibility control plane constructs this value from its already
 /// parsed CTCSS configuration.  Mapping entries are exact precomputed tenths
 /// of hertz: zero means receive-only, while a nonzero default retains the
 /// historical no-default sentinel when one was configured by the legacy
 /// parser.  The operation never retains this pointer.
-#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignalModeConfig {
-    /// Size supplied by the caller for append-only ABI validation.
-    pub struct_size: u32,
     /// Configured signaling-mode hold time in milliseconds.
     pub hold_ms: i32,
     /// One when a decoded CTCSS tone may select transmitter CTCSS.
@@ -101,11 +100,12 @@ impl Default for SignalModeState {
 }
 
 impl SignalModeConfig {
-    /// Return a zero-effect configuration with a valid ABI structure size.
+    /// Return a zero-effect configuration.
     #[must_use]
+    #[cfg(test)]
+    #[cfg_attr(coverage, coverage(off))]
     pub fn disabled() -> Self {
         Self {
-            struct_size: size_of::<Self>() as u32,
             hold_ms: 0,
             ctcss_tx_enabled: 0,
             default_tx_ctcss_frequency_tenths_hz: 0,
@@ -120,8 +120,7 @@ impl SignalModeConfig {
 /// valid stream cannot later reject an otherwise valid native callback solely
 /// because of immutable configuration.
 pub(crate) fn validate_config(config: &SignalModeConfig) -> Result<(), c_int> {
-    if config.struct_size < size_of::<SignalModeConfig>() as u32
-        || config.ctcss_tx_enabled > 1
+    if config.ctcss_tx_enabled > 1
         || config
             .mapped_tx_ctcss_frequency_tenths_hz
             .iter()
@@ -208,6 +207,8 @@ pub(crate) fn advance(
 /// All input is copied before the caller-owned state is changed.  An invalid
 /// config or decoder snapshot therefore leaves state untouched, allowing a
 /// compatibility adapter to use its established C fallback safely.
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
 pub(crate) extern "C" fn radio_signal_mode_advance(
     config: *const SignalModeConfig,
     input: *const SignalModeInput,
@@ -243,6 +244,34 @@ mod tests {
         SignalModeState, TONE_COUNT, radio_signal_mode_advance,
     };
     use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
+
+    #[test]
+    fn disabled_encode_equal_mapping_and_refresh_keep_current_state() {
+        let mut config = config();
+        let mut state = SignalModeState {
+            smode: MODE_CTCSS,
+            tx_ctcss_frequency_tenths_hz: 1000,
+            ..SignalModeState::default()
+        };
+        assert_eq!(
+            super::advance(&config, &input(4, 0, 0, 0), &mut state),
+            Ok(())
+        );
+        assert_eq!(state.tx_ctcss_option, 0);
+        config.ctcss_tx_enabled = 0;
+        assert_eq!(
+            super::advance(&config, &input(4, 0, 0, 0), &mut state),
+            Ok(())
+        );
+        assert_eq!(state.last_rx_ctcss, CTCSS_NONE);
+        state.smode = MODE_DCS;
+        assert_eq!(
+            super::advance(&config, &input(CTCSS_NONE, 1, 0, 0), &mut state),
+            Ok(())
+        );
+        assert_eq!(state.smode, MODE_DCS);
+        assert_eq!(state.smode_timer_ms, config.hold_ms);
+    }
 
     fn config() -> SignalModeConfig {
         let mut config = SignalModeConfig::disabled();
@@ -473,14 +502,6 @@ mod tests {
         );
         assert_eq!(state, initial);
 
-        candidate.struct_size = 0;
-        assert_eq!(
-            radio_signal_mode_advance(&candidate, &valid_input, &mut state),
-            RADIO_INVALID_ARGUMENT
-        );
-        assert_eq!(state, initial);
-
-        candidate = config();
         candidate.mapped_tx_ctcss_frequency_tenths_hz[0] = -1;
         assert_eq!(
             radio_signal_mode_advance(&candidate, &valid_input, &mut state),
