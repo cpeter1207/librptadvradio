@@ -92,6 +92,8 @@ struct ReleaseDetector {
     sign: i8,
     samples: u16,
     matched_half_cycles: u8,
+    tail_detected: bool,
+    phase_pending: bool,
     interval_ready: bool,
     nominal_half_cycles: u8,
     phase_locked: bool,
@@ -109,6 +111,8 @@ impl Default for ReleaseDetector {
             sign: 0,
             samples: 0,
             matched_half_cycles: 0,
+            tail_detected: false,
+            phase_pending: false,
             interval_ready: false,
             nominal_half_cycles: 0,
             phase_locked: false,
@@ -135,6 +139,7 @@ impl ReleaseDetector {
         expected_half_cycle_q8: u32,
         phase_period_samples: usize,
     ) -> bool {
+        self.tail_detected = false;
         self.samples = self.samples.saturating_add(1);
         if sample == 0 {
             return false;
@@ -146,9 +151,9 @@ impl ReleaseDetector {
             self.samples = 0;
             return false;
         }
-        let phase_shifted = self.process_phase(sign, phase_period_samples);
+        self.phase_pending |= self.process_phase(sign, phase_period_samples);
         if previous_sign == sign {
-            return phase_shifted;
+            return false;
         }
 
         let interval = self.samples;
@@ -158,7 +163,7 @@ impl ReleaseDetector {
             // The first interval begins at an arbitrary callback boundary and
             // cannot describe a phase discontinuity.
             self.interval_ready = true;
-            return phase_shifted;
+            return false;
         }
 
         let tail_matched = TAIL_HALF_CYCLE_SAMPLES.contains(&interval);
@@ -168,7 +173,10 @@ impl ReleaseDetector {
             0
         };
         self.update_phase_lock(interval, expected_half_cycle_q8);
-        self.matched_half_cycles >= TAIL_REQUIRED_HALF_CYCLES || phase_shifted
+        self.tail_detected = self.matched_half_cycles >= TAIL_REQUIRED_HALF_CYCLES;
+        // A selected tone changing to 55 Hz can look like a phase shift before
+        // two tail half-cycles complete.  Resolve the complete interval first.
+        self.tail_detected || (self.phase_pending && !tail_matched)
     }
 
     /// Lock only after stable selected-tone half cycles to reject unrelated tones.
@@ -225,6 +233,7 @@ pub(crate) struct ReceiveState {
     blanking_samples: i32,
     detectors: [Detector; TONE_COUNT],
     release_detector: ReleaseDetector,
+    tail_tone_active: bool,
 }
 
 impl Default for ReceiveState {
@@ -236,6 +245,7 @@ impl Default for ReceiveState {
             blanking_samples: 0,
             detectors: [Detector::default(); TONE_COUNT],
             release_detector: ReleaseDetector::default(),
+            tail_tone_active: false,
         }
     }
 }
@@ -249,6 +259,7 @@ impl ReceiveState {
         self.blanking_samples = 0;
         self.detectors = COUNTER_FACTORS.map(Detector::configured);
         self.release_detector.reset();
+        self.tail_tone_active = false;
     }
 
     /// Return whether at least one configured table entry can be decoded.
@@ -259,6 +270,18 @@ impl ReceiveState {
     /// Return the current compatibility-table decode index.
     pub(crate) fn decoded(&self) -> i16 {
         self.decoded
+    }
+
+    /// Return whether the current carrier contains a recognized 55 Hz tail.
+    pub(crate) fn tail_tone_active(&self) -> bool {
+        self.tail_tone_active
+    }
+
+    /// End a recognized tail only when the CTCSS carrier source drops.
+    pub(crate) fn clear_tail_on_carrier_loss(&mut self, carrier_detect: bool) {
+        if !carrier_detect {
+            self.tail_tone_active = false;
+        }
     }
 
     /// Set one detector to a deterministic focused-test configuration.
@@ -314,10 +337,11 @@ impl ReceiveState {
     }
 
     /// Immediately release the active decode and preserve ordinary re-acquire blanking.
-    fn release_decode(&mut self) {
+    fn release_decode(&mut self, tail_tone_active: bool) {
         self.blanking_samples = RELEASE_BLANKING_SAMPLES;
         self.decoded = -1;
         self.release_detector.reset();
+        self.tail_tone_active = tail_tone_active;
         for detector in &mut self.detectors {
             detector.clear_after_loss();
         }
@@ -332,7 +356,7 @@ impl ReceiveState {
         &mut self,
         samples: *const f32,
         sample_count: u32,
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         if self.decoded < 0 {
             self.release_detector.reset();
             return None;
@@ -347,7 +371,7 @@ impl ReceiveState {
                 expected_half_cycle_q8,
                 phase_period_samples,
             ) {
-                return Some(index as u32 + 1);
+                return Some((index as u32 + 1, self.release_detector.tail_detected));
             }
         }
         None
@@ -457,22 +481,24 @@ impl ReceiveState {
         carrier_detect: bool,
     ) -> i16 {
         if !self.enabled() {
+            self.tail_tone_active = false;
             return -1;
         }
 
         if !carrier_detect {
+            self.clear_tail_on_carrier_loss(false);
             self.release_detector.reset();
             return unsafe { self.process_decoder(samples, sample_count, false) };
         }
 
-        if let Some(release_sample_count) =
+        if let Some((release_sample_count, tail_tone_active)) =
             unsafe { self.release_signal_sample_count(samples, sample_count) }
         {
             // Advance the compatibility correlator up to the event, then
             // release at its sample boundary.  Processing the remainder with
             // blanking active gives the same state for whole and split calls.
             unsafe { self.process_decoder(samples, release_sample_count, true) };
-            self.release_decode();
+            self.release_decode(tail_tone_active);
             let remaining = sample_count - release_sample_count;
             if remaining != 0 {
                 unsafe {
@@ -554,7 +580,7 @@ impl ReceiveState {
         if hit >= 0 && self.decoded < 0 && self.blanking_samples == 0 {
             self.decoded = hit;
         } else if self.decoded >= 0 && selected_detector_probed && !selected_detector_qualified {
-            self.release_decode();
+            self.release_decode(false);
         }
         self.decoded
     }
@@ -853,6 +879,81 @@ mod tests {
             -1
         );
         assert_eq!(state.decoded(), -1);
+    }
+
+    #[test]
+    fn tail_state_persists_until_carrier_loss_but_phase_release_does_not_set_it() {
+        const TONE_INDEX: usize = 11;
+        let mut selected = [0.0_f32; 640];
+        let mut tail = [0.0_f32; 512];
+        let mut tail_state = ReceiveState::default();
+
+        activate_selected_detector(&mut tail_state, TONE_INDEX);
+        tail_state.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(&mut selected, 100.0, None);
+        assert_eq!(
+            unsafe { tail_state.process(selected.as_ptr(), selected.len() as u32, true) },
+            TONE_INDEX as i16
+        );
+        assert!(tail_state.release_detector.phase_locked);
+        center_sliced_tone(&mut tail, 55.0, None);
+        assert_eq!(
+            unsafe { tail_state.process(tail.as_ptr(), tail.len() as u32, true) },
+            -1
+        );
+        assert!(tail_state.tail_tone_active());
+        assert_eq!(
+            unsafe { tail_state.process(core::ptr::null(), 0, true) },
+            -1
+        );
+        assert!(tail_state.tail_tone_active());
+        assert_eq!(
+            unsafe { tail_state.process(core::ptr::null(), 0, false) },
+            -1
+        );
+        assert!(!tail_state.tail_tone_active());
+
+        let mut phase = [0.0_f32; 480];
+        let mut phase_state = ReceiveState::default();
+        activate_selected_detector(&mut phase_state, TONE_INDEX);
+        phase_state.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(
+            &mut phase,
+            100.0,
+            Some((320, 2.0 * core::f32::consts::PI / 3.0)),
+        );
+        assert_eq!(
+            unsafe { phase_state.process(phase.as_ptr(), phase.len() as u32, true) },
+            -1
+        );
+        assert!(!phase_state.tail_tone_active());
+    }
+
+    #[test]
+    fn fifty_five_hz_tail_wins_over_phase_release_for_every_supported_tone() {
+        for (tone_index, frequency_hz) in FREQUENCIES.into_iter().enumerate() {
+            let period = (f64::from(SAMPLE_RATE_HZ) / frequency_hz).ceil() as usize;
+            let mut selected = vec![0.0_f32; period * 4];
+            let mut tail = [0.0_f32; 512];
+            let mut state = ReceiveState::default();
+
+            activate_selected_detector(&mut state, tone_index);
+            state.detectors[tone_index].counter = i16::MAX;
+            center_sliced_tone(&mut selected, frequency_hz as f32, None);
+            assert_eq!(
+                unsafe { state.process(selected.as_ptr(), selected.len() as u32, true) },
+                tone_index as i16
+            );
+            assert!(state.release_detector.phase_locked);
+
+            center_sliced_tone(&mut tail, 55.0, None);
+            assert_eq!(
+                unsafe { state.process(tail.as_ptr(), tail.len() as u32, true) },
+                -1,
+                "{frequency_hz} Hz decoded tone"
+            );
+            assert!(state.tail_tone_active(), "{frequency_hz} Hz decoded tone");
+        }
     }
 
     #[test]

@@ -181,6 +181,8 @@ pub struct ProcessResult {
     pub vox_detect: bool,
     /// Current CTCSS table index, or `-1` when unqualified.
     pub ctcss_decoded: i16,
+    /// Whether a 55 Hz CTCSS tail is active until the carrier source drops.
+    pub ctcss_tail_tone_active: bool,
     /// Whether the configured DCS decoder is qualified.
     pub dcs_valid: bool,
     /// Post-decoder-gain CTCSS half peak-to-peak level as normalized PCM.
@@ -515,6 +517,7 @@ impl ReceivePath {
             self.last_native_count = 0;
             self.last_result = ProcessResult {
                 ctcss_decoded: self.ctcss_state.decoded(),
+                ctcss_tail_tone_active: self.ctcss_state.tail_tone_active(),
                 ctcss_decoder_peak: f32::from(self.center_state.peak) / 32_768.0,
                 dcs_valid: self.dcs_state.valid(),
                 rssi_peak: self.frontend_state.rssi_peak,
@@ -602,6 +605,8 @@ impl ReceivePath {
         if self.dcs_state.enabled() {
             let _ = unsafe { self.dcs_state.process(input, native_frame_count_u32) };
         }
+        let ctcss_carrier = external_carrier.unwrap_or(carrier_detect);
+        self.ctcss_state.clear_tail_on_carrier_loss(ctcss_carrier);
         let ctcss_decoded = if baseband_count != 0
             && self.ctcss_state.enabled()
             && (self.voice_processing_active || self.ctcss_state.decoded() != -1)
@@ -610,7 +615,7 @@ impl ReceivePath {
                 self.ctcss_state.process(
                     self.limited.as_ptr(),
                     baseband_count as u32,
-                    external_carrier.unwrap_or(carrier_detect),
+                    ctcss_carrier,
                 )
             }
         } else {
@@ -624,6 +629,7 @@ impl ReceivePath {
             carrier_detect,
             vox_detect,
             ctcss_decoded,
+            ctcss_tail_tone_active: self.ctcss_state.tail_tone_active(),
             dcs_valid: self.dcs_state.valid(),
             ctcss_decoder_peak: f32::from(self.center_state.peak) / 32_768.0,
             rssi_peak: self.frontend_state.rssi_peak,
