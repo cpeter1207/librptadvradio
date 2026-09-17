@@ -1,4 +1,4 @@
-//! ABI 3 whole-session radio engine.
+//! ABI 4 whole-session radio engine.
 //!
 //! One prepared session owns independent receive and transmit workers.  The
 //! workers may run concurrently, but each has exactly one serial callback
@@ -20,7 +20,7 @@ use crate::{
 
 pub(crate) const NATIVE_SAMPLE_RATE_HZ: u32 = 48_000;
 pub(crate) const CANONICAL_CHANNELS: u32 = 2;
-pub(crate) const ABI_VERSION: u32 = 3;
+pub(crate) const ABI_VERSION: u32 = 4;
 pub(crate) const OK: c_int = 0;
 pub(crate) const INVALID_ARGUMENT: c_int = -1;
 pub(crate) const PROVIDER_FAILED: c_int = -2;
@@ -255,6 +255,8 @@ pub(crate) struct SessionPorts {
     pub(crate) transmit_dcs_normal_filter: ProcessorPort,
     pub(crate) transmit_dcs_turnoff_filter: ProcessorPort,
     pub(crate) program_ring: ProgramRingPort,
+    /// Prepared 55 Hz CTCSS tail notch, selected until carrier loss.
+    pub(crate) receive_ctcss_tail_notch: ProcessorPort,
 }
 
 impl Default for SessionPorts {
@@ -270,6 +272,7 @@ impl Default for SessionPorts {
             transmit_dcs_normal_filter: ProcessorPort::default(),
             transmit_dcs_turnoff_filter: ProcessorPort::default(),
             program_ring: ProgramRingPort::default(),
+            receive_ctcss_tail_notch: ProcessorPort::default(),
         }
     }
 }
@@ -411,6 +414,7 @@ struct Ports {
     transmit_dcs_normal_filter: ProcessorPort,
     transmit_dcs_turnoff_filter: ProcessorPort,
     program_ring: ProgramRingPort,
+    receive_ctcss_tail_notch: ProcessorPort,
 }
 
 struct ReceiveWorker {
@@ -928,6 +932,7 @@ pub(crate) unsafe extern "C" fn create(
             transmit_dcs_normal_filter: ports.transmit_dcs_normal_filter,
             transmit_dcs_turnoff_filter: ports.transmit_dcs_turnoff_filter,
             program_ring: ports.program_ring,
+            receive_ctcss_tail_notch: ports.receive_ctcss_tail_notch,
         },
         receive: UnsafeCell::new(ReceiveWorker {
             detector,
@@ -1064,15 +1069,20 @@ unsafe fn run_optional_processor(
 unsafe fn run_receive_filters(
     ports: &Ports,
     decoded_ctcss: i16,
+    tail_tone_active: bool,
     input: &[f32],
     filtered: &mut [f32],
     notched: &mut [f32],
 ) -> Result<bool, c_int> {
     unsafe { run_processor(ports.receive_filter, input, filtered) }?;
-    let notch = usize::try_from(decoded_ctcss)
-        .ok()
-        .and_then(|index| ports.receive_ctcss_notch.get(index))
-        .copied()
+    let notch = tail_tone_active
+        .then_some(ports.receive_ctcss_tail_notch)
+        .or_else(|| {
+            usize::try_from(decoded_ctcss)
+                .ok()
+                .and_then(|index| ports.receive_ctcss_notch.get(index))
+                .copied()
+        })
         .filter(|port| port.process_f32.is_some());
     let Some(port) = notch else {
         return Ok(false);
@@ -1124,7 +1134,12 @@ pub(crate) unsafe extern "C" fn warm(session: *mut Session) -> c_int {
             .copy_from_slice(&receive.work_a[..rx_frames as usize]);
     }
     receive.input_mono.fill(0.0);
-    for port in session.ports.receive_ctcss_notch {
+    for port in session
+        .ports
+        .receive_ctcss_notch
+        .into_iter()
+        .chain([session.ports.receive_ctcss_tail_notch])
+    {
         if port.process_f32.is_some()
             && (unsafe { warm_port(port, rx_frames) }.is_err()
                 || unsafe {
@@ -1401,6 +1416,7 @@ pub(crate) unsafe extern "C" fn receive(
         run_receive_filters(
             &session.ports,
             detected.ctcss_decoded,
+            detected.ctcss_tail_tone_active,
             &worker.work_a[..count],
             &mut worker.work_b[..count],
             &mut worker.work_c[..count],
@@ -2271,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_filter_selects_only_the_decoded_prepared_notch() {
+    fn receive_filter_selects_decoded_or_tail_prepared_notch() {
         let mut fixed = TestProcessor {
             bias: 1.0,
             ..TestProcessor::default()
@@ -2284,6 +2300,10 @@ mod tests {
             bias: 4.0,
             ..TestProcessor::default()
         };
+        let mut tail = TestProcessor {
+            bias: 8.0,
+            ..TestProcessor::default()
+        };
         let mut ports = Ports {
             receive_deemphasis: ProcessorPort::default(),
             receive_filter: test_port(&mut fixed),
@@ -2294,6 +2314,7 @@ mod tests {
             transmit_dcs_normal_filter: ProcessorPort::default(),
             transmit_dcs_turnoff_filter: ProcessorPort::default(),
             program_ring: ProgramRingPort::default(),
+            receive_ctcss_tail_notch: test_port(&mut tail),
         };
         ports.receive_ctcss_notch[5] = test_port(&mut selected);
         ports.receive_ctcss_notch[6] = test_port(&mut other);
@@ -2302,20 +2323,27 @@ mod tests {
         let mut notched = [0.0; 2];
 
         assert!(!unsafe {
-            run_receive_filters(&ports, -1, &input, &mut filtered, &mut notched).unwrap()
+            run_receive_filters(&ports, -1, false, &input, &mut filtered, &mut notched).unwrap()
         });
         assert_eq!(filtered, [1.25, 0.75]);
         assert_eq!(selected.calls, 0);
         assert!(unsafe {
-            run_receive_filters(&ports, 5, &input, &mut filtered, &mut notched).unwrap()
+            run_receive_filters(&ports, 5, false, &input, &mut filtered, &mut notched).unwrap()
         });
         assert_eq!(notched, [3.25, 2.75]);
         assert_eq!(selected.calls, 1);
         assert_eq!(other.calls, 0);
 
+        assert!(unsafe {
+            run_receive_filters(&ports, -1, true, &input, &mut filtered, &mut notched).unwrap()
+        });
+        assert_eq!(notched, [9.25, 8.75]);
+        assert_eq!(tail.calls, 1);
+        assert_eq!(selected.calls, 1);
+
         selected.fail = true;
         assert_eq!(
-            unsafe { run_receive_filters(&ports, 5, &input, &mut filtered, &mut notched) },
+            unsafe { run_receive_filters(&ports, 5, false, &input, &mut filtered, &mut notched) },
             Err(PROVIDER_FAILED)
         );
         assert_eq!(notched, [0.0; 2]);
@@ -2784,7 +2812,7 @@ mod tests {
 
     #[test]
     fn warm_failures_are_retryable_for_every_processor_group() {
-        for index in 0..8 {
+        for index in 0..9 {
             for warm_failure in [false, true] {
                 let mut processor = TestProcessor {
                     fail: true,
@@ -2804,6 +2832,7 @@ mod tests {
                     5 => ports.transmit_program = port,
                     6 => ports.transmit_dcs_normal_filter = port,
                     7 => ports.transmit_dcs_turnoff_filter = port,
+                    8 => ports.receive_ctcss_tail_notch = port,
                     _ => unreachable!(),
                 }
                 let session = TestSession::new(&valid_config(), &ports);
