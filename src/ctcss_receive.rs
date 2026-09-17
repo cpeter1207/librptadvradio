@@ -20,6 +20,15 @@ const HYSTERESIS: i16 = (Q15 as f64 * 0.0130) as i16;
 const BIN_FACTOR: i16 = (Q15 as f64 * 0.135) as i16;
 const FUDGE_FACTOR: i16 = 8;
 const RELEASE_BLANKING_SAMPLES: i32 = SAMPLE_RATE_HZ as i32 / 5;
+const Q8: u32 = 256;
+const PHASE_LOCK_TOLERANCE_Q8: u32 = Q8 * 2;
+const MAX_PHASE_WINDOW_SAMPLES: usize = 120;
+/// Half-cycle bounds for the standard 55 Hz CTCSS tail tone.
+///
+/// The 70 through 76 sample range admits a 55 Hz tail at 8 kHz while rejecting
+/// the adjacent 50 Hz and 60 Hz mains frequencies.
+const TAIL_HALF_CYCLE_SAMPLES: core::ops::RangeInclusive<u16> = 70..=76;
+const TAIL_REQUIRED_HALF_CYCLES: u8 = 2;
 
 /// Exact CTCSS correlator clock dividers from the legacy 8 kHz decoder.
 const COUNTER_FACTORS: [i16; TONE_COUNT] = [
@@ -73,6 +82,141 @@ impl Detector {
     }
 }
 
+/// Callback-owned detector for CTCSS release signaling.
+///
+/// The input has already passed the CTCSS center slicer.  It uses half-cycle
+/// intervals to recognize the 55 Hz tail, then compares selected-tone signs
+/// one period apart to recognize a 120-degree-or-greater phase discontinuity.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ReleaseDetector {
+    sign: i8,
+    samples: u16,
+    matched_half_cycles: u8,
+    interval_ready: bool,
+    nominal_half_cycles: u8,
+    phase_locked: bool,
+    phase_sign_history: [i8; MAX_PHASE_WINDOW_SAMPLES],
+    phase_mismatch_history: [u8; MAX_PHASE_WINDOW_SAMPLES],
+    phase_index: usize,
+    phase_history_count: usize,
+    phase_mismatch_count: usize,
+    phase_mismatch_total: usize,
+}
+
+impl Default for ReleaseDetector {
+    fn default() -> Self {
+        Self {
+            sign: 0,
+            samples: 0,
+            matched_half_cycles: 0,
+            interval_ready: false,
+            nominal_half_cycles: 0,
+            phase_locked: false,
+            phase_sign_history: [0; MAX_PHASE_WINDOW_SAMPLES],
+            phase_mismatch_history: [0; MAX_PHASE_WINDOW_SAMPLES],
+            phase_index: 0,
+            phase_history_count: 0,
+            phase_mismatch_count: 0,
+            phase_mismatch_total: 0,
+        }
+    }
+}
+
+impl ReleaseDetector {
+    /// Clear a partial candidate whenever decoder qualification is lost.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Consume one center-sliced sample and report a recognized release signal.
+    fn process(
+        &mut self,
+        sample: i16,
+        expected_half_cycle_q8: u32,
+        phase_period_samples: usize,
+    ) -> bool {
+        self.samples = self.samples.saturating_add(1);
+        if sample == 0 {
+            return false;
+        }
+        let sign = if sample.is_negative() { -1 } else { 1 };
+        let previous_sign = self.sign;
+        if previous_sign == 0 {
+            self.sign = sign;
+            self.samples = 0;
+            return false;
+        }
+        let phase_shifted = self.process_phase(sign, phase_period_samples);
+        if previous_sign == sign {
+            return phase_shifted;
+        }
+
+        let interval = self.samples;
+        self.sign = sign;
+        self.samples = 0;
+        if !self.interval_ready {
+            // The first interval begins at an arbitrary callback boundary and
+            // cannot describe a phase discontinuity.
+            self.interval_ready = true;
+            return phase_shifted;
+        }
+
+        let tail_matched = TAIL_HALF_CYCLE_SAMPLES.contains(&interval);
+        self.matched_half_cycles = if tail_matched {
+            self.matched_half_cycles.saturating_add(1)
+        } else {
+            0
+        };
+        self.update_phase_lock(interval, expected_half_cycle_q8);
+        self.matched_half_cycles >= TAIL_REQUIRED_HALF_CYCLES || phase_shifted
+    }
+
+    /// Lock only after stable selected-tone half cycles to reject unrelated tones.
+    fn update_phase_lock(&mut self, interval: u16, expected_half_cycle_q8: u32) {
+        if self.phase_locked {
+            return;
+        }
+        let interval_q8 = u32::from(interval) * Q8;
+        if interval_q8.abs_diff(expected_half_cycle_q8) <= PHASE_LOCK_TOLERANCE_Q8 {
+            self.nominal_half_cycles = self.nominal_half_cycles.saturating_add(1);
+        } else {
+            self.nominal_half_cycles = 0;
+        }
+        if self.nominal_half_cycles >= 2 {
+            self.phase_locked = true;
+            self.phase_index = 0;
+            self.phase_history_count = 0;
+            self.phase_mismatch_count = 0;
+            self.phase_mismatch_total = 0;
+        }
+    }
+
+    /// Compare the sign with the sign exactly one selected-tone period earlier.
+    fn process_phase(&mut self, sign: i8, phase_period_samples: usize) -> bool {
+        if !self.phase_locked {
+            return false;
+        }
+
+        let index = self.phase_index;
+        if self.phase_history_count < phase_period_samples {
+            self.phase_history_count += 1;
+        } else {
+            let mismatch = usize::from(sign != self.phase_sign_history[index]);
+            if self.phase_mismatch_count < phase_period_samples {
+                self.phase_mismatch_count += 1;
+            } else {
+                self.phase_mismatch_total -= self.phase_mismatch_history[index] as usize;
+            }
+            self.phase_mismatch_history[index] = mismatch as u8;
+            self.phase_mismatch_total += mismatch;
+        }
+        self.phase_sign_history[index] = sign;
+        self.phase_index = (index + 1) % phase_period_samples;
+        self.phase_mismatch_count == phase_period_samples
+            && self.phase_mismatch_total * 12 >= phase_period_samples * 7
+    }
+}
+
 /// Callback-owned CTCSS receiver state for one fixed native stream.
 pub(crate) struct ReceiveState {
     tone_mask: u64,
@@ -80,6 +224,7 @@ pub(crate) struct ReceiveState {
     decoded: i16,
     blanking_samples: i32,
     detectors: [Detector; TONE_COUNT],
+    release_detector: ReleaseDetector,
 }
 
 impl Default for ReceiveState {
@@ -90,6 +235,7 @@ impl Default for ReceiveState {
             decoded: -1,
             blanking_samples: 0,
             detectors: [Detector::default(); TONE_COUNT],
+            release_detector: ReleaseDetector::default(),
         }
     }
 }
@@ -102,6 +248,7 @@ impl ReceiveState {
         self.decoded = -1;
         self.blanking_samples = 0;
         self.detectors = COUNTER_FACTORS.map(Detector::configured);
+        self.release_detector.reset();
     }
 
     /// Return whether at least one configured table entry can be decoded.
@@ -164,6 +311,54 @@ impl ReceiveState {
         // caller supplying an out-of-range F32 value deterministic and safe.
         let scaled = (sample * 32_768.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX));
         scaled as i16
+    }
+
+    /// Immediately release the active decode and preserve ordinary re-acquire blanking.
+    fn release_decode(&mut self) {
+        self.blanking_samples = RELEASE_BLANKING_SAMPLES;
+        self.decoded = -1;
+        self.release_detector.reset();
+        for detector in &mut self.detectors {
+            detector.clear_after_loss();
+        }
+    }
+
+    /// Detect known CTCSS release signaling after this stream qualified a tone.
+    ///
+    /// The release detector runs at every center-sliced input sample.  It
+    /// closes on two 55 Hz tail half-cycles or a 120-degree-or-greater phase
+    /// discontinuity in the selected CTCSS tone.
+    unsafe fn release_signal_sample_count(
+        &mut self,
+        samples: *const f32,
+        sample_count: u32,
+    ) -> Option<u32> {
+        if self.decoded < 0 {
+            self.release_detector.reset();
+            return None;
+        }
+        let (expected_half_cycle_q8, phase_period_samples) =
+            Self::phase_parameters(FREQUENCIES[self.decoded as usize]);
+        for index in 0..sample_count as usize {
+            // SAFETY: the caller guarantees the complete input span is readable.
+            let sample = unsafe { samples.add(index).read() };
+            if self.release_detector.process(
+                Self::sample_to_i16(sample),
+                expected_half_cycle_q8,
+                phase_period_samples,
+            ) {
+                return Some(index as u32 + 1);
+            }
+        }
+        None
+    }
+
+    /// Return fixed-point reference values for one selected CTCSS frequency.
+    fn phase_parameters(frequency_hz: f64) -> (u32, usize) {
+        let expected_half_cycle_q8 =
+            (f64::from(SAMPLE_RATE_HZ) * f64::from(Q8) / (2.0 * frequency_hz)).round() as u32;
+        let phase_period_samples = (f64::from(SAMPLE_RATE_HZ) / frequency_hz).round() as usize;
+        (expected_half_cycle_q8, phase_period_samples)
     }
 
     /// Consume one legacy decoder sample for one configured detector.
@@ -265,6 +460,46 @@ impl ReceiveState {
             return -1;
         }
 
+        if !carrier_detect {
+            self.release_detector.reset();
+            return unsafe { self.process_decoder(samples, sample_count, false) };
+        }
+
+        if let Some(release_sample_count) =
+            unsafe { self.release_signal_sample_count(samples, sample_count) }
+        {
+            // Advance the compatibility correlator up to the event, then
+            // release at its sample boundary.  Processing the remainder with
+            // blanking active gives the same state for whole and split calls.
+            unsafe { self.process_decoder(samples, release_sample_count, true) };
+            self.release_decode();
+            let remaining = sample_count - release_sample_count;
+            if remaining != 0 {
+                unsafe {
+                    self.process_decoder(
+                        samples.add(release_sample_count as usize),
+                        remaining,
+                        true,
+                    )
+                };
+            }
+            return self.decoded;
+        }
+
+        unsafe { self.process_decoder(samples, sample_count, true) }
+    }
+
+    /// Advance the legacy correlator without inspecting release signaling.
+    ///
+    /// # Safety
+    /// `samples` is readable for `sample_count` F32 values when that count is
+    /// nonzero.  The caller serializes access through its callback-owned radio.
+    unsafe fn process_decoder(
+        &mut self,
+        samples: *const f32,
+        sample_count: u32,
+        carrier_detect: bool,
+    ) -> i16 {
         let decoded_before = self.decoded;
         let mut hit = -1_i16;
         let mut selected_detector_probed = false;
@@ -319,11 +554,7 @@ impl ReceiveState {
         if hit >= 0 && self.decoded < 0 && self.blanking_samples == 0 {
             self.decoded = hit;
         } else if self.decoded >= 0 && selected_detector_probed && !selected_detector_qualified {
-            self.blanking_samples = RELEASE_BLANKING_SAMPLES;
-            self.decoded = -1;
-            for detector in &mut self.detectors {
-                detector.clear_after_loss();
-            }
+            self.release_decode();
         }
         self.decoded
     }
@@ -423,6 +654,41 @@ mod tests {
         detector.dvu = 0;
         detector.dvd = 0;
         detector.zd = 0;
+    }
+
+    /// Render the center-sliced waveform delivered by the compatibility frontend.
+    fn center_sliced_tone(
+        samples: &mut [f32],
+        frequency_hz: f32,
+        phase_step: Option<(usize, f32)>,
+    ) {
+        for (index, sample) in samples.iter_mut().enumerate() {
+            let phase = core::f32::consts::TAU * frequency_hz * index as f32
+                / SAMPLE_RATE_HZ as f32
+                + phase_step
+                    .filter(|(start, _)| index >= *start)
+                    .map_or(0.0, |(_, step)| step);
+            *sample = if phase.sin() >= 0.0 {
+                625.0 / 32_768.0
+            } else {
+                -625.0 / 32_768.0
+            };
+        }
+    }
+
+    /// Report whether a test waveform triggers only the release detector.
+    fn has_release_signal(samples: &[f32], frequency_hz: f64) -> bool {
+        let mut detector = ReleaseDetector::default();
+        let (expected_half_cycle_q8, phase_period_samples) =
+            ReceiveState::phase_parameters(frequency_hz);
+
+        samples.iter().copied().any(|sample| {
+            detector.process(
+                ReceiveState::sample_to_i16(sample),
+                expected_half_cycle_q8,
+                phase_period_samples,
+            )
+        })
     }
 
     /// Make one selected detector probe every supplied sample for focused loss tests.
@@ -570,6 +836,253 @@ mod tests {
         );
         assert_eq!(state.decoded(), TONE_INDEX as i16);
         assert_eq!(state.test_blanking_samples(), 0);
+    }
+
+    #[test]
+    fn fifty_five_hz_tail_closes_an_active_decode() {
+        const TONE_INDEX: usize = 11;
+        let mut state = ReceiveState::default();
+        let mut tail = [0.0_f32; 512];
+
+        activate_selected_detector(&mut state, TONE_INDEX);
+        state.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(&mut tail, 55.0, None);
+
+        assert_eq!(
+            unsafe { state.process(tail.as_ptr(), tail.len() as u32, true) },
+            -1
+        );
+        assert_eq!(state.decoded(), -1);
+    }
+
+    #[test]
+    fn legacy_reverse_burst_envelope_closes_an_active_decode() {
+        const TONE_INDEX: usize = 11;
+        let mut state = ReceiveState::default();
+
+        activate_selected_detector(&mut state, TONE_INDEX);
+        state.detectors[TONE_INDEX].dvu = 30;
+        assert_eq!(unsafe { state.process([0.0].as_ptr(), 1, true) }, -1);
+        assert_eq!(state.decoded(), -1);
+    }
+
+    #[test]
+    fn one_hundred_twenty_degree_phase_shift_closes_an_active_decode() {
+        const TONE_INDEX: usize = 11;
+        let mut state = ReceiveState::default();
+        let mut tone = [0.0_f32; 480];
+
+        activate_selected_detector(&mut state, TONE_INDEX);
+        state.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(
+            &mut tone,
+            100.0,
+            Some((320, 2.0 * core::f32::consts::PI / 3.0)),
+        );
+
+        assert_eq!(
+            unsafe { state.process(tone.as_ptr(), tone.len() as u32, true) },
+            -1
+        );
+        assert_eq!(state.decoded(), -1);
+    }
+
+    #[test]
+    fn release_detector_accepts_one_hundred_twenty_but_not_ninety_degrees() {
+        let mut one_twenty = [0.0_f32; 480];
+        let mut ninety = [0.0_f32; 480];
+
+        center_sliced_tone(
+            &mut one_twenty,
+            100.0,
+            Some((320, 2.0 * core::f32::consts::PI / 3.0)),
+        );
+        center_sliced_tone(&mut ninety, 100.0, Some((320, core::f32::consts::PI / 2.0)));
+
+        assert!(has_release_signal(&one_twenty, 100.0));
+        assert!(!has_release_signal(&ninety, 100.0));
+    }
+
+    #[test]
+    fn phase_release_threshold_covers_each_tone_and_phase_offset() {
+        for frequency_hz in FREQUENCIES {
+            let (expected_half_cycle_q8, _) = ReceiveState::phase_parameters(frequency_hz);
+            let period = (expected_half_cycle_q8 as usize).div_ceil(Q8 as usize) * 2;
+            // Allow the reference to observe multiple stable crossings before
+            // applying the reverse-burst step.
+            let warmup = period * 4;
+            for phase_offset in 0..period {
+                for (phase_step, expected_release) in [
+                    (2.0 * core::f32::consts::PI / 3.0, true),
+                    (-2.0 * core::f32::consts::PI / 3.0, true),
+                    (core::f32::consts::PI / 2.0, false),
+                    (-core::f32::consts::PI / 2.0, false),
+                ] {
+                    let mut samples = vec![0.0_f32; warmup + period * 3];
+                    center_sliced_tone(
+                        &mut samples,
+                        frequency_hz as f32,
+                        Some((warmup + phase_offset, phase_step)),
+                    );
+                    assert_eq!(
+                        has_release_signal(&samples, frequency_hz),
+                        expected_release,
+                        "{frequency_hz} Hz, phase offset {phase_offset}, step {phase_step}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase_release_matches_whole_and_split_callbacks() {
+        const TONE_INDEX: usize = 11;
+        const PARTITIONS: [usize; 3] = [133, 19, 488];
+        let mut whole = ReceiveState::default();
+        let mut split = ReceiveState::default();
+        let mut samples = [0.0_f32; 640];
+
+        activate_selected_detector(&mut whole, TONE_INDEX);
+        activate_selected_detector(&mut split, TONE_INDEX);
+        whole.detectors[TONE_INDEX].counter = i16::MAX;
+        split.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(
+            &mut samples,
+            100.0,
+            Some((400, 2.0 * core::f32::consts::PI / 3.0)),
+        );
+        assert_eq!(
+            unsafe { whole.process(samples.as_ptr(), samples.len() as u32, true) },
+            -1
+        );
+
+        let mut offset = 0;
+        for count in PARTITIONS {
+            unsafe { split.process(samples[offset..].as_ptr(), count as u32, true) };
+            offset += count;
+        }
+
+        assert_eq!(offset, samples.len());
+        assert_eq!(split.decoded(), whole.decoded());
+        assert_eq!(split.blanking_samples, whole.blanking_samples);
+        assert!(split.release_detector == whole.release_detector);
+        for (actual, expected) in split.detectors.iter().zip(&whole.detectors) {
+            assert_eq!(actual.counter, expected.counter);
+            assert_eq!(actual.peak, expected.peak);
+            assert_eq!(actual.z_index, expected.z_index);
+            assert_eq!(actual.z, expected.z);
+            assert_eq!(actual.dvu, expected.dvu);
+            assert_eq!(actual.dvd, expected.dvd);
+            assert_eq!(actual.zd, expected.zd);
+            assert_eq!(actual.decode, expected.decode);
+        }
+    }
+
+    #[test]
+    fn ninety_degree_phase_shift_preserves_an_active_decode() {
+        const TONE_INDEX: usize = 11;
+        let mut state = ReceiveState::default();
+        let mut tone = [0.0_f32; 480];
+
+        activate_selected_detector(&mut state, TONE_INDEX);
+        state.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(&mut tone, 100.0, Some((320, core::f32::consts::PI / 2.0)));
+
+        assert_eq!(
+            unsafe { state.process(tone.as_ptr(), tone.len() as u32, true) },
+            TONE_INDEX as i16
+        );
+        assert_eq!(state.decoded(), TONE_INDEX as i16);
+    }
+
+    #[test]
+    fn mains_frequencies_do_not_look_like_release_signaling() {
+        let (expected_half_cycle_q8, phase_period_samples) = ReceiveState::phase_parameters(100.0);
+        for frequency_hz in [50.0_f32, 60.0] {
+            let mut detector = ReleaseDetector::default();
+            let mut tone = [0.0_f32; 512];
+
+            center_sliced_tone(&mut tone, frequency_hz, None);
+            assert!(tone.into_iter().all(|sample| !detector.process(
+                ReceiveState::sample_to_i16(sample),
+                expected_half_cycle_q8,
+                phase_period_samples,
+            )));
+        }
+    }
+
+    #[test]
+    fn tail_detector_requires_two_55_hz_half_cycles() {
+        let mut detector = ReleaseDetector::default();
+        let (expected_half_cycle_q8, phase_period_samples) = ReceiveState::phase_parameters(100.0);
+
+        assert!(!detector.process(625, expected_half_cycle_q8, phase_period_samples));
+        for _ in 0..72 {
+            assert!(!detector.process(625, expected_half_cycle_q8, phase_period_samples));
+        }
+        assert!(!detector.process(-625, expected_half_cycle_q8, phase_period_samples));
+        for _ in 0..72 {
+            assert!(!detector.process(-625, expected_half_cycle_q8, phase_period_samples));
+        }
+        assert!(!detector.process(625, expected_half_cycle_q8, phase_period_samples));
+        for _ in 0..72 {
+            assert!(!detector.process(625, expected_half_cycle_q8, phase_period_samples));
+        }
+        assert!(detector.process(-625, expected_half_cycle_q8, phase_period_samples));
+    }
+
+    #[test]
+    fn tail_release_matches_whole_and_split_callbacks() {
+        const TONE_INDEX: usize = 11;
+        const PARTITIONS: [usize; 3] = [91, 137, 28];
+        let mut whole = ReceiveState::default();
+        let mut split = ReceiveState::default();
+        let mut tail = [0.0_f32; 256];
+
+        activate_selected_detector(&mut whole, TONE_INDEX);
+        activate_selected_detector(&mut split, TONE_INDEX);
+        whole.detectors[TONE_INDEX].counter = i16::MAX;
+        split.detectors[TONE_INDEX].counter = i16::MAX;
+        center_sliced_tone(&mut tail, 55.0, None);
+        assert_eq!(
+            unsafe { whole.process(tail.as_ptr(), tail.len() as u32, true) },
+            -1
+        );
+
+        let mut offset = 0;
+        for count in PARTITIONS {
+            unsafe { split.process(tail[offset..].as_ptr(), count as u32, true) };
+            offset += count;
+        }
+        assert_eq!(offset, tail.len());
+        assert_eq!(split.decoded(), whole.decoded());
+        assert_eq!(split.blanking_samples, whole.blanking_samples);
+        for (actual, expected) in split.detectors.iter().zip(&whole.detectors) {
+            assert_eq!(actual.counter, expected.counter);
+            assert_eq!(actual.peak, expected.peak);
+            assert_eq!(actual.z_index, expected.z_index);
+            assert_eq!(actual.z, expected.z);
+            assert_eq!(actual.dvu, expected.dvu);
+            assert_eq!(actual.dvd, expected.dvd);
+            assert_eq!(actual.zd, expected.zd);
+            assert_eq!(actual.decode, expected.decode);
+        }
+    }
+
+    #[test]
+    fn lowest_ctcss_tone_does_not_match_the_tail_detector() {
+        const TONE_INDEX: usize = 0;
+        let mut state = ReceiveState::default();
+        let mut tone = [0.0_f32; 512];
+
+        activate_selected_detector(&mut state, TONE_INDEX);
+        center_sliced_tone(&mut tone, 67.0, None);
+
+        assert_eq!(
+            unsafe { state.process(tone.as_ptr(), tone.len() as u32, true) },
+            TONE_INDEX as i16
+        );
+        assert_eq!(state.decoded(), TONE_INDEX as i16);
     }
 
     #[test]
