@@ -914,6 +914,9 @@ mod tests {
             for phase_offset in 0..period {
                 for (phase_step, expected_release) in [
                     (2.0 * core::f32::consts::PI / 3.0, true),
+                    (5.0 * core::f32::consts::PI / 6.0, true),
+                    (core::f32::consts::PI, true),
+                    (7.0 * core::f32::consts::PI / 6.0, true),
                     (-2.0 * core::f32::consts::PI / 3.0, true),
                     (core::f32::consts::PI / 2.0, false),
                     (-core::f32::consts::PI / 2.0, false),
