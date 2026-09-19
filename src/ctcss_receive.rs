@@ -1041,44 +1041,46 @@ mod tests {
     #[test]
     fn phase_release_matches_whole_and_split_callbacks() {
         const TONE_INDEX: usize = 11;
-        const PARTITIONS: [usize; 3] = [133, 19, 488];
-        let mut whole = ReceiveState::default();
-        let mut split = ReceiveState::default();
-        let mut samples = [0.0_f32; 640];
+        // Single-sample callbacks also place the release exactly at a callback end.
+        for partitions in [&[133, 19, 488][..], &[1; 640][..]] {
+            let mut whole = ReceiveState::default();
+            let mut split = ReceiveState::default();
+            let mut samples = [0.0_f32; 640];
 
-        activate_selected_detector(&mut whole, TONE_INDEX);
-        activate_selected_detector(&mut split, TONE_INDEX);
-        whole.detectors[TONE_INDEX].counter = i16::MAX;
-        split.detectors[TONE_INDEX].counter = i16::MAX;
-        center_sliced_tone(
-            &mut samples,
-            100.0,
-            Some((400, 2.0 * core::f32::consts::PI / 3.0)),
-        );
-        assert_eq!(
-            unsafe { whole.process(samples.as_ptr(), samples.len() as u32, true) },
-            -1
-        );
+            activate_selected_detector(&mut whole, TONE_INDEX);
+            activate_selected_detector(&mut split, TONE_INDEX);
+            whole.detectors[TONE_INDEX].counter = i16::MAX;
+            split.detectors[TONE_INDEX].counter = i16::MAX;
+            center_sliced_tone(
+                &mut samples,
+                100.0,
+                Some((400, 2.0 * core::f32::consts::PI / 3.0)),
+            );
+            assert_eq!(
+                unsafe { whole.process(samples.as_ptr(), samples.len() as u32, true) },
+                -1
+            );
 
-        let mut offset = 0;
-        for count in PARTITIONS {
-            unsafe { split.process(samples[offset..].as_ptr(), count as u32, true) };
-            offset += count;
-        }
+            let mut offset = 0;
+            for &count in partitions {
+                unsafe { split.process(samples[offset..].as_ptr(), count as u32, true) };
+                offset += count;
+            }
 
-        assert_eq!(offset, samples.len());
-        assert_eq!(split.decoded(), whole.decoded());
-        assert_eq!(split.blanking_samples, whole.blanking_samples);
-        assert!(split.release_detector == whole.release_detector);
-        for (actual, expected) in split.detectors.iter().zip(&whole.detectors) {
-            assert_eq!(actual.counter, expected.counter);
-            assert_eq!(actual.peak, expected.peak);
-            assert_eq!(actual.z_index, expected.z_index);
-            assert_eq!(actual.z, expected.z);
-            assert_eq!(actual.dvu, expected.dvu);
-            assert_eq!(actual.dvd, expected.dvd);
-            assert_eq!(actual.zd, expected.zd);
-            assert_eq!(actual.decode, expected.decode);
+            assert_eq!(offset, samples.len());
+            assert_eq!(split.decoded(), whole.decoded());
+            assert_eq!(split.blanking_samples, whole.blanking_samples);
+            assert!(split.release_detector == whole.release_detector);
+            for (actual, expected) in split.detectors.iter().zip(&whole.detectors) {
+                assert_eq!(actual.counter, expected.counter);
+                assert_eq!(actual.peak, expected.peak);
+                assert_eq!(actual.z_index, expected.z_index);
+                assert_eq!(actual.z, expected.z);
+                assert_eq!(actual.dvu, expected.dvu);
+                assert_eq!(actual.dvd, expected.dvd);
+                assert_eq!(actual.zd, expected.zd);
+                assert_eq!(actual.decode, expected.decode);
+            }
         }
     }
 
