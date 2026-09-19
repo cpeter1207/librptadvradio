@@ -1,6 +1,6 @@
 /**
  * @file descriptor_smoke.c
- * @brief Exercise the ABI 3 session lifecycle through the installed header.
+ * @brief Exercise the ABI 4 session lifecycle through the installed header.
  */
 
 #include <assert.h>
@@ -94,6 +94,7 @@ int main(void)
 	struct processor_context deemphasis = { .scale = 1.0F, .bias = 0.1F };
 	struct processor_context filter = { .scale = 2.0F };
 	struct processor_context notch = { .scale = 1.0F };
+	struct processor_context tail_notch = { .scale = 1.0F };
 	struct processor_context noise = { .scale = 1.0F, .bias = -0.1F };
 	struct processor_context dynamics = { .scale = 0.5F };
 	struct processor_context transmit_graph = { .scale = 1.0F, .bias = 0.2F };
@@ -110,6 +111,7 @@ int main(void)
 		.transmit_dcs_normal_filter = processor_port(&dcs_normal_graph),
 		.transmit_dcs_turnoff_filter = processor_port(&dcs_turnoff_graph),
 		.program_ring = { .render_f32 = ring_render },
+		.receive_ctcss_tail_notch = processor_port(&tail_notch),
 	};
 	struct rptadv_radio_session *session = NULL;
 	struct rptadv_radio_receive_input receive_input = { .hardware_carrier = 1 };
@@ -150,6 +152,7 @@ int main(void)
 	assert(deemphasis.warm_calls == 1 && deemphasis.calls == 1);
 	assert(filter.warm_calls == 1 && filter.calls == 1);
 	assert(notch.warm_calls == 1 && notch.calls == 1);
+	assert(tail_notch.warm_calls == 1 && tail_notch.calls == 1);
 	assert(noise.warm_calls == 1 && noise.calls == 1);
 	assert(dynamics.warm_calls == 1 && dynamics.calls == 1);
 	assert(dcs_normal_graph.warm_calls == 1 && dcs_normal_graph.calls == 1);

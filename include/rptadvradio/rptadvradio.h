@@ -1,6 +1,6 @@
 /**
  * @file rptadvradio.h
- * @brief ABI 3 for one prepared, portable 48 kHz radio session.
+ * @brief ABI 4 for one prepared, portable 48 kHz radio session.
  *
  * The shared object owns radio DSP and signaling state. Device, Asterisk,
  * FFmpeg, RNNoise, and elastic-ring implementations remain in independently
@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define RPTADV_RADIO_ABI_VERSION 3U /**< Breaking whole-session ABI. */
+#define RPTADV_RADIO_ABI_VERSION 4U /**< Breaking whole-session ABI. */
 #define RPTADV_RADIO_NATIVE_SAMPLE_RATE_HZ 48000U /**< Immutable native rate. */
 #define RPTADV_RADIO_CANONICAL_CHANNELS 2U /**< Interleaved device channels. */
 #define RPTADV_RADIO_CTCSS_TONE_COUNT 38U /**< CTCSS mapping-table length. */
@@ -228,7 +228,7 @@ struct rptadv_radio_session_config {
  * @brief Borrowed prepared runtime ports grouped by exact pipeline role.
  *
  * Receive order is deemphasis, squelch gate/input gain, fixed filter graph,
- * the prepared notch selected by decoded CTCSS, RNNoise, then dynamics.
+ * the prepared decoded-tone or 55 Hz tail notch, RNNoise, then dynamics.
  * Transmit processing precedes native CTCSS/DCS mix. Providers must be
  * allocation-free, lock-free, nonblocking, and exact-frame.
  */
@@ -244,6 +244,7 @@ struct rptadv_radio_session_ports {
   struct rptadv_radio_processor_port transmit_dcs_normal_filter; /**< Normal DCS NRZ shaper. */
   struct rptadv_radio_processor_port transmit_dcs_turnoff_filter; /**< DCS turn-off sine shaper. */
   struct rptadv_radio_program_ring_port program_ring; /**< TX program source. */
+  struct rptadv_radio_processor_port receive_ctcss_tail_notch; /**< Prepared 55 Hz tail notch. */
 };
 
 /** @brief Hardware snapshots supplied to one receive callback. */
@@ -343,7 +344,7 @@ struct rptadv_radio_snapshot {
   struct rptadv_radio_ring_observation program_ring; /**< Ring diagnostics. */
 };
 
-/** @brief Immutable whole-session ABI 3 function table. */
+/** @brief Immutable whole-session ABI 4 function table. */
 struct rptadv_radio_descriptor {
   uint32_t struct_size; /**< Descriptor size. */
   uint32_t abi_version; /**< Descriptor ABI. */
@@ -375,7 +376,7 @@ struct rptadv_radio_descriptor {
 };
 
 /**
- * @brief Return the process-lifetime ABI 3 descriptor.
+ * @brief Return the process-lifetime ABI 4 descriptor.
  *
  * Validate `abi_version` and `struct_size` before use. ABI 2 granular
  * operations were removed rather than retained as compatibility slots.

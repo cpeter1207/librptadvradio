@@ -7,7 +7,7 @@ Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/librptadvradio
 Rules-Requires-Root: no
 
-Package: librptadvradio3
+Package: librptadvradio4
 Architecture: any
 Multi-Arch: same
 Depends: ${misc:Depends}, ${shlibs:Depends}
@@ -17,7 +17,7 @@ Description: portable f32 radio core for rpt_advanced
 Package: librptadvradio-dev
 Architecture: any
 Multi-Arch: same
-Depends: ${misc:Depends}, librptadvradio3 (= ${binary:Version})
+Depends: ${misc:Depends}, librptadvradio4 (= ${binary:Version})
 Description: development files for the rpt_advanced radio core
  Public C header and pkg-config metadata for dynamic consumers of the
  portable native radio-core ABI.
