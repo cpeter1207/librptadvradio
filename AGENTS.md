@@ -19,6 +19,9 @@ Run format, lint, and static analysis once before a push. Rust implementation
 documentation is complete, warning-free Rustdoc. Use Doxygen only for the
 unavoidable C ABI header or shim and do not duplicate Rustdoc narrative there.
 Use native Debian 13 amd64 coverage for production Rust source only. Keep the C
-ABI, Debian packaging, documentation, archive, and staged-install checks in
-sync when a public interface changes. Never static-link or vendor a duplicate
-of a separately released project library.
+ABI, Debian packaging, archive, and staged-install checks in sync when a public
+interface changes. Update Rustdoc, Doxygen, and other developer-facing
+documentation before every implementation commit; defer user-facing manuals,
+examples, and operator documentation until immediately before creating a pull
+request. Never static-link or vendor a duplicate of a separately released
+project library.
