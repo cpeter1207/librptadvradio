@@ -21,6 +21,8 @@ extern "C" {
 
 /** @brief Opaque runtime generation owned by the shared object. */
 struct rptadv_radio_session;
+/** @brief Control-owned candidate storage for one pair of owner updates. */
+struct rptadv_radio_session_update;
 
 /** @brief Result from one session operation. */
 enum rptadv_radio_result {
@@ -373,6 +375,29 @@ struct rptadv_radio_descriptor {
       const struct rptadv_radio_session *,
       struct rptadv_radio_event *); /**< Pop one TX event. */
   void (*session_destroy)(struct rptadv_radio_session *); /**< Destroy stopped session. */
+  /** Prepare internal storage only: never call borrowed ports. New processors
+   * must be warmed by their owner before publication; reused live ports must
+   * not be warmed again. program_ring must be empty and cannot be replaced. */
+  enum rptadv_radio_result (*session_prepare_update)(
+      const struct rptadv_radio_session_config *,
+      const struct rptadv_radio_session_ports *,
+      struct rptadv_radio_session_update **);
+  /** Apply once between receive calls, on that serial owner only. Preserve
+   * unchanged detector history, qualification, delay contents and sample clock.
+   * Both frame maxima must match the live session; failure changes nothing.
+   * The live generation id remains fixed; the publication interval may change.
+   * No allocation, reclamation, provider call or waiting occurs during apply. */
+  enum rptadv_radio_result (*session_apply_receive_update)(
+      struct rptadv_radio_session *, struct rptadv_radio_session_update *);
+  /** Apply once between transmit calls, on that serial owner only. Preserve
+   * PTT, signaling timers, oscillators and the program ring. May run concurrently
+   * with receive update. Borrowed ports must outlive their last live callback. */
+  enum rptadv_radio_result (*session_apply_transmit_update)(
+      struct rptadv_radio_session *, struct rptadv_radio_session_update *);
+  /** Reclaim unused/displaced internal storage on the control plane, after
+   * both callback owners acknowledge or an unpublished update is cancelled.
+   * Never destroys borrowed processors; their owner manages their lifetime. */
+  void (*session_destroy_update)(struct rptadv_radio_session_update *);
 };
 
 /**

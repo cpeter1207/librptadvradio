@@ -273,6 +273,16 @@ pub struct ReceivePath {
 }
 
 impl ReceivePath {
+    /// Apply validated scalar detector controls without clearing stream history.
+    /// The session checks unchanged detector identities and FIR profiles first.
+    pub(crate) fn update_controls_from(&mut self, prepared: &Self) {
+        self.frontend_controls = prepared.frontend_controls;
+        self.lsd_controls = prepared.lsd_controls;
+        self.center_config = prepared.center_config;
+        self.vox_config = prepared.vox_config;
+        self.vox_hang_frames = prepared.vox_hang_frames;
+    }
+
     /// Construct an owned receiver and preallocate all callback workspaces.
     ///
     /// Coefficient tables are copied here because control-plane configuration

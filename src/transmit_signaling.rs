@@ -348,6 +348,11 @@ pub struct TransmitSignaling {
 }
 
 impl TransmitSignaling {
+    /// Replace an already validated policy while retaining PTT and active timers.
+    pub(crate) fn update_config_from(&mut self, prepared: &Self) {
+        self.config = prepared.config;
+    }
+
     /// Create a reset transmitter state from one immutable copied policy.
     ///
     /// Immutable policy is validated before native processing begins.  This

@@ -88,6 +88,16 @@ pub struct RadioDescriptor {
     session_pop_transmit_event:
         unsafe extern "C" fn(*const session::Session, *mut session::Event) -> u32,
     session_destroy: unsafe extern "C" fn(*mut session::Session),
+    session_prepare_update: unsafe extern "C" fn(
+        *const session::SessionConfig,
+        *const session::SessionPorts,
+        *mut *mut session::SessionUpdate,
+    ) -> c_int,
+    session_apply_receive_update:
+        unsafe extern "C" fn(*mut session::Session, *mut session::SessionUpdate) -> c_int,
+    session_apply_transmit_update:
+        unsafe extern "C" fn(*mut session::Session, *mut session::SessionUpdate) -> c_int,
+    session_destroy_update: unsafe extern "C" fn(*mut session::SessionUpdate),
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -105,6 +115,10 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     session_pop_receive_event: session::pop_receive_event,
     session_pop_transmit_event: session::pop_transmit_event,
     session_destroy: session::destroy,
+    session_prepare_update: session::prepare_update,
+    session_apply_receive_update: session::apply_receive_update,
+    session_apply_transmit_update: session::apply_transmit_update,
+    session_destroy_update: session::destroy_update,
 };
 
 /// Return the immutable ABI 4 whole-session function table.

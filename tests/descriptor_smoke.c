@@ -142,6 +142,10 @@ int main(void)
 	assert(descriptor->session_pop_receive_event != NULL);
 	assert(descriptor->session_pop_transmit_event != NULL);
 	assert(descriptor->session_destroy != NULL);
+	assert(descriptor->session_prepare_update != NULL);
+	assert(descriptor->session_apply_receive_update != NULL);
+	assert(descriptor->session_apply_transmit_update != NULL);
+	assert(descriptor->session_destroy_update != NULL);
 
 	assert(descriptor->session_create(&config, &ports, &session) == RPTADV_RADIO_OK);
 	assert(session != NULL);
@@ -182,6 +186,21 @@ int main(void)
 	assert(snapshot.receive_ctcss_decoder_peak == 0.0F);
 	assert(descriptor->session_pop_receive_event(session, &event) == 1);
 	assert(event.generation_id == 42);
+	struct rptadv_radio_session_update *update = NULL;
+	struct rptadv_radio_session_ports update_ports = ports;
+	memset(&update_ports.program_ring, 0, sizeof(update_ports.program_ring));
+	config.generation_id = 43;
+	assert(descriptor->session_prepare_update(&config, &update_ports, &update) == RPTADV_RADIO_OK);
+	assert(descriptor->session_apply_receive_update(session, update) == RPTADV_RADIO_OK);
+	assert(descriptor->session_apply_transmit_update(session, update) == RPTADV_RADIO_OK);
+	descriptor->session_destroy_update(update);
+	assert(descriptor->session_transmit(session, transmit, 4, &transmit_input,
+					     &transmit_result) == RPTADV_RADIO_OK);
+	assert(transmit_result.generation_id == 42);
+	assert(transmit_result.logical_ptt == 1);
+	assert(transmit_result.first_sample_index == 4);
+	assert(transmit_result.program_ring.occupancy_frames == 120);
+	descriptor->session_destroy_update(NULL);
 	descriptor->session_destroy(session);
 	descriptor->session_destroy(NULL);
 	return 0;
