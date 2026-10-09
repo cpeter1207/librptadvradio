@@ -2811,6 +2811,92 @@ mod tests {
     }
 
     #[test]
+    fn prepare_update_rejects_invalid_outputs_ports_and_runtime_configuration() {
+        let config = valid_config();
+        let mut ports = SessionPorts::default();
+        let mut update = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, ptr::null_mut()) },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { prepare_update(&config, ptr::null(), &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+
+        ports.struct_size -= 1;
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+
+        let mut ring = TestRing::default();
+        ports = SessionPorts::default();
+        ports.program_ring.context = ptr::from_mut(&mut ring).cast();
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        ports.program_ring.context = ptr::null_mut();
+        ports.program_ring.render_f32 = Some(test_ring);
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        ports.program_ring.render_f32 = None;
+        ports.program_ring.warm = Some(test_warm);
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+
+        ports = SessionPorts::default();
+        let mut invalid = config;
+        invalid.maximum_receive_frame_count = 0;
+        assert_eq!(
+            unsafe { prepare_update(&invalid, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+        unsafe { destroy_update(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn prepared_receive_update_rebuilds_for_each_detector_control_change() {
+        let edits: &[fn(&mut SessionConfig)] = &[
+            |config| config.receive.noise_filter_profile = 1,
+            |config| config.receive.ctcss_enabled = 1,
+            |config| config.receive.ctcss_tone_mask = 1 << 11,
+            |config| config.receive.ctcss_relax = 1,
+            |config| {
+                config.receive.dcs_enabled = 1;
+                config.receive.dcs_code = 23;
+            },
+            |config| config.receive.dcs_code = 23,
+            |config| config.receive.dcs_inverted = 1,
+            |config| config.qualification.carrier_source = 1,
+        ];
+
+        for edit in edits {
+            let config = valid_config();
+            let session = TestSession::prepared(&config, &SessionPorts::default());
+            let mut changed = config;
+            edit(&mut changed);
+            let mut update = ptr::null_mut();
+            assert_eq!(
+                unsafe { prepare_update(&changed, &SessionPorts::default(), &mut update) },
+                OK
+            );
+            assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+            unsafe { destroy_update(update) };
+        }
+    }
+
+    #[test]
     fn prepared_update_guards_are_bounded_and_changed_storage_is_installed_once() {
         let config = valid_config();
         let session = TestSession::prepared(&config, &SessionPorts::default());
