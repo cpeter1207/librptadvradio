@@ -42,6 +42,12 @@ pub(crate) fn configured_code(code: i32) -> i32 {
 }
 
 impl TransmitState {
+    /// Replace the prepared code/polarity without restarting either oscillator.
+    pub(crate) fn update_config_from(&mut self, prepared: &Self) {
+        self.code = prepared.code;
+        self.inverted = prepared.inverted;
+    }
+
     /// Apply a compatibility configuration change without disturbing phase.
     pub(crate) fn configure(&mut self, code: i32, inverted: u32) {
         self.code = configured_code(code);

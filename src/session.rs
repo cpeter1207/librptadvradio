@@ -222,7 +222,7 @@ impl Default for TransmitConfig {
     }
 }
 
-/// Immutable setup for one complete runtime generation.
+/// Validated setup for a runtime or prepared owner update.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SessionConfig {
@@ -413,11 +413,12 @@ struct Ports {
     transmit_program: ProcessorPort,
     transmit_dcs_normal_filter: ProcessorPort,
     transmit_dcs_turnoff_filter: ProcessorPort,
-    program_ring: ProgramRingPort,
     receive_ctcss_tail_notch: ProcessorPort,
 }
 
 struct ReceiveWorker {
+    ports: Ports,
+    config: ReceiveConfig,
     detector: receive_path::ReceivePath,
     qualification: receive_qualification::Config,
     qualification_state: receive_qualification::State,
@@ -446,6 +447,7 @@ struct ReceiveWorker {
 }
 
 struct TransmitWorker {
+    ports: Ports,
     signaling: TransmitSignaling,
     maximum_frames: usize,
     publication_interval_frames: u64,
@@ -631,7 +633,8 @@ impl EventQueue {
 #[repr(C)]
 pub(crate) struct Session {
     generation_id: u64,
-    ports: Ports,
+    maximum_frames: [u32; 2],
+    program_ring: ProgramRingPort,
     receive: UnsafeCell<ReceiveWorker>,
     transmit: UnsafeCell<TransmitWorker>,
     receive_busy: AtomicBool,
@@ -641,6 +644,164 @@ pub(crate) struct Session {
     snapshot: AtomicSnapshot,
     receive_events: EventQueue,
     transmit_events: EventQueue,
+}
+
+/// Control-owned candidate storage for one receive/transmit update.
+pub(crate) struct SessionUpdate {
+    candidate: Box<Session>,
+    receive_applied: AtomicBool,
+    transmit_applied: AtomicBool,
+}
+
+/// Prepare internal candidate storage without calling any borrowed processor.
+/// New processors must already be warmed by their owner; reused live ports
+/// must never be warmed concurrently with the audio owner.
+pub(crate) unsafe extern "C" fn prepare_update(
+    config: *const SessionConfig,
+    ports: *const SessionPorts,
+    output: *mut *mut SessionUpdate,
+) -> c_int {
+    if output.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    let Some(ports) = (unsafe { ports.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    if ports.struct_size < size_of::<SessionPorts>() as u32
+        || !ports.program_ring.context.is_null()
+        || ports.program_ring.render_f32.is_some()
+        || ports.program_ring.warm.is_some()
+    {
+        return INVALID_ARGUMENT;
+    }
+    let mut candidate = ptr::null_mut();
+    let result = unsafe { create(config, ports, &mut candidate) };
+    if result != OK {
+        return result;
+    }
+    let candidate = unsafe { Box::from_raw(candidate) };
+    let update = Box::new(SessionUpdate {
+        candidate,
+        receive_applied: AtomicBool::new(false),
+        transmit_applied: AtomicBool::new(false),
+    });
+    unsafe { output.write(Box::into_raw(update)) };
+    OK
+}
+
+/// Apply once on the serial receive owner, preserving unchanged decoder state.
+/// All swaps retain displaced allocations in the control-owned update.
+pub(crate) unsafe extern "C" fn apply_receive_update(
+    session: *mut Session,
+    update: *mut SessionUpdate,
+) -> c_int {
+    let (Some(session), Some(update)) = (unsafe { session.as_ref() }, unsafe { update.as_ref() })
+    else {
+        return INVALID_ARGUMENT;
+    };
+    if session.maximum_frames != update.candidate.maximum_frames {
+        return UNSUPPORTED;
+    }
+    let _live = match enter(&session.receive_busy) {
+        Ok(guard) => guard,
+        Err(error) => return error,
+    };
+    let _candidate = match enter(&update.candidate.receive_busy) {
+        Ok(guard) => guard,
+        Err(error) => return error,
+    };
+    if update.receive_applied.load(Ordering::Relaxed) {
+        return INVALID_ARGUMENT;
+    }
+    let live = unsafe { &mut *session.receive.get() };
+    let next = unsafe { &mut *update.candidate.receive.get() };
+    let old = live.config;
+    let new = next.config;
+    if old.noise_filter_profile == new.noise_filter_profile
+        && old.ctcss_enabled == new.ctcss_enabled
+        && old.ctcss_tone_mask == new.ctcss_tone_mask
+        && old.ctcss_relax == new.ctcss_relax
+        && old.dcs_enabled == new.dcs_enabled
+        && old.dcs_code == new.dcs_code
+        && old.dcs_inverted == new.dcs_inverted
+        && live.qualification.carrier_source == next.qualification.carrier_source
+    {
+        live.detector.update_controls_from(&next.detector);
+    } else {
+        std::mem::swap(&mut live.detector, &mut next.detector);
+    }
+    if live.delay.len() != next.delay.len() {
+        std::mem::swap(&mut live.delay, &mut next.delay);
+        live.delay_index = 0;
+    }
+    live.ports = next.ports;
+    live.config = new;
+    live.qualification = next.qualification;
+    live.cpu_saver_enabled = next.cpu_saver_enabled;
+    live.per_sample_noise_gate = next.per_sample_noise_gate;
+    live.ctcss_enabled = next.ctcss_enabled;
+    live.dcs_enabled = next.dcs_enabled;
+    live.receive_channel = next.receive_channel;
+    live.input_gain = next.input_gain;
+    live.publication_interval_frames = next.publication_interval_frames;
+    live.next_publication_frame = live
+        .sample_index
+        .saturating_add(next.publication_interval_frames);
+    update.receive_applied.store(true, Ordering::Release);
+    OK
+}
+
+/// Apply a prepared update on the transmit owner.
+pub(crate) unsafe extern "C" fn apply_transmit_update(
+    session: *mut Session,
+    update: *mut SessionUpdate,
+) -> c_int {
+    let (Some(session), Some(update)) = (unsafe { session.as_ref() }, unsafe { update.as_ref() })
+    else {
+        return INVALID_ARGUMENT;
+    };
+    if session.maximum_frames != update.candidate.maximum_frames {
+        return UNSUPPORTED;
+    }
+    let _live = match enter(&session.transmit_busy) {
+        Ok(guard) => guard,
+        Err(error) => return error,
+    };
+    let _candidate = match enter(&update.candidate.transmit_busy) {
+        Ok(guard) => guard,
+        Err(error) => return error,
+    };
+    if update.transmit_applied.load(Ordering::Relaxed) {
+        return INVALID_ARGUMENT;
+    }
+    let live = unsafe { &mut *session.transmit.get() };
+    let next = unsafe { &*update.candidate.transmit.get() };
+    live.ports = next.ports;
+    live.signaling.update_config_from(&next.signaling);
+    live.dcs.update_config_from(&next.dcs);
+    live.ctcss_peak = next.ctcss_peak;
+    live.dcs_peak = next.dcs_peak;
+    live.dcs_enabled = next.dcs_enabled;
+    live.output_a_route = next.output_a_route;
+    live.output_b_route = next.output_b_route;
+    live.output_a_tone_gain = next.output_a_tone_gain;
+    live.output_a_tone_bias = next.output_a_tone_bias;
+    live.output_b_tone_gain = next.output_b_tone_gain;
+    live.output_b_tone_bias = next.output_b_tone_bias;
+    live.publication_interval_frames = next.publication_interval_frames;
+    live.next_publication_frame = live
+        .sample_index
+        .saturating_add(next.publication_interval_frames);
+    update.transmit_applied.store(true, Ordering::Release);
+    OK
+}
+
+/// Reclaim candidate storage on the control plane after both owners finish.
+pub(crate) unsafe extern "C" fn destroy_update(update: *mut SessionUpdate) {
+    if !update.is_null() {
+        drop(unsafe { Box::from_raw(update) });
+    }
 }
 
 // SAFETY: receive and transmit mutable state have independent single-owner
@@ -858,7 +1019,7 @@ fn transmit_config(
     ))
 }
 
-/// Create and preallocate one immutable runtime generation.
+/// Create and preallocate one runtime with immutable stream geometry and identity.
 pub(crate) unsafe extern "C" fn create(
     config: *const SessionConfig,
     ports: *const SessionPorts,
@@ -920,21 +1081,27 @@ pub(crate) unsafe extern "C" fn create(
     let tx_max = config.maximum_transmit_frame_count as usize;
     let mut dcs = dcs_transmit::TransmitState::default();
     dcs.configure(config.transmit.dcs_code, config.transmit.dcs_inverted);
+    let processor_ports = Ports {
+        receive_deemphasis: ports.receive_deemphasis,
+        receive_filter: ports.receive_filter,
+        receive_ctcss_notch: ports.receive_ctcss_notch,
+        receive_noise_reduction: ports.receive_noise_reduction,
+        receive_dynamics: ports.receive_dynamics,
+        transmit_program: ports.transmit_program,
+        transmit_dcs_normal_filter: ports.transmit_dcs_normal_filter,
+        transmit_dcs_turnoff_filter: ports.transmit_dcs_turnoff_filter,
+        receive_ctcss_tail_notch: ports.receive_ctcss_tail_notch,
+    };
     let session = Box::new(Session {
         generation_id: config.generation_id,
-        ports: Ports {
-            receive_deemphasis: ports.receive_deemphasis,
-            receive_filter: ports.receive_filter,
-            receive_ctcss_notch: ports.receive_ctcss_notch,
-            receive_noise_reduction: ports.receive_noise_reduction,
-            receive_dynamics: ports.receive_dynamics,
-            transmit_program: ports.transmit_program,
-            transmit_dcs_normal_filter: ports.transmit_dcs_normal_filter,
-            transmit_dcs_turnoff_filter: ports.transmit_dcs_turnoff_filter,
-            program_ring: ports.program_ring,
-            receive_ctcss_tail_notch: ports.receive_ctcss_tail_notch,
-        },
+        maximum_frames: [
+            config.maximum_receive_frame_count,
+            config.maximum_transmit_frame_count,
+        ],
+        program_ring: ports.program_ring,
         receive: UnsafeCell::new(ReceiveWorker {
+            ports: processor_ports,
+            config: config.receive,
             detector,
             qualification,
             qualification_state: receive_qualification::State::default(),
@@ -965,6 +1132,7 @@ pub(crate) unsafe extern "C" fn create(
             work_c: vec![0.0; rx_max],
         }),
         transmit: UnsafeCell::new(TransmitWorker {
+            ports: processor_ports,
             signaling,
             maximum_frames: tx_max,
             publication_interval_frames: publication_frames,
@@ -1112,10 +1280,10 @@ pub(crate) unsafe extern "C" fn warm(session: *mut Session) -> c_int {
     let receive = unsafe { &mut *session.receive.get() };
     receive.input_mono.fill(0.0);
     for port in [
-        session.ports.receive_deemphasis,
-        session.ports.receive_filter,
-        session.ports.receive_noise_reduction,
-        session.ports.receive_dynamics,
+        receive.ports.receive_deemphasis,
+        receive.ports.receive_filter,
+        receive.ports.receive_noise_reduction,
+        receive.ports.receive_dynamics,
     ] {
         if unsafe { warm_port(port, rx_frames) }.is_err()
             || unsafe {
@@ -1134,11 +1302,11 @@ pub(crate) unsafe extern "C" fn warm(session: *mut Session) -> c_int {
             .copy_from_slice(&receive.work_a[..rx_frames as usize]);
     }
     receive.input_mono.fill(0.0);
-    for port in session
+    for port in receive
         .ports
         .receive_ctcss_notch
         .into_iter()
-        .chain([session.ports.receive_ctcss_tail_notch])
+        .chain([receive.ports.receive_ctcss_tail_notch])
     {
         if port.process_f32.is_some()
             && (unsafe { warm_port(port, rx_frames) }.is_err()
@@ -1157,9 +1325,9 @@ pub(crate) unsafe extern "C" fn warm(session: *mut Session) -> c_int {
     let transmit = unsafe { &mut *session.transmit.get() };
     transmit.program.fill(0.0);
     for port in [
-        session.ports.transmit_program,
-        session.ports.transmit_dcs_normal_filter,
-        session.ports.transmit_dcs_turnoff_filter,
+        transmit.ports.transmit_program,
+        transmit.ports.transmit_dcs_normal_filter,
+        transmit.ports.transmit_dcs_turnoff_filter,
     ] {
         if unsafe { warm_port(port, tx_frames) }.is_err()
             || unsafe {
@@ -1177,8 +1345,8 @@ pub(crate) unsafe extern "C" fn warm(session: *mut Session) -> c_int {
             .program
             .copy_from_slice(&transmit.processed[..tx_frames as usize]);
     }
-    if let Some(warm_ring) = session.ports.program_ring.warm {
-        if unsafe { warm_ring(session.ports.program_ring.context, tx_frames) } != 0 {
+    if let Some(warm_ring) = session.program_ring.warm {
+        if unsafe { warm_ring(session.program_ring.context, tx_frames) } != 0 {
             return PROVIDER_FAILED;
         }
     }
@@ -1387,7 +1555,7 @@ pub(crate) unsafe extern "C" fn receive(
     }
     if unsafe {
         run_processor(
-            session.ports.receive_deemphasis,
+            worker.ports.receive_deemphasis,
             &worker.input_mono[..count],
             &mut worker.work_a[..count],
         )
@@ -1414,7 +1582,7 @@ pub(crate) unsafe extern "C" fn receive(
     }
     let notched = match unsafe {
         run_receive_filters(
-            &session.ports,
+            &worker.ports,
             detected.ctcss_decoded,
             detected.ctcss_tail_tone_active,
             &worker.work_a[..count],
@@ -1429,7 +1597,7 @@ pub(crate) unsafe extern "C" fn receive(
         }
     };
     if worker.cpu_saver_enabled && !qualified.rx_keyed {
-        if unsafe { bypass_port(session.ports.receive_noise_reduction, frame_count) }.is_err() {
+        if unsafe { bypass_port(worker.ports.receive_noise_reduction, frame_count) }.is_err() {
             provider_failure(session, true, worker.sample_index);
             return PROVIDER_FAILED;
         }
@@ -1440,7 +1608,7 @@ pub(crate) unsafe extern "C" fn receive(
         let noise_result = if notched {
             unsafe {
                 run_optional_processor(
-                    session.ports.receive_noise_reduction,
+                    worker.ports.receive_noise_reduction,
                     &worker.work_c[..count],
                     &mut worker.work_a[..count],
                 )
@@ -1448,7 +1616,7 @@ pub(crate) unsafe extern "C" fn receive(
         } else {
             unsafe {
                 run_optional_processor(
-                    session.ports.receive_noise_reduction,
+                    worker.ports.receive_noise_reduction,
                     &worker.work_b[..count],
                     &mut worker.work_a[..count],
                 )
@@ -1460,7 +1628,7 @@ pub(crate) unsafe extern "C" fn receive(
         }
         if unsafe {
             run_processor(
-                session.ports.receive_dynamics,
+                worker.ports.receive_dynamics,
                 &worker.work_a[..count],
                 &mut worker.work_b[..count],
             )
@@ -1730,7 +1898,7 @@ pub(crate) unsafe extern "C" fn transmit(
     let mut ring = ProgramRingResult::default();
     if unsafe {
         render_ring(
-            session.ports.program_ring,
+            session.program_ring,
             &mut worker.program[..count],
             &mut ring,
         )
@@ -1742,7 +1910,7 @@ pub(crate) unsafe extern "C" fn transmit(
     }
     if unsafe {
         run_processor(
-            session.ports.transmit_program,
+            worker.ports.transmit_program,
             &worker.program[..count],
             &mut worker.processed[..count],
         )
@@ -1777,7 +1945,7 @@ pub(crate) unsafe extern "C" fn transmit(
     render_dcs(worker, &signaling, count);
     if unsafe {
         run_processor(
-            session.ports.transmit_dcs_normal_filter,
+            worker.ports.transmit_dcs_normal_filter,
             &worker.dcs_normal_raw[..count],
             &mut worker.dcs_normal_filtered[..count],
         )
@@ -1789,7 +1957,7 @@ pub(crate) unsafe extern "C" fn transmit(
     }
     if unsafe {
         run_processor(
-            session.ports.transmit_dcs_turnoff_filter,
+            worker.ports.transmit_dcs_turnoff_filter,
             &worker.dcs_turnoff_raw[..count],
             &mut worker.dcs_turnoff_filtered[..count],
         )
@@ -2313,7 +2481,6 @@ mod tests {
             transmit_program: ProcessorPort::default(),
             transmit_dcs_normal_filter: ProcessorPort::default(),
             transmit_dcs_turnoff_filter: ProcessorPort::default(),
-            program_ring: ProgramRingPort::default(),
             receive_ctcss_tail_notch: test_port(&mut tail),
         };
         ports.receive_ctcss_notch[5] = test_port(&mut selected);
@@ -2472,6 +2639,338 @@ mod tests {
         for config in invalid {
             assert_eq!(create_result(&config), INVALID_ARGUMENT);
         }
+    }
+
+    #[test]
+    fn prepared_update_preserves_running_audio_ptt_and_sample_clock() {
+        let mut ring = TestRing {
+            sample: 0.25,
+            ..TestRing::default()
+        };
+        let mut config = valid_config();
+        config.receive.native_squelch_delay_frames = 2;
+        let session = TestSession::prepared(
+            &config,
+            &SessionPorts {
+                program_ring: ring_port(&mut ring),
+                ..SessionPorts::default()
+            },
+        );
+        assert_eq!(session.receive(true).1, [0.0, 0.0, 0.25, 0.25]);
+        assert_eq!(session.transmit(true).2.logical_ptt, 1);
+        let mut update_config = config;
+        update_config.generation_id += 1;
+        update_config.receive_input_gain = 2.0;
+        update_config.publication_interval_ms = 25;
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&update_config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+        assert_eq!(unsafe { apply_transmit_update(session.0, update) }, OK);
+        unsafe { destroy_update(update) };
+        let (status, output, receive) = session.receive(true);
+        assert_eq!((status, output), (OK, [0.5; 4]));
+        assert_eq!(receive.first_sample_index, 4);
+        assert_eq!(receive.generation_id, config.generation_id);
+        let (status, output, transmit) = session.transmit(true);
+        assert_eq!((status, output), (OK, [0.25; 8]));
+        assert_eq!(transmit.first_sample_index, 4);
+        assert_eq!(transmit.logical_ptt, 1);
+    }
+
+    #[test]
+    fn prepared_update_retains_ctcss_and_dcs_transmit_phase() {
+        for dcs in [false, true] {
+            let mut config = valid_config();
+            config.transmit.ctcss_transmit_enabled = u32::from(!dcs);
+            config.transmit.default_ctcss_frequency_tenths_hz = 1_000;
+            config.transmit.ctcss_peak = 0.1;
+            config.transmit.dcs_transmit_enabled = u32::from(dcs);
+            config.transmit.dcs_code = 23;
+            config.transmit.dcs_peak = 0.1;
+            config.transmit.output_a_route = 3;
+            config.transmit.output_a_tone_gain = 1.0;
+            let baseline = TestSession::prepared(&config, &SessionPorts::default());
+            let updated = TestSession::prepared(&config, &SessionPorts::default());
+            for _ in 0..37 {
+                assert_eq!(baseline.transmit(true).1, updated.transmit(true).1);
+            }
+            config.receive_input_gain = 1.25;
+            let mut update = ptr::null_mut();
+            assert_eq!(
+                unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+                OK
+            );
+            assert_eq!(unsafe { apply_transmit_update(updated.0, update) }, OK);
+            unsafe { destroy_update(update) };
+            for _ in 0..200 {
+                let expected = baseline.transmit(true);
+                let actual = updated.transmit(true);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_update_preserves_acquired_receive_decode() {
+        let mut config = valid_config();
+        config.maximum_receive_frame_count = 960;
+        config.receive.ctcss_enabled = 1;
+        config.receive.ctcss_tone_mask = 1 << 11;
+        config.qualification.subaudible_source = 1;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let input: Vec<f32> = (0..960)
+            .flat_map(|index| {
+                let sample = (std::f32::consts::TAU * 100.0 * index as f32 / 48_000.0).sin() * 0.2;
+                [sample, sample]
+            })
+            .collect();
+        let mut output = [0.0; 960];
+        let mut result = ReceiveResult::default();
+        let controls = ReceiveInput {
+            hardware_carrier: 1,
+            hardware_subaudible: 1,
+            ..ReceiveInput::default()
+        };
+        for _ in 0..100 {
+            assert_eq!(
+                unsafe {
+                    receive(
+                        session.0,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        960,
+                        &controls,
+                        &mut result,
+                    )
+                },
+                OK
+            );
+        }
+        assert_eq!(result.ctcss_decoded_index, 11);
+        config.receive_input_gain = 1.1;
+        config.receive.ctcss_decoder_gain = 1.1;
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+        unsafe { destroy_update(update) };
+        assert_eq!(
+            unsafe {
+                receive(
+                    session.0,
+                    input.as_ptr(),
+                    output.as_mut_ptr(),
+                    960,
+                    &controls,
+                    &mut result,
+                )
+            },
+            OK
+        );
+        assert_eq!(result.ctcss_decoded_index, 11);
+        assert_eq!(result.receiver_keyed, 1);
+    }
+
+    #[test]
+    fn prepared_update_never_calls_borrowed_ports_and_rejects_limits_before_mutation() {
+        let config = valid_config();
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let mut processor = TestProcessor {
+            fail: true,
+            ..TestProcessor::default()
+        };
+        let ports = SessionPorts {
+            receive_filter: test_port(&mut processor),
+            ..SessionPorts::default()
+        };
+        let mut update = ptr::null_mut();
+        assert_eq!(unsafe { prepare_update(&config, &ports, &mut update) }, OK);
+        assert_eq!(processor.calls, 0);
+        unsafe { destroy_update(update) };
+        let mut changed = config;
+        changed.maximum_receive_frame_count += 1;
+        assert_eq!(
+            unsafe { prepare_update(&changed, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(
+            unsafe { apply_receive_update(session.0, update) },
+            UNSUPPORTED
+        );
+        assert_eq!(
+            unsafe { apply_transmit_update(session.0, update) },
+            UNSUPPORTED
+        );
+        unsafe { destroy_update(update) };
+        assert_eq!(session.receive(true).2.first_sample_index, 0);
+    }
+
+    #[test]
+    fn prepare_update_rejects_invalid_outputs_ports_and_runtime_configuration() {
+        let config = valid_config();
+        let mut ports = SessionPorts::default();
+        let mut update = ptr::null_mut();
+
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, ptr::null_mut()) },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { prepare_update(&config, ptr::null(), &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+
+        ports.struct_size -= 1;
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+
+        let mut ring = TestRing::default();
+        ports = SessionPorts::default();
+        ports.program_ring.context = ptr::from_mut(&mut ring).cast();
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        ports.program_ring.context = ptr::null_mut();
+        ports.program_ring.render_f32 = Some(test_ring);
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        ports.program_ring.render_f32 = None;
+        ports.program_ring.warm = Some(test_warm);
+        assert_eq!(
+            unsafe { prepare_update(&config, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+
+        ports = SessionPorts::default();
+        let mut invalid = config;
+        invalid.maximum_receive_frame_count = 0;
+        assert_eq!(
+            unsafe { prepare_update(&invalid, &ports, &mut update) },
+            INVALID_ARGUMENT
+        );
+        assert!(update.is_null());
+        unsafe { destroy_update(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn prepared_receive_update_rebuilds_for_each_detector_control_change() {
+        let edits: &[fn(&mut SessionConfig)] = &[
+            |config| config.receive.noise_filter_profile = 1,
+            |config| config.receive.ctcss_enabled = 1,
+            |config| config.receive.ctcss_tone_mask = 1 << 11,
+            |config| config.receive.ctcss_relax = 1,
+            |config| {
+                config.receive.dcs_enabled = 1;
+                config.receive.dcs_code = 23;
+            },
+            |config| config.receive.dcs_code = 23,
+            |config| config.receive.dcs_inverted = 1,
+            |config| config.qualification.carrier_source = 1,
+        ];
+
+        for edit in edits {
+            let config = valid_config();
+            let session = TestSession::prepared(&config, &SessionPorts::default());
+            let mut changed = config;
+            edit(&mut changed);
+            let mut update = ptr::null_mut();
+            assert_eq!(
+                unsafe { prepare_update(&changed, &SessionPorts::default(), &mut update) },
+                OK
+            );
+            assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+            unsafe { destroy_update(update) };
+        }
+    }
+
+    #[test]
+    fn prepared_update_guards_are_bounded_and_changed_storage_is_installed_once() {
+        let config = valid_config();
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let mut processor = TestProcessor::default();
+        let ports = SessionPorts {
+            receive_filter: test_port(&mut processor),
+            ..SessionPorts::default()
+        };
+        let mut changed = config;
+        changed.receive.native_squelch_delay_frames = 2;
+        changed.receive.noise_filter_profile = 1;
+        let mut update = ptr::null_mut();
+        assert_eq!(unsafe { prepare_update(&changed, &ports, &mut update) }, OK);
+        for receive_owner in [true, false] {
+            let apply = if receive_owner {
+                apply_receive_update
+            } else {
+                apply_transmit_update
+            };
+            assert_eq!(unsafe { apply(ptr::null_mut(), update) }, INVALID_ARGUMENT);
+            assert_eq!(
+                unsafe { apply(session.0, ptr::null_mut()) },
+                INVALID_ARGUMENT
+            );
+            let live = unsafe { &*session.0 };
+            let candidate = unsafe { &(*update).candidate };
+            let (live_busy, candidate_busy) = if receive_owner {
+                (&live.receive_busy, &candidate.receive_busy)
+            } else {
+                (&live.transmit_busy, &candidate.transmit_busy)
+            };
+            live_busy.store(true, Ordering::Relaxed);
+            assert_eq!(unsafe { apply(session.0, update) }, BUSY);
+            live_busy.store(false, Ordering::Relaxed);
+            candidate_busy.store(true, Ordering::Relaxed);
+            assert_eq!(unsafe { apply(session.0, update) }, BUSY);
+            candidate_busy.store(false, Ordering::Relaxed);
+            assert_eq!(unsafe { apply(session.0, update) }, OK);
+            assert_eq!(unsafe { apply(session.0, update) }, INVALID_ARGUMENT);
+        }
+        assert_eq!(processor.calls, 0);
+        unsafe { destroy_update(update) };
+        assert_eq!(session.receive(true).1, [0.0, 0.0, 0.25, 0.25]);
+        assert_eq!(processor.calls, 1);
+    }
+
+    #[test]
+    fn prepared_update_halves_apply_concurrently() {
+        let config = valid_config();
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        let session_address = session.0 as usize;
+        let update_address = update as usize;
+        std::thread::scope(|scope| {
+            let receive = scope.spawn(move || unsafe {
+                apply_receive_update(
+                    session_address as *mut Session,
+                    update_address as *mut SessionUpdate,
+                )
+            });
+            let transmit = scope.spawn(move || unsafe {
+                apply_transmit_update(
+                    session_address as *mut Session,
+                    update_address as *mut SessionUpdate,
+                )
+            });
+            assert_eq!(receive.join().unwrap(), OK);
+            assert_eq!(transmit.join().unwrap(), OK);
+        });
+        unsafe { destroy_update(update) };
     }
 
     /// Own a prepared engine so every failing assertion still releases its buffers.

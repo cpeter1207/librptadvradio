@@ -1,3 +1,9 @@
+librptadvradio (0.1.0~alpha6-1) unstable; urgency=medium
+
+  * Preserve receive and transmit state during prepared radio updates.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 08 Oct 2026 05:54:36 -0500
+
 librptadvradio (0.1.0~alpha5-1) unstable; urgency=medium
 
   * Release 0.1.0-alpha.5.
