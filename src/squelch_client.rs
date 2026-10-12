@@ -8,7 +8,7 @@ use std::{
 
 use crate::session::{PROVIDER_FAILED, UNSUPPORTED};
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const CAPABILITY_NAME: &[u8] = b"rptadv.squelch";
 
 #[repr(C)]
@@ -28,11 +28,11 @@ struct Descriptor {
     struct_size: u32,
     abi_version: u32,
     capability_name: *const c_char,
-    create: Option<extern "C" fn() -> *mut Squelch>,
+    create: Option<unsafe extern "C" fn(*mut *mut Squelch) -> i32>,
     destroy: Option<unsafe extern "C" fn(*mut Squelch)>,
-    noise_update: Option<unsafe extern "C" fn(*mut Squelch, bool, f64, u32, u32) -> bool>,
-    vox_advance: Option<unsafe extern "C" fn(*mut Squelch, u32, bool, u32)>,
-    vox_finish: Option<unsafe extern "C" fn(*mut Squelch, u32) -> bool>,
+    noise_update: Option<unsafe extern "C" fn(*mut Squelch, u32, f64, u32, u32) -> u32>,
+    vox_advance: Option<unsafe extern "C" fn(*mut Squelch, u32, u32, u32)>,
+    vox_finish: Option<unsafe extern "C" fn(*mut Squelch, u32) -> u32>,
 }
 
 #[link(name = "rptadvsquelch")]
@@ -44,13 +44,13 @@ unsafe extern "C" {
 pub struct Client {
     handle: NonNull<Squelch>,
     destroy: unsafe extern "C" fn(*mut Squelch),
-    noise_update: unsafe extern "C" fn(*mut Squelch, bool, f64, u32, u32) -> bool,
-    vox_advance: unsafe extern "C" fn(*mut Squelch, u32, bool, u32),
-    vox_finish: unsafe extern "C" fn(*mut Squelch, u32) -> bool,
+    noise_update: unsafe extern "C" fn(*mut Squelch, u32, f64, u32, u32) -> u32,
+    vox_advance: unsafe extern "C" fn(*mut Squelch, u32, u32, u32),
+    vox_finish: unsafe extern "C" fn(*mut Squelch, u32) -> u32,
 }
 
 impl Client {
-    /// Resolve ABI 1 and allocate one handle outside the audio callback.
+    /// Resolve ABI 2 and allocate one handle outside the audio callback.
     pub fn new() -> Result<Self, i32> {
         // SAFETY: the linked provider owns its process-lifetime descriptor.
         unsafe { Self::from_descriptor(rptadv_squelch_descriptor()) }
@@ -79,7 +79,11 @@ impl Client {
         ) else {
             return Err(UNSUPPORTED);
         };
-        let handle = NonNull::new(create()).ok_or(PROVIDER_FAILED)?;
+        let mut raw = std::ptr::null_mut();
+        if unsafe { create(&mut raw) } != 0 {
+            return Err(PROVIDER_FAILED);
+        }
+        let handle = NonNull::new(raw).ok_or(PROVIDER_FAILED)?;
         Ok(Self {
             handle,
             destroy,
@@ -101,24 +105,31 @@ impl Client {
         unsafe {
             (self.noise_update)(
                 self.handle.as_ptr(),
-                previous_closed,
+                u32::from(previous_closed),
                 power,
                 level,
                 hysteresis,
-            )
+            ) != 0
         }
     }
 
     /// Advance the VOX timer to an emitted sample's increasing native offset.
     pub fn vox_advance(&mut self, native_offset: u32, qualified: bool, hang_frames: u32) {
         // SAFETY: setup created this handle; its receive owner calls serially.
-        unsafe { (self.vox_advance)(self.handle.as_ptr(), native_offset, qualified, hang_frames) }
+        unsafe {
+            (self.vox_advance)(
+                self.handle.as_ptr(),
+                native_offset,
+                u32::from(qualified),
+                hang_frames,
+            )
+        }
     }
 
     /// Consume a span's trailing frames and return whether VOX hold remains.
     pub fn vox_finish(&mut self, native_frames: u32) -> bool {
         // SAFETY: setup created this handle; its receive owner calls serially.
-        unsafe { (self.vox_finish)(self.handle.as_ptr(), native_frames) }
+        unsafe { (self.vox_finish)(self.handle.as_ptr(), native_frames) != 0 }
     }
 }
 
@@ -142,12 +153,18 @@ mod tests {
 
     static DESTROYS: AtomicUsize = AtomicUsize::new(0);
 
-    extern "C" fn create() -> *mut Squelch {
-        Box::into_raw(Box::new(0_u8)).cast()
+    unsafe extern "C" fn create(out: *mut *mut Squelch) -> i32 {
+        unsafe { *out = Box::into_raw(Box::new(0_u8)).cast() };
+        0
     }
 
-    extern "C" fn create_null() -> *mut Squelch {
-        ptr::null_mut()
+    unsafe extern "C" fn create_null(out: *mut *mut Squelch) -> i32 {
+        unsafe { *out = ptr::null_mut() };
+        0
+    }
+
+    unsafe extern "C" fn create_error(_: *mut *mut Squelch) -> i32 {
+        -1
     }
 
     unsafe extern "C" fn destroy(handle: *mut Squelch) {
@@ -158,24 +175,24 @@ mod tests {
 
     unsafe extern "C" fn noise_update(
         _: *mut Squelch,
-        previous: bool,
+        previous: u32,
         _: f64,
         _: u32,
         _: u32,
-    ) -> bool {
-        !previous
+    ) -> u32 {
+        if previous == 0 { 2 } else { 0 }
     }
 
-    unsafe extern "C" fn vox_advance(_: *mut Squelch, _: u32, _: bool, _: u32) {}
+    unsafe extern "C" fn vox_advance(_: *mut Squelch, _: u32, _: u32, _: u32) {}
 
-    unsafe extern "C" fn vox_finish(_: *mut Squelch, frames: u32) -> bool {
-        frames != 0
+    unsafe extern "C" fn vox_finish(_: *mut Squelch, frames: u32) -> u32 {
+        if frames != 0 { 2 } else { 0 }
     }
 
     fn descriptor() -> Descriptor {
         Descriptor {
             struct_size: size_of::<Descriptor>() as u32,
-            abi_version: 1,
+            abi_version: 2,
             capability_name: c"rptadv.squelch".as_ptr(),
             create: Some(create),
             destroy: Some(destroy),
@@ -186,6 +203,12 @@ mod tests {
     }
 
     #[test]
+    fn released_abi2_descriptor_creates_a_live_squelch_handle() {
+        let mut client = Client::new().expect("released ABI 2 descriptor");
+        assert!(client.noise_update(false, 0.0, 0, 0));
+    }
+
+    #[test]
     fn rejects_incomplete_or_wrong_descriptor_before_allocation() {
         assert!(matches!(
             unsafe { Client::from_descriptor(ptr::null()) },
@@ -193,14 +216,14 @@ mod tests {
         ));
         let mut prefix = DescriptorPrefix {
             struct_size: size_of::<DescriptorPrefix>() as u32,
-            abi_version: 1,
+            abi_version: 2,
             capability_name: c"rptadv.squelch".as_ptr(),
         };
         assert!(matches!(
             unsafe { Client::from_descriptor((&prefix as *const DescriptorPrefix).cast()) },
             Err(UNSUPPORTED)
         ));
-        prefix.abi_version = 2;
+        prefix.abi_version = 1;
         assert!(matches!(
             unsafe { Client::from_descriptor((&prefix as *const DescriptorPrefix).cast()) },
             Err(UNSUPPORTED)
@@ -258,10 +281,16 @@ mod tests {
             unsafe { Client::from_descriptor(&table) },
             Err(PROVIDER_FAILED)
         ));
+        table.create = Some(create_error);
+        assert!(matches!(
+            unsafe { Client::from_descriptor(&table) },
+            Err(PROVIDER_FAILED)
+        ));
 
         let previous_destroys = DESTROYS.load(Ordering::Relaxed);
         let mut client = unsafe { Client::from_descriptor(&descriptor()) }.expect("valid table");
         assert!(!client.noise_update(true, 0.0, 0, 0));
+        assert!(client.noise_update(false, 0.0, 0, 0));
         client.vox_advance(1, true, 2);
         assert!(client.vox_finish(1));
         drop(client);

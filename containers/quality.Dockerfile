@@ -51,8 +51,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
 		> /etc/apt/sources.list.d/usbradioplus.list && \
 	apt-get update && \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		librptadvsquelch1=0.1.0~alpha1-1 librptadvsquelch-dev=0.1.0~alpha1-1 \
-		librptadvctcss1=0.1.0~alpha1-1 librptadvctcss-dev=0.1.0~alpha1-1 \
+		librptadvsquelch2=0.1.0~alpha2-1 librptadvsquelch-dev=0.1.0~alpha2-1 \
+		librptadvctcss2=0.1.0~alpha2-1 librptadvctcss-dev=0.1.0~alpha2-1 \
 		librptadvdcs1=0.1.0~alpha1-1 librptadvdcs-dev=0.1.0~alpha1-1 && \
 	rm -rf /var/lib/apt/lists/*
 

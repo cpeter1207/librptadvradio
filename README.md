@@ -26,15 +26,15 @@ their established levels remain independent.
 
 ABI 4 replaces earlier granular migration operations.
 Consumers must validate the descriptor and SONAME before creating a session.
-Radio links dynamically to `librptadvsquelch.so.1` for MICOR noise squelch and
-VOX hold timing. Building requires `librptadvsquelch-dev` 0.1.0~alpha1-1 or
-newer, and running requires `librptadvsquelch1` of the same minimum version.
+Radio links dynamically to `librptadvsquelch.so.2` for MICOR noise squelch and
+VOX hold timing. Building requires `librptadvsquelch-dev` 0.1.0~alpha2-1 or
+newer, and running requires `librptadvsquelch2` of the same minimum version.
 The radio session creates its squelch handle during setup; audio callbacks only
 advance the already prepared detector.
-Radio also links dynamically to `librptadvctcss.so.1` for conditioned 8 kHz
+Radio also links dynamically to `librptadvctcss.so.2` for conditioned 8 kHz
 CTCSS receive detection and 48 kHz tone generation. Building requires
-`librptadvctcss-dev` 0.1.0~alpha1-1 or newer, and running requires
-`librptadvctcss1` of the same minimum version. Separate receive and transmit
+`librptadvctcss-dev` 0.1.0~alpha2-1 or newer, and running requires
+`librptadvctcss2` of the same minimum version. Separate receive and transmit
 handles and operations are prepared during session setup; callback conditioning,
 render policy, and timers remain in radio.
 Radio links dynamically to `librptadvdcs.so.1` for 48 kHz stereo-left receive
@@ -45,6 +45,13 @@ updates copy the new code and polarity while preserving live phase and tail
 timing; turn-off scheduling and output routing remain in radio.
 The complete C contract is documented in
 `include/rptadvradio/rptadvradio.h`.
+
+For an alpha.7 to alpha.8 package upgrade, refresh the signed USBRadioPlus
+APT index and install `librptadvradio4`, `librptadvsquelch2`, and
+`librptadvctcss2` together; `librptadvdcs1` remains at ABI 1. A process using
+radio alpha.8 needs the new provider SONAMEs available before it starts. The
+alpha.7 squelch/CTCSS ABI-1 runtimes are not substitutes for ABI 2, and an
+already running consumer must be restarted to load the upgraded libraries.
 
 Build the shared object with `make`. Run `make ci` for the complete local
 quality gate.
