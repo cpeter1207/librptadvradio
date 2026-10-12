@@ -524,10 +524,6 @@ impl ReceivePath {
             }
         }
         if native_frame_count == 0 {
-            if external_carrier == Some(false) {
-                // The released provider accepts NULL for a zero-span carrier-loss update.
-                unsafe { self.ctcss_state.process(std::ptr::null(), 0, false) };
-            }
             self.last_baseband_count = 0;
             self.last_native_count = 0;
             self.last_result = ProcessResult {
@@ -1108,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_span_forwards_explicit_carrier_loss_to_ctcss() {
+    fn zero_span_preserves_ctcss_tail_despite_external_carrier_loss() {
         let mut config = configuration(192);
         config.ctcss = Some(CtcssConfig {
             tone_mask: 1 << 11,
@@ -1153,11 +1149,11 @@ mod tests {
                 .ctcss_tail_tone_active
         );
         assert!(
-            !path
-                .process_with_carrier(&[], Some(false))
+            path.process_with_carrier(&[], Some(false))
                 .unwrap()
                 .ctcss_tail_tone_active
         );
+        assert!(path.ctcss_state.tail_tone_active());
     }
 
     fn deployed_oracle_configuration(variant: u8) -> Config<'static> {
