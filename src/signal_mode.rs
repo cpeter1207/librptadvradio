@@ -12,7 +12,7 @@ use std::ptr::NonNull;
 
 #[cfg(test)]
 use crate::RADIO_OK;
-use crate::{RADIO_INVALID_ARGUMENT, ctcss_receive, timer};
+use crate::{RADIO_INVALID_ARGUMENT, ctcss_client, timer};
 
 /// Legacy no-signaling mode.
 pub const MODE_NONE: i32 = 0;
@@ -25,7 +25,7 @@ pub const MODE_DCS: i32 = 3;
 pub const CTCSS_NONE: i32 = -1;
 
 /// Number of CTCSS mapping entries in the public ABI.
-pub const TONE_COUNT: usize = ctcss_receive::TONE_COUNT;
+pub const TONE_COUNT: usize = ctcss_client::TONE_COUNT;
 
 /// Immutable signaling-mode configuration.
 ///

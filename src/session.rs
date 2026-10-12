@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::{
     CtcssRenderStateConfig, DcsTurnoffConfig, SignalModeConfig, TxCompleteConfig,
-    calibrated_test_tone, ctcss_transmit, dcs_transmit, receive_path, receive_profiles,
+    calibrated_test_tone, ctcss_client, dcs_client, receive_path, receive_profiles,
     receive_qualification, rx_cpu_saver,
     transmit_signaling::{self, TransmitSignaling},
 };
@@ -31,7 +31,7 @@ pub(crate) const BUSY: c_int = -6;
 
 const EVENT_CAPACITY: usize = 64;
 const MAX_SIGNED_PCM_LEVEL: u32 = i16::MAX as u32;
-const VALID_CTCSS_TONE_MASK: u64 = (1_u64 << crate::ctcss_receive::TONE_COUNT) - 1;
+const VALID_CTCSS_TONE_MASK: u64 = (1_u64 << ctcss_client::TONE_COUNT) - 1;
 
 /// External processing function prepared by an adapter.
 pub(crate) type ProcessFn = unsafe extern "C" fn(
@@ -169,7 +169,7 @@ pub(crate) struct QualificationConfig {
 pub(crate) struct TransmitConfig {
     pub(crate) ctcss_transmit_enabled: u32,
     pub(crate) default_ctcss_frequency_tenths_hz: i32,
-    pub(crate) mapped_ctcss_frequency_tenths_hz: [i32; crate::ctcss_receive::TONE_COUNT],
+    pub(crate) mapped_ctcss_frequency_tenths_hz: [i32; ctcss_client::TONE_COUNT],
     pub(crate) tone_off_mode: u32,
     pub(crate) ctcss_turnoff_duration_ms: i32,
     pub(crate) ctcss_turnoff_phase_shift_degrees: f64,
@@ -197,7 +197,7 @@ impl Default for TransmitConfig {
         Self {
             ctcss_transmit_enabled: 0,
             default_ctcss_frequency_tenths_hz: 0,
-            mapped_ctcss_frequency_tenths_hz: [0; crate::ctcss_receive::TONE_COUNT],
+            mapped_ctcss_frequency_tenths_hz: [0; ctcss_client::TONE_COUNT],
             tone_off_mode: 0,
             ctcss_turnoff_duration_ms: 0,
             ctcss_turnoff_phase_shift_degrees: 0.0,
@@ -248,7 +248,7 @@ pub(crate) struct SessionPorts {
     pub(crate) struct_size: u32,
     pub(crate) receive_deemphasis: ProcessorPort,
     pub(crate) receive_filter: ProcessorPort,
-    pub(crate) receive_ctcss_notch: [ProcessorPort; crate::ctcss_receive::TONE_COUNT],
+    pub(crate) receive_ctcss_notch: [ProcessorPort; ctcss_client::TONE_COUNT],
     pub(crate) receive_noise_reduction: ProcessorPort,
     pub(crate) receive_dynamics: ProcessorPort,
     pub(crate) transmit_program: ProcessorPort,
@@ -265,7 +265,7 @@ impl Default for SessionPorts {
             struct_size: size_of::<Self>() as u32,
             receive_deemphasis: ProcessorPort::default(),
             receive_filter: ProcessorPort::default(),
-            receive_ctcss_notch: [ProcessorPort::default(); crate::ctcss_receive::TONE_COUNT],
+            receive_ctcss_notch: [ProcessorPort::default(); ctcss_client::TONE_COUNT],
             receive_noise_reduction: ProcessorPort::default(),
             receive_dynamics: ProcessorPort::default(),
             transmit_program: ProcessorPort::default(),
@@ -407,7 +407,7 @@ pub(crate) struct Snapshot {
 struct Ports {
     receive_deemphasis: ProcessorPort,
     receive_filter: ProcessorPort,
-    receive_ctcss_notch: [ProcessorPort; crate::ctcss_receive::TONE_COUNT],
+    receive_ctcss_notch: [ProcessorPort; ctcss_client::TONE_COUNT],
     receive_noise_reduction: ProcessorPort,
     receive_dynamics: ProcessorPort,
     transmit_program: ProcessorPort,
@@ -462,8 +462,8 @@ struct TransmitWorker {
     output_a_tone_bias: f32,
     output_b_tone_gain: f32,
     output_b_tone_bias: f32,
-    ctcss_phase: f64,
-    dcs: dcs_transmit::TransmitState,
+    ctcss_tx: ctcss_client::Transmit,
+    dcs: dcs_client::Transmit,
     test_tone: calibrated_test_tone::State,
     program: Vec<f32>,
     processed: Vec<f32>,
@@ -777,9 +777,11 @@ pub(crate) unsafe extern "C" fn apply_transmit_update(
     }
     let live = unsafe { &mut *session.transmit.get() };
     let next = unsafe { &*update.candidate.transmit.get() };
+    if let Err(error) = live.dcs.update_config_from(&next.dcs) {
+        return error;
+    }
     live.ports = next.ports;
     live.signaling.update_config_from(&next.signaling);
-    live.dcs.update_config_from(&next.dcs);
     live.ctcss_peak = next.ctcss_peak;
     live.dcs_peak = next.dcs_peak;
     live.dcs_enabled = next.dcs_enabled;
@@ -903,7 +905,7 @@ fn receive_config(
         || !(0..=i32::from(i16::MAX)).contains(&rx.vox_hang_ms)
         || rx.ctcss_tone_mask & !VALID_CTCSS_TONE_MASK != 0
         || (ctcss_enabled && dcs_enabled)
-        || (dcs_enabled && !crate::dcs_receive::code_supported(rx.dcs_code))
+        || (dcs_enabled && !dcs_client::code_supported(rx.dcs_code)?)
     {
         return Err(INVALID_ARGUMENT);
     }
@@ -979,7 +981,7 @@ fn transmit_config(
     let ctcss_enabled = bool32(config.ctcss_transmit_enabled)?;
     let dcs_enabled = bool32(config.dcs_transmit_enabled)?;
     let _ = bool32(config.dcs_inverted)?;
-    if dcs_enabled && (ctcss_enabled || !dcs_transmit::code_supported(config.dcs_code))
+    if dcs_enabled && (ctcss_enabled || !dcs_client::code_supported(config.dcs_code)?)
         || !config.ctcss_peak.is_finite()
         || !(0.0..=1.0).contains(&config.ctcss_peak)
         || !config.dcs_peak.is_finite()
@@ -1065,8 +1067,10 @@ pub(crate) unsafe extern "C" fn create(
         Err(error) => return error,
     };
     // Setup above validates the only variable fields; profiles are built-in.
-    let detector = receive_path::ReceivePath::new(receive_config)
-        .expect("validated session receiver configuration");
+    let detector = match receive_path::ReceivePath::new(receive_config) {
+        Ok(detector) => detector,
+        Err(error) => return error,
+    };
     let (signaling_config, transmit_dcs_enabled, output_a_route, output_b_route) =
         match transmit_config(config.transmit) {
             Ok(value) => value,
@@ -1079,8 +1083,17 @@ pub(crate) unsafe extern "C" fn create(
     let publication_frames = u64::from(config.publication_interval_ms) * 48;
     let rx_max = config.maximum_receive_frame_count as usize;
     let tx_max = config.maximum_transmit_frame_count as usize;
-    let mut dcs = dcs_transmit::TransmitState::default();
-    dcs.configure(config.transmit.dcs_code, config.transmit.dcs_inverted);
+    let mut dcs = match dcs_client::Transmit::new() {
+        Ok(handle) => handle,
+        Err(error) => return error,
+    };
+    if let Err(error) = dcs.configure(config.transmit.dcs_code, config.transmit.dcs_inverted) {
+        return error;
+    }
+    let ctcss_tx = match ctcss_client::Transmit::new() {
+        Ok(handle) => handle,
+        Err(error) => return error,
+    };
     let processor_ports = Ports {
         receive_deemphasis: ports.receive_deemphasis,
         receive_filter: ports.receive_filter,
@@ -1147,7 +1160,7 @@ pub(crate) unsafe extern "C" fn create(
             output_a_tone_bias: config.transmit.output_a_tone_bias,
             output_b_tone_gain: config.transmit.output_b_tone_gain,
             output_b_tone_bias: config.transmit.output_b_tone_bias,
-            ctcss_phase: 0.0,
+            ctcss_tx,
             dcs,
             test_tone: calibrated_test_tone::State::default(),
             program: vec![0.0; tx_max],
@@ -1789,7 +1802,7 @@ unsafe fn render_ring(
             || !(0..=1).contains(&result.receiver_keyed)
             || !(0..=1).contains(&result.dcs_valid)
             || result.ctcss_decoded_index < -1
-            || result.ctcss_decoded_index >= crate::ctcss_receive::TONE_COUNT as i32
+            || result.ctcss_decoded_index >= ctcss_client::TONE_COUNT as i32
         {
             output.fill(0.0);
             return Err(PROVIDER_FAILED);
@@ -1808,11 +1821,12 @@ fn render_ctcss(worker: &mut TransmitWorker, output: &transmit_signaling::Output
         let frequency = if tail_frequency > 0.0 {
             tail_frequency
         } else {
-            ctcss_transmit::legacy_frequency(f64::from(span.ctcss_frequency_tenths_hz) / 10.0)
+            worker
+                .ctcss_tx
+                .legacy_frequency(f64::from(span.ctcss_frequency_tenths_hz) / 10.0)
         };
         unsafe {
-            ctcss_transmit::generate(
-                &mut worker.ctcss_phase,
+            worker.ctcss_tx.generate(
                 destination,
                 span.frame_count,
                 frequency,
@@ -1824,7 +1838,11 @@ fn render_ctcss(worker: &mut TransmitWorker, output: &transmit_signaling::Output
     }
 }
 
-fn render_dcs(worker: &mut TransmitWorker, output: &transmit_signaling::Output, count: usize) {
+fn render_dcs(
+    worker: &mut TransmitWorker,
+    output: &transmit_signaling::Output,
+    count: usize,
+) -> Result<(), c_int> {
     worker.dcs_normal_raw[..count].fill(0.0);
     worker.dcs_turnoff_raw[..count].fill(0.0);
     for span in &output.render_spans[..output.render_span_count] {
@@ -1835,18 +1853,16 @@ fn render_dcs(worker: &mut TransmitWorker, output: &transmit_signaling::Output, 
             &mut worker.dcs_normal_raw
         };
         unsafe {
-            dcs_transmit::generate(
-                &mut worker.dcs,
+            worker.dcs.generate(
                 destination[start..].as_mut_ptr(),
                 span.frame_count,
-                dcs_transmit::GenerateConfig {
-                    peak: worker.dcs_peak,
-                    enabled: u32::from(span.logical_ptt && worker.dcs_enabled),
-                    turnoff: u32::from(span.dcs_turnoff_active),
-                },
+                worker.dcs_peak,
+                u32::from(span.logical_ptt && worker.dcs_enabled),
+                u32::from(span.dcs_turnoff_active),
             )
-        };
+        }?;
     }
+    Ok(())
 }
 
 fn route_sample(
@@ -1942,7 +1958,10 @@ pub(crate) unsafe extern "C" fn transmit(
         Err(_) => return INVALID_ARGUMENT,
     };
     render_ctcss(worker, &signaling, count);
-    render_dcs(worker, &signaling, count);
+    if render_dcs(worker, &signaling, count).is_err() {
+        provider_failure(session, false, worker.sample_index);
+        return PROVIDER_FAILED;
+    }
     if unsafe {
         run_processor(
             worker.ports.transmit_dcs_normal_filter,
@@ -2350,6 +2369,105 @@ mod tests {
     }
 
     #[test]
+    fn released_provider_receive_setup_error_keeps_output_null() {
+        let config = valid_config();
+        assert_eq!(
+            dcs_client::with_test_fault(dcs_client::TestFault::RxCreateFailed, || {
+                create_result(&config)
+            }),
+            PROVIDER_FAILED
+        );
+    }
+
+    #[test]
+    fn released_provider_transmit_setup_errors_keep_output_null() {
+        let config = valid_config();
+        for fault in [
+            dcs_client::TestFault::TxCreateFailed,
+            dcs_client::TestFault::TxConfigureFailed,
+        ] {
+            assert_eq!(
+                dcs_client::with_test_fault(fault, || create_result(&config)),
+                PROVIDER_FAILED
+            );
+        }
+    }
+
+    #[test]
+    fn ctcss_transmit_setup_error_keeps_output_null() {
+        let config = valid_config();
+        assert_eq!(
+            ctcss_client::with_test_tx_create_failure(|| create_result(&config)),
+            PROVIDER_FAILED
+        );
+    }
+
+    #[test]
+    fn incompatible_dcs_descriptor_fails_receive_and_transmit_validation() {
+        let mut config = valid_config();
+        config.receive.dcs_enabled = 1;
+        config.receive.dcs_code = 23;
+        assert_eq!(
+            dcs_client::with_test_fault(dcs_client::TestFault::Unsupported, || {
+                create_result(&config)
+            }),
+            UNSUPPORTED
+        );
+        config.receive.dcs_enabled = 0;
+        config.transmit.dcs_transmit_enabled = 1;
+        config.transmit.dcs_code = 23;
+        assert!(matches!(
+            dcs_client::with_test_fault(dcs_client::TestFault::Unsupported, || {
+                transmit_config(config.transmit)
+            }),
+            Err(UNSUPPORTED)
+        ));
+    }
+
+    #[test]
+    fn rejected_dcs_prepared_update_preserves_live_transmit() {
+        let mut config = valid_config();
+        config.transmit.dcs_transmit_enabled = 1;
+        config.transmit.dcs_code = 23;
+        config.transmit.dcs_peak = 0.1;
+        config.transmit.output_a_route = 3;
+        config.transmit.output_a_tone_gain = 1.0;
+        let baseline = TestSession::prepared(&config, &SessionPorts::default());
+        let live = dcs_client::with_test_fault(dcs_client::TestFault::TxUpdateFailed, || {
+            TestSession::prepared(&config, &SessionPorts::default())
+        });
+        for _ in 0..37 {
+            assert_eq!(live.transmit(true), baseline.transmit(true));
+        }
+        config.transmit.dcs_code = 25;
+        config.transmit.dcs_inverted = 1;
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(
+            unsafe { apply_transmit_update(live.0, update) },
+            PROVIDER_FAILED
+        );
+        assert!(!unsafe { &*update }.transmit_applied.load(Ordering::Relaxed));
+        unsafe { destroy_update(update) };
+        assert_eq!(live.transmit(true), baseline.transmit(true));
+    }
+
+    #[test]
+    fn dcs_generate_failure_reports_provider_failure_without_output() {
+        let config = valid_config();
+        let session = dcs_client::with_test_fault(dcs_client::TestFault::TxGenerateFailed, || {
+            TestSession::prepared(&config, &SessionPorts::default())
+        });
+        let (status, output, _) = session.transmit(true);
+        assert_eq!(status, PROVIDER_FAILED);
+        assert_eq!(output, [0.0; 8]);
+        assert_eq!(session.snapshot().provider_failures, 1);
+    }
+
+    #[test]
     fn event_queue_is_bounded_fifo() {
         let queue = EventQueue::new();
         for value in 0..EVENT_CAPACITY as i32 {
@@ -2475,7 +2593,7 @@ mod tests {
         let mut ports = Ports {
             receive_deemphasis: ProcessorPort::default(),
             receive_filter: test_port(&mut fixed),
-            receive_ctcss_notch: [ProcessorPort::default(); crate::ctcss_receive::TONE_COUNT],
+            receive_ctcss_notch: [ProcessorPort::default(); ctcss_client::TONE_COUNT],
             receive_noise_reduction: ProcessorPort::default(),
             receive_dynamics: ProcessorPort::default(),
             transmit_program: ProcessorPort::default(),
@@ -2596,7 +2714,7 @@ mod tests {
         candidate.receive.vox_hang_ms = i32::from(i16::MAX) + 1;
         invalid.push(candidate);
         candidate = valid_config();
-        candidate.receive.ctcss_tone_mask = 1_u64 << crate::ctcss_receive::TONE_COUNT;
+        candidate.receive.ctcss_tone_mask = 1_u64 << ctcss_client::TONE_COUNT;
         invalid.push(candidate);
         candidate = valid_config();
         candidate.receive.ctcss_enabled = 1;
@@ -2711,6 +2829,41 @@ mod tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn prepared_update_changes_dcs_code_without_resetting_phase() {
+        let mut config = valid_config();
+        config.transmit.dcs_transmit_enabled = 1;
+        config.transmit.dcs_code = 23;
+        config.transmit.dcs_peak = 0.1;
+        config.transmit.output_a_route = 3;
+        config.transmit.output_a_tone_gain = 1.0;
+        let old_code = TestSession::prepared(&config, &SessionPorts::default());
+        let updated = TestSession::prepared(&config, &SessionPorts::default());
+        config.transmit.dcs_code = 25;
+        config.transmit.dcs_inverted = 1;
+        let new_code = TestSession::prepared(&config, &SessionPorts::default());
+        for _ in 0..37 {
+            assert_eq!(old_code.transmit(true), updated.transmit(true));
+            new_code.transmit(true);
+        }
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(unsafe { apply_transmit_update(updated.0, update) }, OK);
+        unsafe { destroy_update(update) };
+        let mut differs_from_old = false;
+        for _ in 0..200 {
+            let old = old_code.transmit(true);
+            let expected = new_code.transmit(true);
+            let actual = updated.transmit(true);
+            differs_from_old |= actual.1 != old.1;
+            assert_eq!(actual, expected);
+        }
+        assert!(differs_from_old);
     }
 
     #[test]
@@ -3463,7 +3616,7 @@ mod tests {
             ring.result.dcs_valid = if invalid == 3 { 2 } else { 0 };
             ring.result.ctcss_decoded_index = match invalid {
                 4 => -2,
-                5 => crate::ctcss_receive::TONE_COUNT as i32,
+                5 => ctcss_client::TONE_COUNT as i32,
                 _ => -1,
             };
             let (status, output, _) = session.transmit(true);

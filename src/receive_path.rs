@@ -1,16 +1,16 @@
 //! Owned native receive path for the whole-session radio engine.
 //!
 //! This module composes the existing legacy-compatible fixed-point primitives
-//! without crossing the C descriptor for each stage.  Construction copies the
+//! with a setup-resolved squelch descriptor. Construction copies the
 //! selected coefficient tables and preallocates every history and PCM span;
 //! [`crate::receive_path::ReceivePath::process_with_carrier`] only advances caller-owned
 //! stream state.
 
 use super::{
-    RADIO_INVALID_ARGUMENT, audio_meter, center_slicer, ctcss_receive, dcs_receive,
+    RADIO_INVALID_ARGUMENT, audio_meter, center_slicer, ctcss_client, dcs_client,
     deemphasis_integrator, delay_line, envelope_meter, fir, receive_frontend,
     rx_blanking::{self, RxBlankingInput, RxBlankingState},
-    timer,
+    squelch_client, timer,
 };
 
 /// Fixed legacy network-rate detector sample rate.
@@ -238,13 +238,14 @@ pub struct ReceivePath {
     lsd_history: Vec<i16>,
     hpf_history: Vec<i16>,
     frontend_state: receive_frontend::State,
+    squelch: squelch_client::Client,
     center_state: center_slicer::State,
     deemphasis_state: deemphasis_integrator::State,
     delay_state: delay_line::State,
     vox_envelope_state: envelope_meter::State,
     measurement_state: envelope_meter::State,
-    ctcss_state: ctcss_receive::ReceiveState,
-    dcs_state: dcs_receive::ReceiveState,
+    ctcss_state: ctcss_client::Receive,
+    dcs_state: dcs_client::Receive,
     native_work: Vec<f32>,
     baseband: Vec<f32>,
     carrier_gate: Vec<u8>,
@@ -262,7 +263,6 @@ pub struct ReceivePath {
     blanking_remaining_ms: i32,
     blanking_remainder: u32,
     vox_hang_frames: u32,
-    vox_hold_remaining_frames: u32,
     delay_gate_native_remainder: u32,
     delay_outzero: bool,
     voice_processing_active: bool,
@@ -335,14 +335,15 @@ impl ReceivePath {
             _ => 0,
         };
 
-        let mut ctcss_state = ctcss_receive::ReceiveState::default();
+        let mut ctcss_state = ctcss_client::Receive::new()?;
         if let Some(ctcss) = config.ctcss {
             ctcss_state.configure(ctcss.tone_mask, ctcss.relax);
         }
-        let mut dcs_state = dcs_receive::ReceiveState::default();
+        let mut dcs_state = dcs_client::Receive::new()?;
         if let Some(dcs) = config.dcs {
-            dcs_state.configure(dcs.code, u32::from(dcs.inverted));
+            dcs_state.configure(dcs.code, u32::from(dcs.inverted))?;
         }
+        let squelch = squelch_client::Client::new()?;
 
         Ok(Self {
             maximum_native_frames,
@@ -383,6 +384,7 @@ impl ReceivePath {
                 comparator_output: 1,
                 ..receive_frontend::State::default()
             },
+            squelch,
             center_state: center_slicer::State::default(),
             deemphasis_state: deemphasis_integrator::State::default(),
             delay_state: delay_line::State::default(),
@@ -407,7 +409,6 @@ impl ReceivePath {
             blanking_remaining_ms: 0,
             blanking_remainder: 0,
             vox_hang_frames,
-            vox_hold_remaining_frames: 0,
             delay_gate_native_remainder: 0,
             delay_outzero: false,
             voice_processing_active: true,
@@ -562,6 +563,7 @@ impl ReceivePath {
                 open_level: self.frontend_controls.open_level,
                 hysteresis: self.frontend_controls.hysteresis,
                 state: &mut self.frontend_state,
+                squelch: &mut self.squelch,
             })
         };
         let frontend = frontend?;
@@ -613,7 +615,7 @@ impl ReceivePath {
         };
 
         if self.dcs_state.enabled() {
-            let _ = unsafe { self.dcs_state.process(input, native_frame_count_u32) };
+            let _ = unsafe { self.dcs_state.process(input, native_frame_count_u32) }?;
         }
         let ctcss_carrier = external_carrier.unwrap_or(carrier_detect);
         self.ctcss_state.clear_tail_on_carrier_loss(ctcss_carrier);
@@ -691,21 +693,16 @@ impl ReceivePath {
     ) -> Result<bool, i32> {
         // record_emission_offsets uses the frontend's identical decimator and
         // records exactly one increasing in-span offset per emitted sample.
-        let mut prior_offset = 0_u32;
         for index in 0..sample_count {
             let offset = self.emission_offsets[index];
-            let elapsed = offset - prior_offset;
-            self.vox_hold_remaining_frames = self.vox_hold_remaining_frames.saturating_sub(elapsed);
-
             let peak = audio_meter::f32_to_pcm_code(self.vox_envelope[index])?;
-            if peak >= i32::from(vox.envelope.threshold) {
-                self.vox_hold_remaining_frames = self.vox_hang_frames;
-            }
-            prior_offset = offset;
+            self.squelch.vox_advance(
+                offset,
+                peak >= i32::from(vox.envelope.threshold),
+                self.vox_hang_frames,
+            );
         }
-        let trailing = native_frame_count - prior_offset;
-        self.vox_hold_remaining_frames = self.vox_hold_remaining_frames.saturating_sub(trailing);
-        Ok(self.vox_hold_remaining_frames != 0)
+        Ok(self.squelch.vox_finish(native_frame_count))
     }
 
     fn process_baseband(&mut self, sample_count: usize) -> Result<(), i32> {
@@ -1077,7 +1074,34 @@ mod tests {
     }
 
     #[test]
-    fn cpu_saver_suspends_ctcss_acquisition_but_monitors_a_qualified_tone() {
+    fn zero_span_preserves_acquired_dcs_decode() {
+        let mut config = configuration(960);
+        config.dcs = Some(super::DcsConfig {
+            code: 0o023,
+            inverted: false,
+        });
+        let mut path = ReceivePath::new(config).expect("valid DCS path");
+        let mut pcm = vec![0.0_f32; 48_000 * 2];
+        let word = 0x76_3813_u32;
+        for (index, frame) in pcm.chunks_exact_mut(2).enumerate() {
+            let bit = (index as u64 * 1_344 / 480_000) % 23;
+            frame[0] = if word & (1 << bit) != 0 {
+                0.375
+            } else {
+                -0.375
+            };
+            frame[1] = -frame[0];
+        }
+        for block in pcm.chunks(960 * 2) {
+            path.process(block).expect("native DCS span");
+        }
+        assert!(path.dcs_state.valid());
+        assert!(path.process(&[]).expect("empty span").dcs_valid);
+        assert!(path.dcs_state.valid());
+    }
+
+    #[test]
+    fn cpu_saver_suspends_ctcss_acquisition() {
         let mut config = configuration(6);
         config.frontend.noise_squelch = false;
         config.ctcss = Some(CtcssConfig {
@@ -1092,7 +1116,6 @@ mod tests {
         });
         let mut path = ReceivePath::new(config).expect("valid CTCSS path");
         path.frontend_state.comparator_output = 0;
-        path.ctcss_state.test_prepare_detector(0);
         path.center_state.peak = 2_400;
         assert_eq!(
             path.process(&[]).unwrap().ctcss_decoder_peak,
@@ -1103,14 +1126,61 @@ mod tests {
         let sleeping = path.process(&silence).expect("sleeping receiver");
         assert!(sleeping.carrier_detect);
         assert_eq!(sleeping.ctcss_decoded, -1);
-        assert_eq!(path.ctcss_state.test_detector_decode(0), 0);
-
         path.set_voice_processing_active(true);
-        assert_eq!(path.process(&silence).unwrap().ctcss_decoded, 0);
-        path.set_voice_processing_active(false);
-        path.ctcss_state.test_set_detector_release(0);
         assert_eq!(path.process(&silence).unwrap().ctcss_decoded, -1);
-        assert_eq!(path.ctcss_state.test_blanking_samples(), 1_600);
+    }
+
+    #[test]
+    fn zero_span_preserves_ctcss_tail_despite_external_carrier_loss() {
+        let mut config = configuration(192);
+        config.ctcss = Some(CtcssConfig {
+            tone_mask: 1 << 11,
+            relax: false,
+        });
+        config.center_slicer = Some(CenterSlicerConfig {
+            limit: 16_384,
+            setpoint: 8_192,
+            decay_factor: 1,
+            trace: false,
+        });
+        let mut path = ReceivePath::new(config).expect("valid CTCSS path");
+        let mut tone = [0.0; 8_000];
+        for (index, sample) in tone.iter_mut().enumerate() {
+            let phase = std::f32::consts::TAU * 100.0 * index as f32 / 8_000.0;
+            *sample = if phase.sin() >= 0.0 { 625.0 } else { -625.0 } / 32_768.0;
+        }
+        for block in tone.chunks(160) {
+            unsafe {
+                path.ctcss_state
+                    .process(block.as_ptr(), block.len() as u32, true)
+            };
+        }
+        assert_eq!(path.ctcss_state.decoded(), 11);
+        path.set_voice_processing_active(false);
+        assert_eq!(
+            path.process_with_carrier(&stereo(192), Some(true))
+                .unwrap()
+                .ctcss_decoded,
+            11
+        );
+        let mut tail = [0.0; 256];
+        for (index, sample) in tail.iter_mut().enumerate() {
+            let phase = std::f32::consts::TAU * 55.0 * index as f32 / 8_000.0;
+            *sample = if phase.sin() >= 0.0 { 625.0 } else { -625.0 } / 32_768.0;
+        }
+        unsafe { path.ctcss_state.process(tail.as_ptr(), 256, true) };
+        assert!(path.ctcss_state.tail_tone_active());
+        assert!(
+            path.process_with_carrier(&[], Some(true))
+                .unwrap()
+                .ctcss_tail_tone_active
+        );
+        assert!(
+            path.process_with_carrier(&[], Some(false))
+                .unwrap()
+                .ctcss_tail_tone_active
+        );
+        assert!(path.ctcss_state.tail_tone_active());
     }
 
     fn deployed_oracle_configuration(variant: u8) -> Config<'static> {
@@ -1423,6 +1493,46 @@ mod tests {
     }
 
     #[test]
+    fn shared_squelch_matches_baseline_for_irregular_partitions() {
+        let partitions = [
+            vec![1; 960],
+            [vec![7; 137], vec![1]].concat(),
+            vec![480, 480],
+            vec![960],
+        ];
+        let mut expected = None;
+        for blocks in partitions {
+            let mut path = ReceivePath::new(deployed_oracle_configuration(0)).expect("path");
+            let capture = process_deployed_oracle(&mut path, &blocks);
+            let gate_hash = capture
+                .gates
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, gate| {
+                    (hash ^ u64::from(*gate)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+            assert_eq!(
+                gate_hash,
+                7_876_329_024_134_177_093,
+                "partition count {}",
+                blocks.len()
+            );
+            assert_eq!(
+                capture
+                    .gates
+                    .iter()
+                    .map(|gate| u32::from(*gate))
+                    .sum::<u32>(),
+                45_600
+            );
+            if let Some(prior) = &expected {
+                assert_eq!(&capture, prior, "partition count {}", blocks.len());
+            } else {
+                expected = Some(capture);
+            }
+        }
+    }
+
+    #[test]
     fn incomplete_decimation_interval_emits_no_baseband_samples() {
         let input = stereo(5);
         let mut path = ReceivePath::new(configuration(960)).expect("valid path");
@@ -1505,10 +1615,6 @@ mod tests {
         assert_eq!(split_offset, INITIAL_BLOCK * 2);
         assert_eq!(whole_result.carrier_detect, split_result.carrier_detect);
         assert_eq!(whole_last_hit, split_last_hit);
-        assert_eq!(
-            whole.vox_hold_remaining_frames,
-            split.vox_hold_remaining_frames
-        );
 
         let mut whole_drop = None;
         let mut split_drop = None;

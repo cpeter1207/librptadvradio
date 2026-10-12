@@ -8,4 +8,7 @@ installation, Debian package, source archive, and unpacked-archive checks.
 
 The optional `make container-coverage` target rebuilds a labeled, disposable
 Debian 13 quality container and removes project-owned stale test containers on
-exit. It does not alter source files.
+exit. Its source-owned image installs the released squelch, CTCSS and DCS
+development/runtime packages from the signed USBRadioPlus APT repository at
+`0.1.0~alpha1-1`; no provider source is built into the image. It does not alter
+source files.
