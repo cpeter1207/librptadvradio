@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::{
     CtcssRenderStateConfig, DcsTurnoffConfig, SignalModeConfig, TxCompleteConfig,
-    calibrated_test_tone, ctcss_client, dcs_transmit, receive_path, receive_profiles,
+    calibrated_test_tone, ctcss_client, dcs_client, receive_path, receive_profiles,
     receive_qualification, rx_cpu_saver,
     transmit_signaling::{self, TransmitSignaling},
 };
@@ -463,7 +463,7 @@ struct TransmitWorker {
     output_b_tone_gain: f32,
     output_b_tone_bias: f32,
     ctcss_tx: ctcss_client::Transmit,
-    dcs: dcs_transmit::TransmitState,
+    dcs: dcs_client::Transmit,
     test_tone: calibrated_test_tone::State,
     program: Vec<f32>,
     processed: Vec<f32>,
@@ -777,9 +777,11 @@ pub(crate) unsafe extern "C" fn apply_transmit_update(
     }
     let live = unsafe { &mut *session.transmit.get() };
     let next = unsafe { &*update.candidate.transmit.get() };
+    if let Err(error) = live.dcs.update_config_from(&next.dcs) {
+        return error;
+    }
     live.ports = next.ports;
     live.signaling.update_config_from(&next.signaling);
-    live.dcs.update_config_from(&next.dcs);
     live.ctcss_peak = next.ctcss_peak;
     live.dcs_peak = next.dcs_peak;
     live.dcs_enabled = next.dcs_enabled;
@@ -903,7 +905,7 @@ fn receive_config(
         || !(0..=i32::from(i16::MAX)).contains(&rx.vox_hang_ms)
         || rx.ctcss_tone_mask & !VALID_CTCSS_TONE_MASK != 0
         || (ctcss_enabled && dcs_enabled)
-        || (dcs_enabled && !crate::dcs_receive::code_supported(rx.dcs_code))
+        || (dcs_enabled && !dcs_client::code_supported(rx.dcs_code)?)
     {
         return Err(INVALID_ARGUMENT);
     }
@@ -979,7 +981,7 @@ fn transmit_config(
     let ctcss_enabled = bool32(config.ctcss_transmit_enabled)?;
     let dcs_enabled = bool32(config.dcs_transmit_enabled)?;
     let _ = bool32(config.dcs_inverted)?;
-    if dcs_enabled && (ctcss_enabled || !dcs_transmit::code_supported(config.dcs_code))
+    if dcs_enabled && (ctcss_enabled || !dcs_client::code_supported(config.dcs_code)?)
         || !config.ctcss_peak.is_finite()
         || !(0.0..=1.0).contains(&config.ctcss_peak)
         || !config.dcs_peak.is_finite()
@@ -1081,8 +1083,13 @@ pub(crate) unsafe extern "C" fn create(
     let publication_frames = u64::from(config.publication_interval_ms) * 48;
     let rx_max = config.maximum_receive_frame_count as usize;
     let tx_max = config.maximum_transmit_frame_count as usize;
-    let mut dcs = dcs_transmit::TransmitState::default();
-    dcs.configure(config.transmit.dcs_code, config.transmit.dcs_inverted);
+    let mut dcs = match dcs_client::Transmit::new() {
+        Ok(handle) => handle,
+        Err(error) => return error,
+    };
+    if let Err(error) = dcs.configure(config.transmit.dcs_code, config.transmit.dcs_inverted) {
+        return error;
+    }
     let ctcss_tx = match ctcss_client::Transmit::new() {
         Ok(handle) => handle,
         Err(error) => return error,
@@ -1831,7 +1838,11 @@ fn render_ctcss(worker: &mut TransmitWorker, output: &transmit_signaling::Output
     }
 }
 
-fn render_dcs(worker: &mut TransmitWorker, output: &transmit_signaling::Output, count: usize) {
+fn render_dcs(
+    worker: &mut TransmitWorker,
+    output: &transmit_signaling::Output,
+    count: usize,
+) -> Result<(), c_int> {
     worker.dcs_normal_raw[..count].fill(0.0);
     worker.dcs_turnoff_raw[..count].fill(0.0);
     for span in &output.render_spans[..output.render_span_count] {
@@ -1842,18 +1853,16 @@ fn render_dcs(worker: &mut TransmitWorker, output: &transmit_signaling::Output, 
             &mut worker.dcs_normal_raw
         };
         unsafe {
-            dcs_transmit::generate(
-                &mut worker.dcs,
+            worker.dcs.generate(
                 destination[start..].as_mut_ptr(),
                 span.frame_count,
-                dcs_transmit::GenerateConfig {
-                    peak: worker.dcs_peak,
-                    enabled: u32::from(span.logical_ptt && worker.dcs_enabled),
-                    turnoff: u32::from(span.dcs_turnoff_active),
-                },
+                worker.dcs_peak,
+                u32::from(span.logical_ptt && worker.dcs_enabled),
+                u32::from(span.dcs_turnoff_active),
             )
-        };
+        }?;
     }
+    Ok(())
 }
 
 fn route_sample(
@@ -1949,7 +1958,10 @@ pub(crate) unsafe extern "C" fn transmit(
         Err(_) => return INVALID_ARGUMENT,
     };
     render_ctcss(worker, &signaling, count);
-    render_dcs(worker, &signaling, count);
+    if render_dcs(worker, &signaling, count).is_err() {
+        provider_failure(session, false, worker.sample_index);
+        return PROVIDER_FAILED;
+    }
     if unsafe {
         run_processor(
             worker.ports.transmit_dcs_normal_filter,
@@ -2718,6 +2730,41 @@ mod tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn prepared_update_changes_dcs_code_without_resetting_phase() {
+        let mut config = valid_config();
+        config.transmit.dcs_transmit_enabled = 1;
+        config.transmit.dcs_code = 23;
+        config.transmit.dcs_peak = 0.1;
+        config.transmit.output_a_route = 3;
+        config.transmit.output_a_tone_gain = 1.0;
+        let old_code = TestSession::prepared(&config, &SessionPorts::default());
+        let updated = TestSession::prepared(&config, &SessionPorts::default());
+        config.transmit.dcs_code = 25;
+        config.transmit.dcs_inverted = 1;
+        let new_code = TestSession::prepared(&config, &SessionPorts::default());
+        for _ in 0..37 {
+            assert_eq!(old_code.transmit(true), updated.transmit(true));
+            new_code.transmit(true);
+        }
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(unsafe { apply_transmit_update(updated.0, update) }, OK);
+        unsafe { destroy_update(update) };
+        let mut differs_from_old = false;
+        for _ in 0..200 {
+            let old = old_code.transmit(true);
+            let expected = new_code.transmit(true);
+            let actual = updated.transmit(true);
+            differs_from_old |= actual.1 != old.1;
+            assert_eq!(actual, expected);
+        }
+        assert!(differs_from_old);
     }
 
     #[test]

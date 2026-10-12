@@ -37,6 +37,12 @@ CTCSS receive detection and 48 kHz tone generation. Building requires
 `librptadvctcss1` of the same minimum version. Separate receive and transmit
 handles and operations are prepared during session setup; callback conditioning,
 render policy, and timers remain in radio.
+Radio links dynamically to `librptadvdcs.so.1` for 48 kHz stereo-left receive
+decoding and mono transmit generation. Building requires `librptadvdcs-dev`
+0.1.0~alpha1-1 or newer, and running requires `librptadvdcs1` of the same
+minimum version. Receive and transmit handles are separate. Prepared transmit
+updates copy the new code and polarity while preserving live phase and tail
+timing; turn-off scheduling and output routing remain in radio.
 The complete C contract is documented in
 `include/rptadvradio/rptadvradio.h`.
 

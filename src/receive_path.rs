@@ -7,7 +7,7 @@
 //! stream state.
 
 use super::{
-    RADIO_INVALID_ARGUMENT, audio_meter, center_slicer, ctcss_client, dcs_receive,
+    RADIO_INVALID_ARGUMENT, audio_meter, center_slicer, ctcss_client, dcs_client,
     deemphasis_integrator, delay_line, envelope_meter, fir, receive_frontend,
     rx_blanking::{self, RxBlankingInput, RxBlankingState},
     squelch_client, timer,
@@ -245,7 +245,7 @@ pub struct ReceivePath {
     vox_envelope_state: envelope_meter::State,
     measurement_state: envelope_meter::State,
     ctcss_state: ctcss_client::Receive,
-    dcs_state: dcs_receive::ReceiveState,
+    dcs_state: dcs_client::Receive,
     native_work: Vec<f32>,
     baseband: Vec<f32>,
     carrier_gate: Vec<u8>,
@@ -339,9 +339,9 @@ impl ReceivePath {
         if let Some(ctcss) = config.ctcss {
             ctcss_state.configure(ctcss.tone_mask, ctcss.relax);
         }
-        let mut dcs_state = dcs_receive::ReceiveState::default();
+        let mut dcs_state = dcs_client::Receive::new()?;
         if let Some(dcs) = config.dcs {
-            dcs_state.configure(dcs.code, u32::from(dcs.inverted));
+            dcs_state.configure(dcs.code, u32::from(dcs.inverted))?;
         }
         let squelch = squelch_client::Client::new()?;
 
@@ -615,7 +615,7 @@ impl ReceivePath {
         };
 
         if self.dcs_state.enabled() {
-            let _ = unsafe { self.dcs_state.process(input, native_frame_count_u32) };
+            let _ = unsafe { self.dcs_state.process(input, native_frame_count_u32) }?;
         }
         let ctcss_carrier = external_carrier.unwrap_or(carrier_detect);
         self.ctcss_state.clear_tail_on_carrier_loss(ctcss_carrier);
@@ -1071,6 +1071,33 @@ mod tests {
         assert_eq!(empty.native_frame_count, 0);
         assert!(path.voice_output().is_empty());
         assert!(path.carrier_gates().is_empty());
+    }
+
+    #[test]
+    fn zero_span_preserves_acquired_dcs_decode() {
+        let mut config = configuration(960);
+        config.dcs = Some(super::DcsConfig {
+            code: 0o023,
+            inverted: false,
+        });
+        let mut path = ReceivePath::new(config).expect("valid DCS path");
+        let mut pcm = vec![0.0_f32; 48_000 * 2];
+        let word = 0x76_3813_u32;
+        for (index, frame) in pcm.chunks_exact_mut(2).enumerate() {
+            let bit = (index as u64 * 1_344 / 480_000) % 23;
+            frame[0] = if word & (1 << bit) != 0 {
+                0.375
+            } else {
+                -0.375
+            };
+            frame[1] = -frame[0];
+        }
+        for block in pcm.chunks(960 * 2) {
+            path.process(block).expect("native DCS span");
+        }
+        assert!(path.dcs_state.valid());
+        assert!(path.process(&[]).expect("empty span").dcs_valid);
+        assert!(path.dcs_state.valid());
     }
 
     #[test]
