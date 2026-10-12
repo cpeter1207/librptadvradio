@@ -142,6 +142,7 @@ install-check: all
 	test ! -e build/stage/usr/lib/$(LIBRARY_BASENAME).a
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadvsquelch.so.1'
+	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadvctcss.so.1'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -E 'res_usbradio.so|libportaudio.so|libasound.so|libhamlib.so|libavfilter.so'
 	test -f build/stage/usr/include/rptadvradio/$(notdir $(HEADER))
 	test -f build/stage/usr/lib/pkgconfig/rptadvradio.pc
@@ -174,6 +175,8 @@ debian-package-check: dist
 	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).a"
 	test -L "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so"
 	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
+	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | grep -F 'librptadvsquelch.so.1'
+	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | grep -F 'librptadvctcss.so.1'
 	! $(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | grep -E 'res_usbradio.so|libportaudio.so|libasound.so|libhamlib.so|libavfilter.so'
 	PKG_CONFIG_PATH=$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig \
 		PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/$(DEBIAN_STAGE) $(CC) -std=c11 -Wall -Wextra -Werror \

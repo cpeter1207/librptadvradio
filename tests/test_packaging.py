@@ -33,6 +33,8 @@ class PackagingContracts(unittest.TestCase):
         self.assertIn("librptadvradio4 (= ${binary:Version})", control)
         self.assertIn("librptadvsquelch-dev (>= 0.1.0~alpha1-1)", control)
         self.assertIn("librptadvsquelch1 (>= 0.1.0~alpha1-1)", control)
+        self.assertIn("librptadvctcss-dev (>= 0.1.0~alpha1-1)", control)
+        self.assertIn("librptadvctcss1 (>= 0.1.0~alpha1-1)", control)
         self.assertFalse((ROOT / "debian/librptadvradio1.install").exists())
         self.assertFalse((ROOT / "debian/librptadvradio2.install").exists())
         self.assertFalse((ROOT / "debian/librptadvradio3.install").exists())
@@ -50,6 +52,18 @@ class PackagingContracts(unittest.TestCase):
         self.assertNotRegex(dynamic, r"RPATH|RUNPATH")
         resolved = subprocess.check_output(["ldd", str(library)], text=True)
         self.assertRegex(resolved, r"librptadvsquelch\.so\.1 => /")
+        self.assertNotIn("not found", resolved)
+        self.assertNotIn(str(ROOT / "build"), resolved)
+
+    def test_released_ctcss_is_a_resolved_dynamic_dependency(self):
+        subprocess.run(["make", "all"], cwd=ROOT, check=True,
+                       capture_output=True, text=True)
+        library = ROOT / "build" / "librptadvradio.so.4"
+        dynamic = subprocess.check_output(["readelf", "-d", str(library)], text=True)
+        self.assertIn("Shared library: [librptadvctcss.so.1]", dynamic)
+        self.assertNotRegex(dynamic, r"RPATH|RUNPATH")
+        resolved = subprocess.check_output(["ldd", str(library)], text=True)
+        self.assertRegex(resolved, r"librptadvctcss\.so\.1 => /")
         self.assertNotIn("not found", resolved)
         self.assertNotIn(str(ROOT / "build"), resolved)
 

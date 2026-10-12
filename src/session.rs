@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::{
     CtcssRenderStateConfig, DcsTurnoffConfig, SignalModeConfig, TxCompleteConfig,
-    calibrated_test_tone, ctcss_transmit, dcs_transmit, receive_path, receive_profiles,
+    calibrated_test_tone, ctcss_client, dcs_transmit, receive_path, receive_profiles,
     receive_qualification, rx_cpu_saver,
     transmit_signaling::{self, TransmitSignaling},
 };
@@ -31,7 +31,7 @@ pub(crate) const BUSY: c_int = -6;
 
 const EVENT_CAPACITY: usize = 64;
 const MAX_SIGNED_PCM_LEVEL: u32 = i16::MAX as u32;
-const VALID_CTCSS_TONE_MASK: u64 = (1_u64 << crate::ctcss_receive::TONE_COUNT) - 1;
+const VALID_CTCSS_TONE_MASK: u64 = (1_u64 << ctcss_client::TONE_COUNT) - 1;
 
 /// External processing function prepared by an adapter.
 pub(crate) type ProcessFn = unsafe extern "C" fn(
@@ -169,7 +169,7 @@ pub(crate) struct QualificationConfig {
 pub(crate) struct TransmitConfig {
     pub(crate) ctcss_transmit_enabled: u32,
     pub(crate) default_ctcss_frequency_tenths_hz: i32,
-    pub(crate) mapped_ctcss_frequency_tenths_hz: [i32; crate::ctcss_receive::TONE_COUNT],
+    pub(crate) mapped_ctcss_frequency_tenths_hz: [i32; ctcss_client::TONE_COUNT],
     pub(crate) tone_off_mode: u32,
     pub(crate) ctcss_turnoff_duration_ms: i32,
     pub(crate) ctcss_turnoff_phase_shift_degrees: f64,
@@ -197,7 +197,7 @@ impl Default for TransmitConfig {
         Self {
             ctcss_transmit_enabled: 0,
             default_ctcss_frequency_tenths_hz: 0,
-            mapped_ctcss_frequency_tenths_hz: [0; crate::ctcss_receive::TONE_COUNT],
+            mapped_ctcss_frequency_tenths_hz: [0; ctcss_client::TONE_COUNT],
             tone_off_mode: 0,
             ctcss_turnoff_duration_ms: 0,
             ctcss_turnoff_phase_shift_degrees: 0.0,
@@ -248,7 +248,7 @@ pub(crate) struct SessionPorts {
     pub(crate) struct_size: u32,
     pub(crate) receive_deemphasis: ProcessorPort,
     pub(crate) receive_filter: ProcessorPort,
-    pub(crate) receive_ctcss_notch: [ProcessorPort; crate::ctcss_receive::TONE_COUNT],
+    pub(crate) receive_ctcss_notch: [ProcessorPort; ctcss_client::TONE_COUNT],
     pub(crate) receive_noise_reduction: ProcessorPort,
     pub(crate) receive_dynamics: ProcessorPort,
     pub(crate) transmit_program: ProcessorPort,
@@ -265,7 +265,7 @@ impl Default for SessionPorts {
             struct_size: size_of::<Self>() as u32,
             receive_deemphasis: ProcessorPort::default(),
             receive_filter: ProcessorPort::default(),
-            receive_ctcss_notch: [ProcessorPort::default(); crate::ctcss_receive::TONE_COUNT],
+            receive_ctcss_notch: [ProcessorPort::default(); ctcss_client::TONE_COUNT],
             receive_noise_reduction: ProcessorPort::default(),
             receive_dynamics: ProcessorPort::default(),
             transmit_program: ProcessorPort::default(),
@@ -407,7 +407,7 @@ pub(crate) struct Snapshot {
 struct Ports {
     receive_deemphasis: ProcessorPort,
     receive_filter: ProcessorPort,
-    receive_ctcss_notch: [ProcessorPort; crate::ctcss_receive::TONE_COUNT],
+    receive_ctcss_notch: [ProcessorPort; ctcss_client::TONE_COUNT],
     receive_noise_reduction: ProcessorPort,
     receive_dynamics: ProcessorPort,
     transmit_program: ProcessorPort,
@@ -462,7 +462,7 @@ struct TransmitWorker {
     output_a_tone_bias: f32,
     output_b_tone_gain: f32,
     output_b_tone_bias: f32,
-    ctcss_phase: f64,
+    ctcss_tx: ctcss_client::Transmit,
     dcs: dcs_transmit::TransmitState,
     test_tone: calibrated_test_tone::State,
     program: Vec<f32>,
@@ -1083,6 +1083,10 @@ pub(crate) unsafe extern "C" fn create(
     let tx_max = config.maximum_transmit_frame_count as usize;
     let mut dcs = dcs_transmit::TransmitState::default();
     dcs.configure(config.transmit.dcs_code, config.transmit.dcs_inverted);
+    let ctcss_tx = match ctcss_client::Transmit::new() {
+        Ok(handle) => handle,
+        Err(error) => return error,
+    };
     let processor_ports = Ports {
         receive_deemphasis: ports.receive_deemphasis,
         receive_filter: ports.receive_filter,
@@ -1149,7 +1153,7 @@ pub(crate) unsafe extern "C" fn create(
             output_a_tone_bias: config.transmit.output_a_tone_bias,
             output_b_tone_gain: config.transmit.output_b_tone_gain,
             output_b_tone_bias: config.transmit.output_b_tone_bias,
-            ctcss_phase: 0.0,
+            ctcss_tx,
             dcs,
             test_tone: calibrated_test_tone::State::default(),
             program: vec![0.0; tx_max],
@@ -1791,7 +1795,7 @@ unsafe fn render_ring(
             || !(0..=1).contains(&result.receiver_keyed)
             || !(0..=1).contains(&result.dcs_valid)
             || result.ctcss_decoded_index < -1
-            || result.ctcss_decoded_index >= crate::ctcss_receive::TONE_COUNT as i32
+            || result.ctcss_decoded_index >= ctcss_client::TONE_COUNT as i32
         {
             output.fill(0.0);
             return Err(PROVIDER_FAILED);
@@ -1810,11 +1814,12 @@ fn render_ctcss(worker: &mut TransmitWorker, output: &transmit_signaling::Output
         let frequency = if tail_frequency > 0.0 {
             tail_frequency
         } else {
-            ctcss_transmit::legacy_frequency(f64::from(span.ctcss_frequency_tenths_hz) / 10.0)
+            worker
+                .ctcss_tx
+                .legacy_frequency(f64::from(span.ctcss_frequency_tenths_hz) / 10.0)
         };
         unsafe {
-            ctcss_transmit::generate(
-                &mut worker.ctcss_phase,
+            worker.ctcss_tx.generate(
                 destination,
                 span.frame_count,
                 frequency,
@@ -2477,7 +2482,7 @@ mod tests {
         let mut ports = Ports {
             receive_deemphasis: ProcessorPort::default(),
             receive_filter: test_port(&mut fixed),
-            receive_ctcss_notch: [ProcessorPort::default(); crate::ctcss_receive::TONE_COUNT],
+            receive_ctcss_notch: [ProcessorPort::default(); ctcss_client::TONE_COUNT],
             receive_noise_reduction: ProcessorPort::default(),
             receive_dynamics: ProcessorPort::default(),
             transmit_program: ProcessorPort::default(),
@@ -2598,7 +2603,7 @@ mod tests {
         candidate.receive.vox_hang_ms = i32::from(i16::MAX) + 1;
         invalid.push(candidate);
         candidate = valid_config();
-        candidate.receive.ctcss_tone_mask = 1_u64 << crate::ctcss_receive::TONE_COUNT;
+        candidate.receive.ctcss_tone_mask = 1_u64 << ctcss_client::TONE_COUNT;
         invalid.push(candidate);
         candidate = valid_config();
         candidate.receive.ctcss_enabled = 1;
@@ -3465,7 +3470,7 @@ mod tests {
             ring.result.dcs_valid = if invalid == 3 { 2 } else { 0 };
             ring.result.ctcss_decoded_index = match invalid {
                 4 => -2,
-                5 => crate::ctcss_receive::TONE_COUNT as i32,
+                5 => ctcss_client::TONE_COUNT as i32,
                 _ => -1,
             };
             let (status, output, _) = session.transmit(true);

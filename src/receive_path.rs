@@ -7,7 +7,7 @@
 //! stream state.
 
 use super::{
-    RADIO_INVALID_ARGUMENT, audio_meter, center_slicer, ctcss_receive, dcs_receive,
+    RADIO_INVALID_ARGUMENT, audio_meter, center_slicer, ctcss_client, dcs_receive,
     deemphasis_integrator, delay_line, envelope_meter, fir, receive_frontend,
     rx_blanking::{self, RxBlankingInput, RxBlankingState},
     squelch_client, timer,
@@ -244,7 +244,7 @@ pub struct ReceivePath {
     delay_state: delay_line::State,
     vox_envelope_state: envelope_meter::State,
     measurement_state: envelope_meter::State,
-    ctcss_state: ctcss_receive::ReceiveState,
+    ctcss_state: ctcss_client::Receive,
     dcs_state: dcs_receive::ReceiveState,
     native_work: Vec<f32>,
     baseband: Vec<f32>,
@@ -335,7 +335,7 @@ impl ReceivePath {
             _ => 0,
         };
 
-        let mut ctcss_state = ctcss_receive::ReceiveState::default();
+        let mut ctcss_state = ctcss_client::Receive::new()?;
         if let Some(ctcss) = config.ctcss {
             ctcss_state.configure(ctcss.tone_mask, ctcss.relax);
         }
@@ -524,6 +524,10 @@ impl ReceivePath {
             }
         }
         if native_frame_count == 0 {
+            if external_carrier == Some(false) {
+                // The released provider accepts NULL for a zero-span carrier-loss update.
+                unsafe { self.ctcss_state.process(std::ptr::null(), 0, false) };
+            }
             self.last_baseband_count = 0;
             self.last_native_count = 0;
             self.last_result = ProcessResult {
@@ -1074,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_saver_suspends_ctcss_acquisition_but_monitors_a_qualified_tone() {
+    fn cpu_saver_suspends_ctcss_acquisition() {
         let mut config = configuration(6);
         config.frontend.noise_squelch = false;
         config.ctcss = Some(CtcssConfig {
@@ -1089,7 +1093,6 @@ mod tests {
         });
         let mut path = ReceivePath::new(config).expect("valid CTCSS path");
         path.frontend_state.comparator_output = 0;
-        path.ctcss_state.test_prepare_detector(0);
         path.center_state.peak = 2_400;
         assert_eq!(
             path.process(&[]).unwrap().ctcss_decoder_peak,
@@ -1100,14 +1103,61 @@ mod tests {
         let sleeping = path.process(&silence).expect("sleeping receiver");
         assert!(sleeping.carrier_detect);
         assert_eq!(sleeping.ctcss_decoded, -1);
-        assert_eq!(path.ctcss_state.test_detector_decode(0), 0);
-
         path.set_voice_processing_active(true);
-        assert_eq!(path.process(&silence).unwrap().ctcss_decoded, 0);
-        path.set_voice_processing_active(false);
-        path.ctcss_state.test_set_detector_release(0);
         assert_eq!(path.process(&silence).unwrap().ctcss_decoded, -1);
-        assert_eq!(path.ctcss_state.test_blanking_samples(), 1_600);
+    }
+
+    #[test]
+    fn zero_span_forwards_explicit_carrier_loss_to_ctcss() {
+        let mut config = configuration(192);
+        config.ctcss = Some(CtcssConfig {
+            tone_mask: 1 << 11,
+            relax: false,
+        });
+        config.center_slicer = Some(CenterSlicerConfig {
+            limit: 16_384,
+            setpoint: 8_192,
+            decay_factor: 1,
+            trace: false,
+        });
+        let mut path = ReceivePath::new(config).expect("valid CTCSS path");
+        let mut tone = [0.0; 8_000];
+        for (index, sample) in tone.iter_mut().enumerate() {
+            let phase = std::f32::consts::TAU * 100.0 * index as f32 / 8_000.0;
+            *sample = if phase.sin() >= 0.0 { 625.0 } else { -625.0 } / 32_768.0;
+        }
+        for block in tone.chunks(160) {
+            unsafe {
+                path.ctcss_state
+                    .process(block.as_ptr(), block.len() as u32, true)
+            };
+        }
+        assert_eq!(path.ctcss_state.decoded(), 11);
+        path.set_voice_processing_active(false);
+        assert_eq!(
+            path.process_with_carrier(&stereo(192), Some(true))
+                .unwrap()
+                .ctcss_decoded,
+            11
+        );
+        let mut tail = [0.0; 256];
+        for (index, sample) in tail.iter_mut().enumerate() {
+            let phase = std::f32::consts::TAU * 55.0 * index as f32 / 8_000.0;
+            *sample = if phase.sin() >= 0.0 { 625.0 } else { -625.0 } / 32_768.0;
+        }
+        unsafe { path.ctcss_state.process(tail.as_ptr(), 256, true) };
+        assert!(path.ctcss_state.tail_tone_active());
+        assert!(
+            path.process_with_carrier(&[], Some(true))
+                .unwrap()
+                .ctcss_tail_tone_active
+        );
+        assert!(
+            !path
+                .process_with_carrier(&[], Some(false))
+                .unwrap()
+                .ctcss_tail_tone_active
+        );
     }
 
     fn deployed_oracle_configuration(variant: u8) -> Config<'static> {

@@ -31,6 +31,12 @@ VOX hold timing. Building requires `librptadvsquelch-dev` 0.1.0~alpha1-1 or
 newer, and running requires `librptadvsquelch1` of the same minimum version.
 The radio session creates its squelch handle during setup; audio callbacks only
 advance the already prepared detector.
+Radio also links dynamically to `librptadvctcss.so.1` for conditioned 8 kHz
+CTCSS receive detection and 48 kHz tone generation. Building requires
+`librptadvctcss-dev` 0.1.0~alpha1-1 or newer, and running requires
+`librptadvctcss1` of the same minimum version. Separate receive and transmit
+handles and operations are prepared during session setup; callback conditioning,
+render policy, and timers remain in radio.
 The complete C contract is documented in
 `include/rptadvradio/rptadvradio.h`.
 
