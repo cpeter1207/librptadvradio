@@ -9,7 +9,7 @@ use std::{
 use crate::session::{PROVIDER_FAILED, UNSUPPORTED};
 
 pub const TONE_COUNT: usize = 38;
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const CAPABILITY_NAME: &[u8] = b"rptadv.ctcss";
 
 #[repr(C)]
@@ -35,15 +35,15 @@ struct Descriptor {
     struct_size: u32,
     abi_version: u32,
     capability_name: *const c_char,
-    rx_create: Option<extern "C" fn() -> *mut Rx>,
+    rx_create: Option<unsafe extern "C" fn(*mut *mut Rx) -> i32>,
     rx_destroy: Option<unsafe extern "C" fn(*mut Rx)>,
-    rx_configure: Option<unsafe extern "C" fn(*mut Rx, u64, bool)>,
-    rx_enabled: Option<unsafe extern "C" fn(*const Rx) -> bool>,
+    rx_configure: Option<unsafe extern "C" fn(*mut Rx, u64, u32)>,
+    rx_enabled: Option<unsafe extern "C" fn(*const Rx) -> u32>,
     rx_decoded: Option<unsafe extern "C" fn(*const Rx) -> i16>,
-    rx_tail_tone_active: Option<unsafe extern "C" fn(*const Rx) -> bool>,
-    rx_clear_tail_on_carrier_loss: Option<unsafe extern "C" fn(*mut Rx, bool)>,
-    rx_process: Option<unsafe extern "C" fn(*mut Rx, *const f32, u32, bool) -> i16>,
-    tx_create: Option<extern "C" fn() -> *mut Tx>,
+    rx_tail_tone_active: Option<unsafe extern "C" fn(*const Rx) -> u32>,
+    rx_clear_tail_on_carrier_loss: Option<unsafe extern "C" fn(*mut Rx, u32)>,
+    rx_process: Option<unsafe extern "C" fn(*mut Rx, *const f32, u32, u32) -> i16>,
+    tx_create: Option<unsafe extern "C" fn(*mut *mut Tx) -> i32>,
     tx_destroy: Option<unsafe extern "C" fn(*mut Tx)>,
     legacy_frequency: Option<extern "C" fn(f64) -> f64>,
     tx_generate: Option<unsafe extern "C" fn(*mut Tx, *mut f32, u32, f64, f32, u32, f64)>,
@@ -72,8 +72,9 @@ fn transmit_descriptor() -> *const Descriptor {
 }
 
 #[cfg(test)]
-extern "C" fn injected_null_tx() -> *mut Tx {
-    std::ptr::null_mut()
+unsafe extern "C" fn injected_null_tx(out: *mut *mut Tx) -> i32 {
+    unsafe { *out = std::ptr::null_mut() };
+    0
 }
 
 #[cfg(test)]
@@ -130,12 +131,12 @@ unsafe fn descriptor(pointer: *const Descriptor) -> Result<Descriptor, i32> {
 pub struct Receive {
     handle: NonNull<Rx>,
     destroy: unsafe extern "C" fn(*mut Rx),
-    configure: unsafe extern "C" fn(*mut Rx, u64, bool),
-    enabled: unsafe extern "C" fn(*const Rx) -> bool,
+    configure: unsafe extern "C" fn(*mut Rx, u64, u32),
+    enabled: unsafe extern "C" fn(*const Rx) -> u32,
     decoded: unsafe extern "C" fn(*const Rx) -> i16,
-    tail_tone_active: unsafe extern "C" fn(*const Rx) -> bool,
-    clear_tail_on_carrier_loss: unsafe extern "C" fn(*mut Rx, bool),
-    process: unsafe extern "C" fn(*mut Rx, *const f32, u32, bool) -> i16,
+    tail_tone_active: unsafe extern "C" fn(*const Rx) -> u32,
+    clear_tail_on_carrier_loss: unsafe extern "C" fn(*mut Rx, u32),
+    process: unsafe extern "C" fn(*mut Rx, *const f32, u32, u32) -> i16,
 }
 
 impl Receive {
@@ -148,8 +149,11 @@ impl Receive {
     unsafe fn from_descriptor(pointer: *const Descriptor) -> Result<Self, i32> {
         // SAFETY: setup owns a readable descriptor until its operations are copied.
         let table = unsafe { descriptor(pointer)? };
-        let handle = NonNull::new(table.rx_create.expect("validated descriptor")())
-            .ok_or(PROVIDER_FAILED)?;
+        let mut raw = std::ptr::null_mut();
+        if unsafe { table.rx_create.expect("validated descriptor")(&mut raw) } != 0 {
+            return Err(PROVIDER_FAILED);
+        }
+        let handle = NonNull::new(raw).ok_or(PROVIDER_FAILED)?;
         Ok(Self {
             handle,
             destroy: table.rx_destroy.expect("validated descriptor"),
@@ -166,12 +170,12 @@ impl Receive {
 
     pub fn configure(&mut self, tone_mask: u64, relax: bool) {
         // SAFETY: setup owns this live handle and calls it serially.
-        unsafe { (self.configure)(self.handle.as_ptr(), tone_mask, relax) }
+        unsafe { (self.configure)(self.handle.as_ptr(), tone_mask, u32::from(relax)) }
     }
 
     pub fn enabled(&self) -> bool {
         // SAFETY: setup owns this live handle and calls it serially.
-        unsafe { (self.enabled)(self.handle.as_ptr()) }
+        unsafe { (self.enabled)(self.handle.as_ptr()) != 0 }
     }
 
     pub fn decoded(&self) -> i16 {
@@ -181,18 +185,18 @@ impl Receive {
 
     pub fn tail_tone_active(&self) -> bool {
         // SAFETY: setup owns this live handle and calls it serially.
-        unsafe { (self.tail_tone_active)(self.handle.as_ptr()) }
+        unsafe { (self.tail_tone_active)(self.handle.as_ptr()) != 0 }
     }
 
     pub fn clear_tail_on_carrier_loss(&mut self, carrier: bool) {
         // SAFETY: setup owns this live handle and calls it serially.
-        unsafe { (self.clear_tail_on_carrier_loss)(self.handle.as_ptr(), carrier) }
+        unsafe { (self.clear_tail_on_carrier_loss)(self.handle.as_ptr(), u32::from(carrier)) }
     }
 
     /// Consume conditioned 8 kHz mono F32, including NULL zero spans for carrier loss.
     pub unsafe fn process(&mut self, samples: *const f32, count: u32, carrier: bool) -> i16 {
         // SAFETY: the caller provides count readable samples, or NULL only for zero count.
-        unsafe { (self.process)(self.handle.as_ptr(), samples, count, carrier) }
+        unsafe { (self.process)(self.handle.as_ptr(), samples, count, u32::from(carrier)) }
     }
 }
 
@@ -221,8 +225,11 @@ impl Transmit {
     unsafe fn from_descriptor(pointer: *const Descriptor) -> Result<Self, i32> {
         // SAFETY: setup owns a readable descriptor until its operations are copied.
         let table = unsafe { descriptor(pointer)? };
-        let handle = NonNull::new(table.tx_create.expect("validated descriptor")())
-            .ok_or(PROVIDER_FAILED)?;
+        let mut raw = std::ptr::null_mut();
+        if unsafe { table.tx_create.expect("validated descriptor")(&mut raw) } != 0 {
+            return Err(PROVIDER_FAILED);
+        }
+        let handle = NonNull::new(raw).ok_or(PROVIDER_FAILED)?;
         Ok(Self {
             handle,
             destroy: table.tx_destroy.expect("validated descriptor"),
@@ -273,17 +280,49 @@ mod tests {
     use super::*;
     use std::ptr;
 
-    extern "C" fn null_rx() -> *mut Rx {
-        ptr::null_mut()
+    unsafe extern "C" fn null_rx(out: *mut *mut Rx) -> i32 {
+        unsafe { *out = ptr::null_mut() };
+        0
     }
 
-    extern "C" fn null_tx() -> *mut Tx {
-        ptr::null_mut()
+    unsafe extern "C" fn null_tx(out: *mut *mut Tx) -> i32 {
+        unsafe { *out = ptr::null_mut() };
+        0
+    }
+
+    unsafe extern "C" fn failed_rx(_: *mut *mut Rx) -> i32 {
+        -1
+    }
+
+    unsafe extern "C" fn failed_tx(_: *mut *mut Tx) -> i32 {
+        -1
+    }
+
+    unsafe extern "C" fn nonzero_flag(_: *const Rx) -> u32 {
+        2
     }
 
     fn table() -> Descriptor {
-        // SAFETY: the linked provider returns an immutable complete ABI-1 descriptor.
+        // SAFETY: the linked provider returns an immutable complete ABI-2 descriptor.
         unsafe { *rptadv_ctcss_descriptor() }
+    }
+
+    #[test]
+    fn released_abi2_descriptor_creates_receive_and_transmit_handles() {
+        let mut rx = Receive::new().expect("released ABI 2 receive descriptor");
+        rx.configure(1 << 11, false);
+        assert!(rx.enabled());
+        let _tx = Transmit::new().expect("released ABI 2 transmit descriptor");
+    }
+
+    #[test]
+    fn nonone_provider_flags_remain_true_at_the_radio_boundary() {
+        let mut provider = table();
+        provider.rx_enabled = Some(nonzero_flag);
+        provider.rx_tail_tone_active = Some(nonzero_flag);
+        let rx = unsafe { Receive::from_descriptor(&provider) }.expect("valid ABI 2 descriptor");
+        assert!(rx.enabled());
+        assert!(rx.tail_tone_active());
     }
 
     #[test]
@@ -301,7 +340,7 @@ mod tests {
             unsafe { Receive::from_descriptor((&prefix as *const DescriptorPrefix).cast()) },
             Err(UNSUPPORTED)
         ));
-        prefix.abi_version = 2;
+        prefix.abi_version = 1;
         assert!(matches!(
             unsafe { Receive::from_descriptor((&prefix as *const DescriptorPrefix).cast()) },
             Err(UNSUPPORTED)
@@ -347,8 +386,18 @@ mod tests {
             unsafe { Receive::from_descriptor(&failed) },
             Err(PROVIDER_FAILED)
         ));
+        failed.rx_create = Some(failed_rx);
+        assert!(matches!(
+            unsafe { Receive::from_descriptor(&failed) },
+            Err(PROVIDER_FAILED)
+        ));
         failed = table();
         failed.tx_create = Some(null_tx);
+        assert!(matches!(
+            unsafe { Transmit::from_descriptor(&failed) },
+            Err(PROVIDER_FAILED)
+        ));
+        failed.tx_create = Some(failed_tx);
         assert!(matches!(
             unsafe { Transmit::from_descriptor(&failed) },
             Err(PROVIDER_FAILED)
