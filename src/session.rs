@@ -1065,8 +1065,10 @@ pub(crate) unsafe extern "C" fn create(
         Err(error) => return error,
     };
     // Setup above validates the only variable fields; profiles are built-in.
-    let detector = receive_path::ReceivePath::new(receive_config)
-        .expect("validated session receiver configuration");
+    let detector = match receive_path::ReceivePath::new(receive_config) {
+        Ok(detector) => detector,
+        Err(error) => return error,
+    };
     let (signaling_config, transmit_dcs_enabled, output_a_route, output_b_route) =
         match transmit_config(config.transmit) {
             Ok(value) => value,

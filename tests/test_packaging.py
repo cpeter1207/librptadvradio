@@ -1,6 +1,7 @@
 """Keep the initial-alpha descriptor and dynamic artifact identifiers aligned."""
 
 import re
+import subprocess
 import tomllib
 import unittest
 from pathlib import Path
@@ -30,6 +31,8 @@ class PackagingContracts(unittest.TestCase):
         self.assertEqual(re.findall(r"^Package: (.+)$", control, re.MULTILINE),
                          ["librptadvradio4", "librptadvradio-dev"])
         self.assertIn("librptadvradio4 (= ${binary:Version})", control)
+        self.assertIn("librptadvsquelch-dev (>= 0.1.0~alpha1-1)", control)
+        self.assertIn("librptadvsquelch1 (>= 0.1.0~alpha1-1)", control)
         self.assertFalse((ROOT / "debian/librptadvradio1.install").exists())
         self.assertFalse((ROOT / "debian/librptadvradio2.install").exists())
         self.assertFalse((ROOT / "debian/librptadvradio3.install").exists())
@@ -37,6 +40,18 @@ class PackagingContracts(unittest.TestCase):
                          "usr/lib/*/librptadvradio.so.4*")
         self.assertTrue((ROOT / "debian/changelog").read_text().startswith(
             "librptadvradio (0.1.0~alpha6-1)"))
+
+    def test_released_squelch_is_a_resolved_dynamic_dependency(self):
+        subprocess.run(["make", "all"], cwd=ROOT, check=True,
+                       capture_output=True, text=True)
+        library = ROOT / "build" / "librptadvradio.so.4"
+        dynamic = subprocess.check_output(["readelf", "-d", str(library)], text=True)
+        self.assertIn("Shared library: [librptadvsquelch.so.1]", dynamic)
+        self.assertNotRegex(dynamic, r"RPATH|RUNPATH")
+        resolved = subprocess.check_output(["ldd", str(library)], text=True)
+        self.assertRegex(resolved, r"librptadvsquelch\.so\.1 => /")
+        self.assertNotIn("not found", resolved)
+        self.assertNotIn(str(ROOT / "build"), resolved)
 
 
 if __name__ == "__main__":

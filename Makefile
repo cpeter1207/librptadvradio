@@ -141,6 +141,7 @@ install-check: all
 	test -L build/stage/usr/lib/$(notdir $(LIBRARY_LINK))
 	test ! -e build/stage/usr/lib/$(LIBRARY_BASENAME).a
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
+	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadvsquelch.so.1'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -E 'res_usbradio.so|libportaudio.so|libasound.so|libhamlib.so|libavfilter.so'
 	test -f build/stage/usr/include/rptadvradio/$(notdir $(HEADER))
 	test -f build/stage/usr/lib/pkgconfig/rptadvradio.pc

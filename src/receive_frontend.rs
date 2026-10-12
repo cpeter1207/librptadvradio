@@ -4,11 +4,11 @@
 //! unusual diagnostic or VOX modes.  This bounded primitive owns the ordinary
 //! DSP-squelch arithmetic only: it consumes native stereo F32 PCM, preserves
 //! the established byte-count history shift, emits decimated mono F32 PCM,
-//! and advances the fixed RSSI and MICOR state once per native sample.
+//! and advances fixed RSSI and the borrowed squelch detector once per native sample.
 
 use core::mem::size_of;
 
-use super::{RADIO_INVALID_ARGUMENT, audio_meter::f32_to_pcm_code, micor_squelch};
+use super::{RADIO_INVALID_ARGUMENT, audio_meter::f32_to_pcm_code, squelch_client};
 
 const PCM_SCALE: f32 = 32_768.0;
 const LEGACY_GAIN_DIVISOR: i64 = 256;
@@ -30,12 +30,10 @@ pub struct State {
     pub rssi_power: i64,
     /// Native samples accumulated in the current RSSI window.
     pub rssi_samples: u32,
-    /// Retained sample-clocked MICOR comparator state.
-    pub micor_squelch: micor_squelch::State,
 }
 
 /// Borrowed buffers and fixed controls for one native frontend span.
-pub(crate) struct Request {
+pub(crate) struct Request<'a> {
     /// Readable interleaved canonical-F32 native stereo input.
     pub(crate) input: *const f32,
     /// Writable canonical-F32 decimated mono output.
@@ -79,6 +77,8 @@ pub(crate) struct Request {
     pub(crate) hysteresis: u32,
     /// Caller-owned phase, RSSI, and comparator state.
     pub(crate) state: *mut State,
+    /// Setup-owned MICOR/VOX handle outside the copied scalar state.
+    pub(crate) squelch: &'a mut squelch_client::Client,
 }
 
 /// One completed native frontend result.
@@ -115,8 +115,8 @@ unsafe fn legacy_history_shift(history: *mut i16, history_count: usize) {
 ///
 /// The full selected input span is validated before history, output, carrier
 /// gates, or state changes.  Once validation succeeds the calculation has no
-/// fallible operations, so a compatibility bridge can retain its C fallback
-/// without a partially changed frontend state.  The operation allocates
+/// fallible operations, so the provider handle and copied scalar state cannot
+/// diverge on a rejected span. The operation allocates
 /// nothing, locks nothing, and performs no I/O.
 ///
 /// # Safety
@@ -124,8 +124,10 @@ unsafe fn legacy_history_shift(history: *mut i16, history_count: usize) {
 /// Nonzero native spans require every pointer in [`Request`] to identify the
 /// documented readable or writable storage.  The history span has
 /// `history_count` signed-16 entries; baseband and noise tables have their
-/// stated counts; state is a valid mutable [`State`].
-pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
+/// stated counts; state is a valid mutable [`State`]. Input samples and
+/// coefficient tables must remain unchanged during processing and must not
+/// overlap writable destinations.
+pub unsafe fn process(request: Request<'_>) -> core::result::Result<Result, i32> {
     let Request {
         input,
         baseband_output,
@@ -147,6 +149,7 @@ pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
         open_level,
         hysteresis,
         state,
+        squelch,
     } = request;
     // All u32 buffer counts fit exactly on the supported 64-bit targets.
     let native_frame_count = native_frame_count as usize;
@@ -197,7 +200,8 @@ pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
 
     for index in 0..native_frame_count {
         // SAFETY: validation covered every selected input sample.
-        let input_code = f32_to_pcm_code(unsafe { input.add(index * 2).read() })?;
+        let input_code = f32_to_pcm_code(unsafe { input.add(index * 2).read() })
+            .expect("prevalidated immutable input");
         unsafe { legacy_history_shift(history, history_count) };
         // SAFETY: the front history always has at least one validated entry.
         unsafe { history.write(input_code as i16) };
@@ -223,8 +227,7 @@ pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
                 next.rssi_samples = 0;
                 rssi_updated = true;
             }
-            let closed = micor_squelch::update(
-                &mut next.micor_squelch,
+            let closed = squelch.noise_update(
                 next.comparator_output != 0,
                 f64::from(noise) * f64::from(noise) * 3.75,
                 open_level,
@@ -275,7 +278,20 @@ pub unsafe fn process(request: Request) -> core::result::Result<Result, i32> {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Request, State, process};
-    use crate::micor_squelch;
+    use crate::squelch_client::Client;
+
+    // The next call crosses the provider's startup boundary, so an accidental
+    // update in a rejected or bypassed span changes the observed result.
+    fn prime_detector(squelch: &mut Client) {
+        for _ in 0..479 {
+            assert!(squelch.noise_update(true, 0.0, 1, 0));
+        }
+    }
+
+    fn assert_detector_unadvanced(squelch: &mut Client) {
+        assert!(squelch.noise_update(true, 0.0, 1, 0));
+        assert!(!squelch.noise_update(true, 0.0, 1, 0));
+    }
 
     fn stereo_left(codes: &[i16]) -> Vec<f32> {
         let mut output = Vec::with_capacity(codes.len() * 2);
@@ -298,6 +314,7 @@ mod tests {
         input: &[i16],
         history: &mut [i16],
         state: &mut State,
+        squelch: &mut Client,
         baseband: &[i16],
         noise: &[i16],
         decimate: u32,
@@ -327,6 +344,7 @@ mod tests {
                 open_level: 1_000,
                 hysteresis: 100,
                 state,
+                squelch,
             })
         }
         .expect("valid frontend request");
@@ -345,10 +363,12 @@ mod tests {
             comparator_output: 1,
             ..State::default()
         };
+        let mut squelch = Client::new().expect("squelch provider");
         let (output, gate, result) = run(
             &[100, -200, 300, -400, 500, -600],
             &mut history,
             &mut state,
+            &mut squelch,
             &[1, 2, -3, 4],
             &[2, -1],
             3,
@@ -374,19 +394,17 @@ mod tests {
         let initial_state = State {
             decimator: 2,
             comparator_output: 1,
-            micor_squelch: micor_squelch::State {
-                settling_samples: 480,
-                ..micor_squelch::State::default()
-            },
             ..State::default()
         };
 
         let mut whole_history = initial_history;
         let mut whole_state = initial_state;
+        let mut whole_squelch = Client::new().expect("squelch provider");
         let (whole_output, whole_gate, whole_result) = run(
             &input,
             &mut whole_history,
             &mut whole_state,
+            &mut whole_squelch,
             &baseband,
             &noise,
             3,
@@ -395,10 +413,12 @@ mod tests {
         for split in 1..input.len() {
             let mut history = initial_history;
             let mut state = initial_state;
+            let mut squelch = Client::new().expect("squelch provider");
             let (mut output, mut gate, first_result) = run(
                 &input[..split],
                 &mut history,
                 &mut state,
+                &mut squelch,
                 &baseband,
                 &noise,
                 3,
@@ -407,6 +427,7 @@ mod tests {
                 &input[split..],
                 &mut history,
                 &mut state,
+                &mut squelch,
                 &baseband,
                 &noise,
                 3,
@@ -438,6 +459,8 @@ mod tests {
             comparator_output: 1,
             ..State::default()
         };
+        let mut squelch = Client::new().expect("squelch provider");
+        prime_detector(&mut squelch);
         let initial_state = state;
         let baseband = [1_i16];
         let noise = [1_i16];
@@ -465,6 +488,7 @@ mod tests {
                     open_level: 0,
                     hysteresis: 0,
                     state: &mut state,
+                    squelch: &mut squelch,
                 })
             }
             .is_err()
@@ -473,6 +497,7 @@ mod tests {
         assert_eq!(gate, [0x5a]);
         assert_eq!(history, initial_history);
         assert_eq!(state, initial_state);
+        assert_detector_unadvanced(&mut squelch);
     }
 
     #[test]
@@ -503,6 +528,8 @@ mod tests {
             |r| r.carrier_gate = core::ptr::null_mut(),
         ];
         for configure in cases {
+            let mut squelch = Client::new().expect("squelch provider");
+            prime_detector(&mut squelch);
             let mut request = Request {
                 input: input.as_ptr(),
                 baseband_output: output.as_mut_ptr(),
@@ -524,6 +551,7 @@ mod tests {
                 open_level: 1,
                 hysteresis: 0,
                 state: &mut state,
+                squelch: &mut squelch,
             };
             configure(&mut request);
             assert_eq!(
@@ -534,6 +562,7 @@ mod tests {
             assert_eq!(output, [0.5]);
             assert_eq!(gates, [7]);
             assert_eq!(state, State::default());
+            assert_detector_unadvanced(&mut squelch);
         }
     }
 
@@ -546,6 +575,8 @@ mod tests {
             rssi_samples: 5,
             ..State::default()
         };
+        let mut squelch = Client::new().expect("squelch provider");
+        prime_detector(&mut squelch);
         let expected = state;
         let mut history = [12_i16];
         let coefficients = [1_i16];
@@ -572,6 +603,7 @@ mod tests {
                 open_level: 1,
                 hysteresis: 0,
                 state: &mut state,
+                squelch: &mut squelch,
             })
         }
         .expect("zero span");
@@ -579,6 +611,7 @@ mod tests {
         assert_eq!(result, super::Result::default());
         assert_eq!(state, expected);
         assert_eq!(history, [12]);
+        assert_detector_unadvanced(&mut squelch);
     }
 
     #[test]
@@ -593,12 +626,10 @@ mod tests {
             rssi_peak: 77,
             rssi_power: 88,
             rssi_samples: 5,
-            micor_squelch: micor_squelch::State {
-                settling_samples: 99,
-                ..micor_squelch::State::default()
-            },
             ..State::default()
         };
+        let mut squelch = Client::new().expect("squelch provider");
+        prime_detector(&mut squelch);
         let expected_detector = state;
         let baseband = [1_i16, 1];
 
@@ -624,6 +655,7 @@ mod tests {
                 open_level: 0,
                 hysteresis: 0,
                 state: &mut state,
+                squelch: &mut squelch,
             })
         }
         .expect("valid VOX frontend");
@@ -635,8 +667,8 @@ mod tests {
         assert_eq!(state.rssi_peak, expected_detector.rssi_peak);
         assert_eq!(state.rssi_power, expected_detector.rssi_power);
         assert_eq!(state.rssi_samples, expected_detector.rssi_samples);
-        assert_eq!(state.micor_squelch, expected_detector.micor_squelch);
         assert_eq!(state.decimator, 2);
         assert_ne!(history, [11, -22]);
+        assert_detector_unadvanced(&mut squelch);
     }
 }
