@@ -14,7 +14,7 @@ PKG_CONFIG ?= pkg-config
 
 PACKAGE := librptadvradio
 CRATE := rptadvradio
-PACKAGE_VERSION ?= 0.1.0-alpha.6
+PACKAGE_VERSION ?= 0.1.0-alpha.7
 SOVERSION := 4
 PREFIX ?= /usr/local
 DESTDIR ?=

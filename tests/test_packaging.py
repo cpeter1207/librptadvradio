@@ -15,11 +15,11 @@ class PackagingContracts(unittest.TestCase):
     def test_candidate_version_and_abi_identifiers_match(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
-        self.assertEqual(manifest["package"]["version"], "0.1.0-alpha.6")
+        self.assertEqual(manifest["package"]["version"], "0.1.0-alpha.7")
         self.assertEqual(lock["package"][0]["version"], manifest["package"]["version"])
         self.assertEqual(manifest["lib"]["crate-type"], ["cdylib"])
         makefile = (ROOT / "Makefile").read_text()
-        self.assertIn("PACKAGE_VERSION ?= 0.1.0-alpha.6", makefile)
+        self.assertIn("PACKAGE_VERSION ?= 0.1.0-alpha.7", makefile)
         self.assertIn("SOVERSION := 4", makefile)
         self.assertIn("libstd-", makefile)
         header = (ROOT / "include/rptadvradio/rptadvradio.h").read_text()
@@ -43,7 +43,7 @@ class PackagingContracts(unittest.TestCase):
         self.assertEqual((ROOT / "debian/librptadvradio4.install").read_text().strip(),
                          "usr/lib/*/librptadvradio.so.4*")
         self.assertTrue((ROOT / "debian/changelog").read_text().startswith(
-            "librptadvradio (0.1.0~alpha6-1)"))
+            "librptadvradio (0.1.0~alpha7-1)"))
 
     def test_released_squelch_is_a_resolved_dynamic_dependency(self):
         subprocess.run(["make", "all"], cwd=ROOT, check=True,

@@ -2369,6 +2369,105 @@ mod tests {
     }
 
     #[test]
+    fn released_provider_receive_setup_error_keeps_output_null() {
+        let config = valid_config();
+        assert_eq!(
+            dcs_client::with_test_fault(dcs_client::TestFault::RxCreateFailed, || {
+                create_result(&config)
+            }),
+            PROVIDER_FAILED
+        );
+    }
+
+    #[test]
+    fn released_provider_transmit_setup_errors_keep_output_null() {
+        let config = valid_config();
+        for fault in [
+            dcs_client::TestFault::TxCreateFailed,
+            dcs_client::TestFault::TxConfigureFailed,
+        ] {
+            assert_eq!(
+                dcs_client::with_test_fault(fault, || create_result(&config)),
+                PROVIDER_FAILED
+            );
+        }
+    }
+
+    #[test]
+    fn ctcss_transmit_setup_error_keeps_output_null() {
+        let config = valid_config();
+        assert_eq!(
+            ctcss_client::with_test_tx_create_failure(|| create_result(&config)),
+            PROVIDER_FAILED
+        );
+    }
+
+    #[test]
+    fn incompatible_dcs_descriptor_fails_receive_and_transmit_validation() {
+        let mut config = valid_config();
+        config.receive.dcs_enabled = 1;
+        config.receive.dcs_code = 23;
+        assert_eq!(
+            dcs_client::with_test_fault(dcs_client::TestFault::Unsupported, || {
+                create_result(&config)
+            }),
+            UNSUPPORTED
+        );
+        config.receive.dcs_enabled = 0;
+        config.transmit.dcs_transmit_enabled = 1;
+        config.transmit.dcs_code = 23;
+        assert!(matches!(
+            dcs_client::with_test_fault(dcs_client::TestFault::Unsupported, || {
+                transmit_config(config.transmit)
+            }),
+            Err(UNSUPPORTED)
+        ));
+    }
+
+    #[test]
+    fn rejected_dcs_prepared_update_preserves_live_transmit() {
+        let mut config = valid_config();
+        config.transmit.dcs_transmit_enabled = 1;
+        config.transmit.dcs_code = 23;
+        config.transmit.dcs_peak = 0.1;
+        config.transmit.output_a_route = 3;
+        config.transmit.output_a_tone_gain = 1.0;
+        let baseline = TestSession::prepared(&config, &SessionPorts::default());
+        let live = dcs_client::with_test_fault(dcs_client::TestFault::TxUpdateFailed, || {
+            TestSession::prepared(&config, &SessionPorts::default())
+        });
+        for _ in 0..37 {
+            assert_eq!(live.transmit(true), baseline.transmit(true));
+        }
+        config.transmit.dcs_code = 25;
+        config.transmit.dcs_inverted = 1;
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(
+            unsafe { apply_transmit_update(live.0, update) },
+            PROVIDER_FAILED
+        );
+        assert!(!unsafe { &*update }.transmit_applied.load(Ordering::Relaxed));
+        unsafe { destroy_update(update) };
+        assert_eq!(live.transmit(true), baseline.transmit(true));
+    }
+
+    #[test]
+    fn dcs_generate_failure_reports_provider_failure_without_output() {
+        let config = valid_config();
+        let session = dcs_client::with_test_fault(dcs_client::TestFault::TxGenerateFailed, || {
+            TestSession::prepared(&config, &SessionPorts::default())
+        });
+        let (status, output, _) = session.transmit(true);
+        assert_eq!(status, PROVIDER_FAILED);
+        assert_eq!(output, [0.0; 8]);
+        assert_eq!(session.snapshot().provider_failures, 1);
+    }
+
+    #[test]
     fn event_queue_is_bounded_fifo() {
         let queue = EventQueue::new();
         for value in 0..EVENT_CAPACITY as i32 {

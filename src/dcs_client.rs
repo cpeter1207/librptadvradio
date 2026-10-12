@@ -54,6 +54,94 @@ unsafe extern "C" {
     fn rptadv_dcs_descriptor() -> *const Descriptor;
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_DESCRIPTOR: std::cell::Cell<*const Descriptor> = const { std::cell::Cell::new(ptr::null()) };
+}
+
+fn provider_descriptor() -> *const Descriptor {
+    #[cfg(test)]
+    {
+        let pointer = TEST_DESCRIPTOR.with(|slot| slot.get());
+        if !pointer.is_null() {
+            return pointer;
+        }
+    }
+    // SAFETY: the linked provider owns this process-lifetime descriptor.
+    unsafe { rptadv_dcs_descriptor() }
+}
+
+#[cfg(test)]
+pub(crate) enum TestFault {
+    RxCreateFailed,
+    TxCreateFailed,
+    TxConfigureFailed,
+    TxUpdateFailed,
+    TxGenerateFailed,
+    Unsupported,
+}
+
+#[cfg(test)]
+unsafe extern "C" fn injected_rx_create_failure(_: *mut *mut Rx) -> i32 {
+    -1
+}
+
+#[cfg(test)]
+unsafe extern "C" fn injected_tx_create_failure(_: *mut *mut Tx) -> i32 {
+    -1
+}
+
+#[cfg(test)]
+unsafe extern "C" fn injected_tx_configure_failure(_: *mut Tx, _: i32, _: u32) -> i32 {
+    -1
+}
+
+#[cfg(test)]
+unsafe extern "C" fn injected_tx_update_failure(_: *mut Tx, _: *const Tx) -> i32 {
+    -1
+}
+
+#[cfg(test)]
+unsafe extern "C" fn injected_tx_generate_failure(
+    _: *mut Tx,
+    _: *mut f32,
+    _: u32,
+    _: f32,
+    _: u32,
+    _: u32,
+) -> i32 {
+    -1
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+pub(crate) fn with_test_fault<T>(fault: TestFault, action: impl FnOnce() -> T) -> T {
+    // SAFETY: the released provider returns a complete immutable descriptor.
+    let mut table = unsafe { *rptadv_dcs_descriptor() };
+    match fault {
+        TestFault::RxCreateFailed => table.receive_create = Some(injected_rx_create_failure),
+        TestFault::TxCreateFailed => table.transmit_create = Some(injected_tx_create_failure),
+        TestFault::TxConfigureFailed => {
+            table.transmit_configure = Some(injected_tx_configure_failure)
+        }
+        TestFault::TxUpdateFailed => {
+            table.transmit_update_config_from = Some(injected_tx_update_failure)
+        }
+        TestFault::TxGenerateFailed => table.transmit_generate = Some(injected_tx_generate_failure),
+        TestFault::Unsupported => table.abi_version = 2,
+    }
+    TEST_DESCRIPTOR.with(|slot| {
+        struct Restore<'a>(&'a std::cell::Cell<*const Descriptor>, *const Descriptor);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(slot, slot.replace(&table));
+        action()
+    })
+}
+
 /// Resolve the complete function table before any handle enters a session.
 unsafe fn descriptor(pointer: *const Descriptor) -> Result<Descriptor, i32> {
     // SAFETY: a nonnull provider descriptor references at least the ABI prefix.
@@ -98,7 +186,7 @@ fn status(value: i32) -> Result<(), i32> {
 /// Validate a DCS code through the released provider during setup.
 pub fn code_supported(code: i32) -> Result<bool, i32> {
     // SAFETY: setup reads the process-lifetime provider descriptor.
-    let table = unsafe { descriptor(rptadv_dcs_descriptor())? };
+    let table = unsafe { descriptor(provider_descriptor())? };
     Ok(table.code_supported.expect("validated descriptor")(code) != 0)
 }
 
@@ -116,7 +204,7 @@ impl Receive {
     /// Allocate receive state outside the audio callback.
     pub fn new() -> Result<Self, i32> {
         // SAFETY: the linked provider owns its process-lifetime descriptor.
-        unsafe { Self::from_descriptor(rptadv_dcs_descriptor()) }
+        unsafe { Self::from_descriptor(provider_descriptor()) }
     }
 
     unsafe fn from_descriptor(pointer: *const Descriptor) -> Result<Self, i32> {
@@ -181,7 +269,7 @@ impl Transmit {
     /// Allocate transmit state outside the audio callback.
     pub fn new() -> Result<Self, i32> {
         // SAFETY: the linked provider owns its process-lifetime descriptor.
-        unsafe { Self::from_descriptor(rptadv_dcs_descriptor()) }
+        unsafe { Self::from_descriptor(provider_descriptor()) }
     }
 
     unsafe fn from_descriptor(pointer: *const Descriptor) -> Result<Self, i32> {

@@ -54,6 +54,46 @@ unsafe extern "C" {
     fn rptadv_ctcss_descriptor() -> *const Descriptor;
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_TX_DESCRIPTOR: std::cell::Cell<*const Descriptor> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+fn transmit_descriptor() -> *const Descriptor {
+    #[cfg(test)]
+    {
+        let pointer = TEST_TX_DESCRIPTOR.with(|slot| slot.get());
+        if !pointer.is_null() {
+            return pointer;
+        }
+    }
+    // SAFETY: the linked provider owns this process-lifetime descriptor.
+    unsafe { rptadv_ctcss_descriptor() }
+}
+
+#[cfg(test)]
+extern "C" fn injected_null_tx() -> *mut Tx {
+    std::ptr::null_mut()
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+pub(crate) fn with_test_tx_create_failure<T>(action: impl FnOnce() -> T) -> T {
+    // SAFETY: the released provider returns a complete immutable descriptor.
+    let mut table = unsafe { *rptadv_ctcss_descriptor() };
+    table.tx_create = Some(injected_null_tx);
+    TEST_TX_DESCRIPTOR.with(|slot| {
+        struct Restore<'a>(&'a std::cell::Cell<*const Descriptor>, *const Descriptor);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(slot, slot.replace(&table));
+        action()
+    })
+}
+
 /// Validate the complete ABI once, before creating either callback-owned handle.
 unsafe fn descriptor(pointer: *const Descriptor) -> Result<Descriptor, i32> {
     // SAFETY: a nonnull provider descriptor references at least the ABI prefix.
@@ -175,7 +215,7 @@ impl Transmit {
     /// Create phase state from the released descriptor outside the callback.
     pub fn new() -> Result<Self, i32> {
         // SAFETY: the linked provider owns its process-lifetime descriptor.
-        unsafe { Self::from_descriptor(rptadv_ctcss_descriptor()) }
+        unsafe { Self::from_descriptor(transmit_descriptor()) }
     }
 
     unsafe fn from_descriptor(pointer: *const Descriptor) -> Result<Self, i32> {

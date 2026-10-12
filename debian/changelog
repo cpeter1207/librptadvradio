@@ -1,3 +1,10 @@
+librptadvradio (0.1.0~alpha7-1) unstable; urgency=medium
+
+  * Integrate the released squelch, CTCSS and DCS shared libraries.
+  * Build the quality image with their signed repository packages.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Mon, 12 Oct 2026 12:28:00 -0500
+
 librptadvradio (0.1.0~alpha6-1) unstable; urgency=medium
 
   * Preserve receive and transmit state during prepared radio updates.
