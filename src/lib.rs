@@ -124,6 +124,13 @@ pub struct RadioDescriptor {
         *const session::ProfileReceiveInput,
         *mut session::ProfileReceiveResult,
     ) -> c_int,
+    session_transmit_profiled: unsafe extern "C" fn(
+        *mut session::Session,
+        *mut f32,
+        u32,
+        *const session::TransmitInput,
+        *mut session::ProfileTransmitResult,
+    ) -> c_int,
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -148,6 +155,7 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     session_create_profiled: session::create_profiled,
     session_prepare_profiled_update: session::prepare_profiled_update,
     session_receive_profiled: session::receive_profiled,
+    session_transmit_profiled: session::transmit_profiled,
 };
 
 /// Return the immutable ABI 4 whole-session function table.

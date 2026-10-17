@@ -389,6 +389,19 @@ struct rptadv_radio_profile_receive_result {
   uint32_t external_ctcss_valid; /**< Whether that observation is valid. */
 };
 
+/** @brief Logical requests still subject to hardware admission/interlock. */
+struct rptadv_radio_prepared_outputs {
+  uint32_t logical_ptt; /**< PTT requested at this callback boundary. */
+  uint32_t external_ctcss_enable; /**< External encoder only; never without PTT. */
+};
+
+/** @brief PCM diagnostics and prepared actions from the same serial TX call. */
+struct rptadv_radio_profile_transmit_result {
+  uint32_t struct_size; /**< Caller sets available size before every call. */
+  struct rptadv_radio_transmit_result result; /**< Existing TX diagnostics. */
+  struct rptadv_radio_prepared_outputs outputs; /**< Released on errors. */
+};
+
 /** @brief Immutable whole-session ABI 4 function table. */
 struct rptadv_radio_descriptor {
   uint32_t struct_size; /**< Descriptor size. */
@@ -462,6 +475,14 @@ struct rptadv_radio_descriptor {
       struct rptadv_radio_session *, const float *, float *, uint32_t,
       const struct rptadv_radio_profile_receive_input *,
       struct rptadv_radio_profile_receive_result *);
+  /** Profiled exact-frame TX. External encode produces no native CTCSS PCM.
+   * Inhibit acts live without a PTT edge. Error returns release both actions;
+   * oversized spans are rejected without touching PCM. Other errors clear a
+   * valid bounded PCM span. One serial TX owner; no device I/O or allocation. */
+  enum rptadv_radio_result (*session_transmit_profiled)(
+      struct rptadv_radio_session *, float *, uint32_t,
+      const struct rptadv_radio_transmit_input *,
+      struct rptadv_radio_profile_transmit_result *);
 };
 
 /**

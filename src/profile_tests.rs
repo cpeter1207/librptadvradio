@@ -50,6 +50,7 @@ fn source_config(encode: u32, decode: u32) -> SessionConfig {
         config.transmit.default_ctcss_frequency_tenths_hz = 1148;
         config.transmit.ctcss_peak = 0.1;
         config.transmit.output_a_route = 2;
+        config.transmit.output_a_tone_gain = 1.0;
     }
     if decode == 1 {
         config.receive.ctcss_enabled = 1;
@@ -157,6 +158,199 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         unsafe { destroy(self.0) };
     }
+}
+
+impl Runtime {
+    fn transmit(
+        &self,
+        keyed: bool,
+        inhibit: bool,
+        count: usize,
+    ) -> (ProfileTransmitResult, Vec<f32>) {
+        let mut pcm = vec![9.0; count * 2];
+        let mut result = ProfileTransmitResult {
+            struct_size: size_of::<ProfileTransmitResult>() as u32,
+            ..Default::default()
+        };
+        let controls = TransmitInput {
+            external_ptt_request: u32::from(keyed),
+            physical_ptt_applied: 1,
+            render_admitted: 1,
+            ctcss_inhibit: u32::from(inhibit),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                transmit_profiled(
+                    self.0,
+                    pcm.as_mut_ptr(),
+                    count as u32,
+                    &controls,
+                    &mut result,
+                )
+            },
+            OK
+        );
+        (result, pcm)
+    }
+}
+
+#[test]
+fn profiled_external_encode_has_no_tone_pcm() {
+    for encode in 0..=2 {
+        let runtime = Runtime::new(&profile(encode, 0), &source_config(encode, 0));
+        let (result, pcm) = runtime.transmit(true, false, 960);
+        assert_eq!(result.outputs.logical_ptt, 1);
+        assert_eq!(result.outputs.external_ctcss_enable, u32::from(encode == 2));
+        assert_eq!(pcm.iter().any(|value| value.abs() > 0.01), encode == 1);
+        assert!(pcm.chunks_exact(2).all(|frame| frame[1] == 0.0));
+    }
+}
+
+#[test]
+fn profiled_encode_follows_live_inhibit() {
+    for encode in [1, 2] {
+        let runtime = Runtime::new(&profile(encode, 0), &source_config(encode, 0));
+        for inhibit in [false, true, false] {
+            let (result, pcm) = runtime.transmit(true, inhibit, 960);
+            assert_eq!(result.outputs.logical_ptt, 1);
+            assert_eq!(
+                result.outputs.external_ctcss_enable,
+                u32::from(encode == 2 && !inhibit)
+            );
+            assert_eq!(
+                pcm.iter().any(|value| value.abs() > 0.01),
+                encode == 1 && !inhibit
+            );
+        }
+    }
+}
+
+#[test]
+fn profiled_encode_release_and_partitioning() {
+    for mode in [0, 2] {
+        let mut c = config();
+        c.transmit.tone_off_mode = mode;
+        c.transmit.ctcss_turnoff_duration_ms = 30;
+        let mut results = Vec::new();
+        for partition in [&[960][..], &[480][..], &[1, 103, 337, 519][..]] {
+            let runtime = Runtime::new(&profile(2, 0), &c);
+            runtime.transmit(true, false, 960);
+            let mut elapsed = 0;
+            let mut last = None;
+            while elapsed < 9600 {
+                for count in partition {
+                    let count = (*count).min(9600 - elapsed);
+                    if count == 0 {
+                        break;
+                    }
+                    let (result, pcm) = runtime.transmit(false, false, count);
+                    assert_eq!(result.outputs.external_ctcss_enable, 0);
+                    assert!(pcm.iter().all(|value| *value == 0.0));
+                    elapsed += count;
+                    last = Some(result.outputs);
+                }
+            }
+            results.push(last.unwrap());
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], results[2]);
+        assert_eq!(results[0].logical_ptt, 0);
+    }
+}
+
+#[test]
+fn profiled_transmit_errors_release_actions_without_overwrite() {
+    let runtime = Runtime::new(&profile(2, 0), &config());
+    runtime.transmit(true, false, 960);
+    let mut output = [9.0; 2];
+    let mut result = ProfileTransmitResult {
+        struct_size: size_of::<ProfileTransmitResult>() as u32,
+        outputs: PreparedOutputs {
+            logical_ptt: 1,
+            external_ctcss_enable: 1,
+        },
+        ..Default::default()
+    };
+    let controls = TransmitInput::default();
+    assert_eq!(
+        unsafe { transmit_profiled(runtime.0, output.as_mut_ptr(), 961, &controls, &mut result) },
+        FRAME_COUNT_EXCEEDED
+    );
+    assert_eq!(output, [9.0; 2]);
+    assert_eq!(result.outputs, PreparedOutputs::default());
+    let controls = TransmitInput {
+        forced_ctcss_tenths_hz: 1148,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { transmit_profiled(runtime.0, output.as_mut_ptr(), 1, &controls, &mut result) },
+        UNSUPPORTED
+    );
+    assert_eq!(result.outputs, PreparedOutputs::default());
+    assert_eq!(output, [0.0; 2]);
+}
+
+#[test]
+fn profiled_transmit_unwarmed_and_provider_failure_are_safe() {
+    unsafe extern "C" fn fail(_: *mut std::ffi::c_void, _: *const f32, _: *mut f32, _: u32) -> i32 {
+        -1
+    }
+    let mut handle = ptr::null_mut();
+    let mut ports = SessionPorts::default();
+    assert_eq!(
+        unsafe {
+            create_profiled(
+                &config(),
+                &ports,
+                &profile(2, 0),
+                &capabilities(),
+                &mut handle,
+            )
+        },
+        OK
+    );
+    let runtime = Runtime(handle);
+    let mut output = [9.0; 2];
+    let mut result = ProfileTransmitResult {
+        struct_size: size_of::<ProfileTransmitResult>() as u32,
+        ..Default::default()
+    };
+    let controls = TransmitInput {
+        external_ptt_request: 1,
+        render_admitted: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { transmit_profiled(runtime.0, output.as_mut_ptr(), 1, &controls, &mut result) },
+        NOT_READY
+    );
+    assert_eq!(output, [0.0; 2]);
+    assert_eq!(result.outputs, PreparedOutputs::default());
+    assert_eq!(unsafe { warm(runtime.0) }, OK);
+    ports.transmit_program.process_f32 = Some(fail);
+    let mut update = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            prepare_profiled_update(
+                runtime.0,
+                &config(),
+                &ports,
+                &profile(2, 0),
+                &capabilities(),
+                &mut update,
+            )
+        },
+        OK
+    );
+    assert_eq!(unsafe { apply_transmit_update(runtime.0, update) }, OK);
+    unsafe { destroy_update(update) };
+    assert_eq!(
+        unsafe { transmit_profiled(runtime.0, output.as_mut_ptr(), 1, &controls, &mut result) },
+        PROVIDER_FAILED
+    );
+    assert_eq!(output, [0.0; 2]);
+    assert_eq!(result.outputs, PreparedOutputs::default());
 }
 
 #[test]
