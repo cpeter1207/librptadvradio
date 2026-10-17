@@ -288,6 +288,28 @@ pub(crate) struct ReceiveInput {
     pub(crate) subaudible_override: u32,
 }
 
+/// Sized profiled input. Values are normalized booleans, not raw pin polarity.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProfileReceiveInput {
+    pub(crate) struct_size: u32,
+    pub(crate) controls: ReceiveInput,
+    pub(crate) hardware_cor: u32,
+    pub(crate) hardware_cor_valid: u32,
+    pub(crate) external_ctcss: u32,
+    pub(crate) external_ctcss_valid: u32,
+}
+
+/// Sized profiled result, leaving the existing unsized result unchanged.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProfileReceiveResult {
+    pub(crate) struct_size: u32,
+    pub(crate) result: ReceiveResult,
+    pub(crate) external_ctcss: u32,
+    pub(crate) external_ctcss_valid: u32,
+}
+
 /// Hardware/control snapshots consumed by the transmit worker.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -632,6 +654,7 @@ impl EventQueue {
 /// Opaque whole-engine runtime generation.
 #[repr(C)]
 pub(crate) struct Session {
+    profile: Option<crate::profile::ValidatedProfile>,
     generation_id: u64,
     maximum_frames: [u32; 2],
     program_ring: ProgramRingPort,
@@ -700,7 +723,9 @@ pub(crate) unsafe extern "C" fn apply_receive_update(
     else {
         return INVALID_ARGUMENT;
     };
-    if session.maximum_frames != update.candidate.maximum_frames {
+    if session.maximum_frames != update.candidate.maximum_frames
+        || session.profile != update.candidate.profile
+    {
         return UNSUPPORTED;
     }
     let _live = match enter(&session.receive_busy) {
@@ -761,7 +786,9 @@ pub(crate) unsafe extern "C" fn apply_transmit_update(
     else {
         return INVALID_ARGUMENT;
     };
-    if session.maximum_frames != update.candidate.maximum_frames {
+    if session.maximum_frames != update.candidate.maximum_frames
+        || session.profile != update.candidate.profile
+    {
         return UNSUPPORTED;
     }
     let _live = match enter(&session.transmit_busy) {
@@ -1021,6 +1048,83 @@ fn transmit_config(
     ))
 }
 
+/// Check only the common size prefix before reading a new sized ABI record.
+unsafe fn record_fits<T>(record: *const T) -> bool {
+    !record.is_null() && unsafe { *record.cast::<u32>() as usize >= size_of::<T>() }
+}
+
+/// Validate copied profile data before any provider setup or session mutation.
+unsafe fn validated_profile(
+    config: *const SessionConfig,
+    profile: *const crate::profile::Profile,
+    capabilities: *const crate::profile::ProfileCapabilities,
+) -> Result<(SessionConfig, crate::profile::ValidatedProfile), c_int> {
+    if !unsafe { record_fits(config) && record_fits(profile) && record_fits(capabilities) } {
+        return Err(INVALID_ARGUMENT);
+    }
+    let config = unsafe { *config };
+    let selected = crate::profile::ValidatedProfile::new(
+        unsafe { &*profile },
+        unsafe { &*capabilities },
+        &config,
+    )?;
+    Ok((selected.configure(config), selected))
+}
+
+/// Create a profile-owned session. Borrowed ports retain the ordinary lifetime contract.
+pub(crate) unsafe extern "C" fn create_profiled(
+    config: *const SessionConfig,
+    ports: *const SessionPorts,
+    profile: *const crate::profile::Profile,
+    capabilities: *const crate::profile::ProfileCapabilities,
+    output: *mut *mut Session,
+) -> c_int {
+    if output.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    let (config, profile) = match unsafe { validated_profile(config, profile, capabilities) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let status = unsafe { create(&config, ports, output) };
+    if status == OK {
+        // Setup has exclusive ownership; no callback can see the session yet.
+        unsafe { (**output).profile = Some(profile) };
+    }
+    status
+}
+
+/// Prepare a same-profile update; replacing a source requires a stopped session.
+pub(crate) unsafe extern "C" fn prepare_profiled_update(
+    session: *const Session,
+    config: *const SessionConfig,
+    ports: *const SessionPorts,
+    profile: *const crate::profile::Profile,
+    capabilities: *const crate::profile::ProfileCapabilities,
+    output: *mut *mut SessionUpdate,
+) -> c_int {
+    if output.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    let (config, profile) = match unsafe { validated_profile(config, profile, capabilities) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if session.profile != Some(profile) {
+        return UNSUPPORTED;
+    }
+    let status = unsafe { prepare_update(&config, ports, output) };
+    if status == OK {
+        unsafe { (**output).candidate.profile = Some(profile) };
+    }
+    status
+}
+
 /// Create and preallocate one runtime with immutable stream geometry and identity.
 pub(crate) unsafe extern "C" fn create(
     config: *const SessionConfig,
@@ -1106,6 +1210,7 @@ pub(crate) unsafe extern "C" fn create(
         receive_ctcss_tail_notch: ports.receive_ctcss_tail_notch,
     };
     let session = Box::new(Session {
+        profile: None,
         generation_id: config.generation_id,
         maximum_frames: [
             config.maximum_receive_frame_count,
@@ -1461,6 +1566,89 @@ pub(crate) unsafe extern "C" fn receive(
     controls: *const ReceiveInput,
     result: *mut ReceiveResult,
 ) -> c_int {
+    let Some(current) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    if current.profile.is_some() {
+        return UNSUPPORTED;
+    }
+    unsafe { receive_inner(session, input, output, frame_count, controls, result, true) }
+}
+
+/// Resolve valid normalized hardware snapshots, then run the same RX pipeline.
+pub(crate) unsafe extern "C" fn receive_profiled(
+    session: *mut Session,
+    input: *const f32,
+    output: *mut f32,
+    frame_count: u32,
+    controls: *const ProfileReceiveInput,
+    result: *mut ProfileReceiveResult,
+) -> c_int {
+    let Some(current) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    let Some(profile) = current.profile else {
+        return UNSUPPORTED;
+    };
+    if !unsafe { record_fits(controls) && record_fits(result) } {
+        return INVALID_ARGUMENT;
+    }
+    let controls = unsafe { *controls };
+    if [
+        controls.hardware_cor,
+        controls.hardware_cor_valid,
+        controls.external_ctcss,
+        controls.external_ctcss_valid,
+    ]
+    .iter()
+    .any(|value| *value > 1)
+    {
+        return INVALID_ARGUMENT;
+    }
+    let normalized = ReceiveInput {
+        hardware_carrier: controls.hardware_cor & controls.hardware_cor_valid,
+        hardware_subaudible: controls.external_ctcss & controls.external_ctcss_valid,
+        ..controls.controls
+    };
+    let valid = profile.snapshots_valid(
+        controls.hardware_cor_valid != 0,
+        controls.external_ctcss_valid != 0,
+    );
+    let mut received = ReceiveResult::default();
+    let status = unsafe {
+        receive_inner(
+            session,
+            input,
+            output,
+            frame_count,
+            &normalized,
+            &mut received,
+            valid,
+        )
+    };
+    if status == OK {
+        unsafe {
+            result.write(ProfileReceiveResult {
+                struct_size: size_of::<ProfileReceiveResult>() as u32,
+                result: received,
+                external_ctcss: controls.external_ctcss,
+                external_ctcss_valid: controls.external_ctcss_valid,
+            })
+        };
+    }
+    status
+}
+
+/// Both ABI receive entry points share one serial sample-clocked implementation.
+unsafe fn receive_inner(
+    session: *mut Session,
+    input: *const f32,
+    output: *mut f32,
+    frame_count: u32,
+    controls: *const ReceiveInput,
+    result: *mut ReceiveResult,
+    snapshots_valid: bool,
+) -> c_int {
     let Some(session) = (unsafe { session.as_ref() }) else {
         return INVALID_ARGUMENT;
     };
@@ -1518,6 +1706,10 @@ pub(crate) unsafe extern "C" fn receive(
     let tx_ptt = session.shared.logical_ptt.load(Ordering::Acquire);
     let mut qualification = worker.qualification;
     qualification.subaudible_override |= controls.subaudible_override != 0;
+    if !snapshots_valid {
+        qualification.carrier_source = receive_qualification::CarrierSource::Ignore;
+        qualification.subaudible_override = false;
+    }
     let qualified = receive_qualification::advance(
         &qualification,
         &receive_qualification::Inputs {

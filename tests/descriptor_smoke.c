@@ -9,6 +9,14 @@
 
 #include "rptadvradio/rptadvradio.h"
 
+/* All released descriptor operations retain their offsets. */
+_Static_assert(offsetof(struct rptadv_radio_descriptor, session_destroy_update) ==
+               offsetof(struct rptadv_radio_descriptor, session_create) + 11 * sizeof(void (*)(void)),
+               "ABI 4 prefix changed");
+_Static_assert(offsetof(struct rptadv_radio_descriptor, session_create_profiled) ==
+               offsetof(struct rptadv_radio_descriptor, session_destroy_update) + sizeof(void (*)(void)),
+               "profile operations must be a descriptor tail");
+
 struct processor_context {
 	float scale;
 	float bias;
@@ -203,5 +211,26 @@ int main(void)
 	descriptor->session_destroy_update(NULL);
 	descriptor->session_destroy(session);
 	descriptor->session_destroy(NULL);
+
+	struct rptadv_radio_profile profile = { sizeof(profile), 1, 0, 0, 2 };
+	struct rptadv_radio_profile_capabilities caps = { sizeof(caps), 1, 1, 0, 0 };
+	struct rptadv_radio_profile_receive_input profiled_input = {
+		.struct_size = sizeof(profiled_input), .hardware_cor = 1,
+		.hardware_cor_valid = 1, .external_ctcss = 1, .external_ctcss_valid = 1
+	};
+	struct rptadv_radio_profile_receive_result profiled_result = { .struct_size = sizeof(profiled_result) };
+	assert(descriptor->session_create_profiled(&config, &ports, &profile, &caps, &session) == RPTADV_RADIO_OK);
+	assert(descriptor->session_warm(session) == RPTADV_RADIO_OK);
+	assert(descriptor->session_receive_profiled(session, capture, receive, 4, &profiled_input, &profiled_result) == RPTADV_RADIO_OK);
+	assert(profiled_result.result.receiver_keyed == 1);
+	profiled_input.external_ctcss_valid = 0;
+	assert(descriptor->session_receive_profiled(session, capture, receive, 4, &profiled_input, &profiled_result) == RPTADV_RADIO_OK);
+	assert(profiled_result.result.receiver_keyed == 0);
+	profiled_result.struct_size = sizeof(uint32_t);
+	assert(descriptor->session_receive_profiled(session, capture, receive, 4, &profiled_input, &profiled_result) == RPTADV_RADIO_INVALID_ARGUMENT);
+	descriptor->session_destroy(session);
+	profile.struct_size = sizeof(uint32_t);
+	assert(descriptor->session_create_profiled(&config, &ports, &profile, &caps, &session) == RPTADV_RADIO_INVALID_ARGUMENT);
+	assert(session == NULL);
 	return 0;
 }

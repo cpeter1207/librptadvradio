@@ -346,6 +346,49 @@ struct rptadv_radio_snapshot {
   struct rptadv_radio_ring_observation program_ring; /**< Ring diagnostics. */
 };
 
+/** @brief Independent encoder/decoder assignment. */
+enum rptadv_radio_ctcss_source {
+  RPTADV_RADIO_CTCSS_DISABLED = 0, /**< No CTCSS for this direction. */
+  RPTADV_RADIO_CTCSS_DSP = 1, /**< Native detector or generator. */
+  RPTADV_RADIO_CTCSS_EXTERNAL = 2 /**< Normalized hardware input/output. */
+};
+
+/** @brief Copied immutable profile; changes require stopped-session replacement. */
+struct rptadv_radio_profile {
+  uint32_t struct_size; /**< Size of this record. */
+  uint32_t kind; /**< 0 native audio, 1 appliance direct codec. */
+  uint32_t carrier_source; /**< 0 normalized hardware COR, 1 DSP noise. */
+  uint32_t ctcss_encode_source; /**< enum rptadv_radio_ctcss_source. */
+  uint32_t ctcss_decode_source; /**< enum rptadv_radio_ctcss_source. */
+};
+
+/** @brief Actual backend facilities, each 0 or 1; not requested features. */
+struct rptadv_radio_profile_capabilities {
+  uint32_t struct_size; /**< Size of this record. */
+  uint32_t hardware_cor; /**< Normalized COR available. */
+  uint32_t external_ctcss_decode; /**< Decoder indication available. */
+  uint32_t external_ctcss_encode; /**< Encoder-enable output available. */
+  uint32_t dsp_tone_audio; /**< Audio path can carry native signaling. */
+};
+
+/** @brief Normalized snapshots for profiled receive; no hardware I/O occurs. */
+struct rptadv_radio_profile_receive_input {
+  uint32_t struct_size; /**< Size of this record. */
+  struct rptadv_radio_receive_input controls; /**< Remaining control policy. */
+  uint32_t hardware_cor; /**< Normalized COR, 0 or 1. */
+  uint32_t hardware_cor_valid; /**< COR snapshot valid, 0 or 1. */
+  uint32_t external_ctcss; /**< Raw normalized decoder indication, 0 or 1. */
+  uint32_t external_ctcss_valid; /**< Decoder snapshot valid, 0 or 1. */
+};
+
+/** @brief Exact receive result and independent external-decoder observation. */
+struct rptadv_radio_profile_receive_result {
+  uint32_t struct_size; /**< Caller sets available size before every call. */
+  struct rptadv_radio_receive_result result; /**< Existing receive diagnostics. */
+  uint32_t external_ctcss; /**< Decoder value even when not selected. */
+  uint32_t external_ctcss_valid; /**< Whether that observation is valid. */
+};
+
 /** @brief Immutable whole-session ABI 4 function table. */
 struct rptadv_radio_descriptor {
   uint32_t struct_size; /**< Descriptor size. */
@@ -398,6 +441,27 @@ struct rptadv_radio_descriptor {
    * both callback owners acknowledge or an unpublished update is cancelled.
    * Never destroys borrowed processors; their owner manages their lifetime. */
   void (*session_destroy_update)(struct rptadv_radio_session_update *);
+  /** Copy and validate independent source selections before allocating.
+   * Config DSP enable fields must agree with DSP selection. External encode
+   * rejects native frequency, level and waveform settings. Port lifetimes and
+   * warm-up requirements are the same as session_create. */
+  enum rptadv_radio_result (*session_create_profiled)(
+      const struct rptadv_radio_session_config *, const struct rptadv_radio_session_ports *,
+      const struct rptadv_radio_profile *, const struct rptadv_radio_profile_capabilities *,
+      struct rptadv_radio_session **);
+  /** Prepare only same-profile/capability updates; existing apply/destroy
+   * operations own publication and reclamation. No live provider is warmed. */
+  enum rptadv_radio_result (*session_prepare_profiled_update)(
+      const struct rptadv_radio_session *, const struct rptadv_radio_session_config *,
+      const struct rptadv_radio_session_ports *, const struct rptadv_radio_profile *,
+      const struct rptadv_radio_profile_capabilities *, struct rptadv_radio_session_update **);
+  /** Exact-frame RX with required snapshot validity enforced. Profiled sessions
+   * use this entry, not session_receive. One serial RX owner; no allocation,
+   * waiting or I/O. Input is stereo; output is mono, as for session_receive. */
+  enum rptadv_radio_result (*session_receive_profiled)(
+      struct rptadv_radio_session *, const float *, float *, uint32_t,
+      const struct rptadv_radio_profile_receive_input *,
+      struct rptadv_radio_profile_receive_result *);
 };
 
 /**
