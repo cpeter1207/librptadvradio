@@ -21,6 +21,7 @@ mod deemphasis_integrator;
 mod delay_line;
 mod envelope_meter;
 mod fir;
+mod profile;
 mod receive_frontend;
 mod receive_path;
 mod receive_profiles;
@@ -35,6 +36,10 @@ mod transmit_signaling;
 mod tx_complete;
 mod tx_cpu_saver;
 mod tx_finish;
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod profile_tests;
 
 pub(crate) use ctcss_render_state::{
     CtcssRenderState, CtcssRenderStateConfig, CtcssRenderStateInput,
@@ -96,6 +101,36 @@ pub struct RadioDescriptor {
     session_apply_transmit_update:
         unsafe extern "C" fn(*mut session::Session, *mut session::SessionUpdate) -> c_int,
     session_destroy_update: unsafe extern "C" fn(*mut session::SessionUpdate),
+    session_create_profiled: unsafe extern "C" fn(
+        *const session::SessionConfig,
+        *const session::SessionPorts,
+        *const profile::Profile,
+        *const profile::ProfileCapabilities,
+        *mut *mut session::Session,
+    ) -> c_int,
+    session_prepare_profiled_update: unsafe extern "C" fn(
+        *const session::Session,
+        *const session::SessionConfig,
+        *const session::SessionPorts,
+        *const profile::Profile,
+        *const profile::ProfileCapabilities,
+        *mut *mut session::SessionUpdate,
+    ) -> c_int,
+    session_receive_profiled: unsafe extern "C" fn(
+        *mut session::Session,
+        *const f32,
+        *mut f32,
+        u32,
+        *const session::ProfileReceiveInput,
+        *mut session::ProfileReceiveResult,
+    ) -> c_int,
+    session_transmit_profiled: unsafe extern "C" fn(
+        *mut session::Session,
+        *mut f32,
+        u32,
+        *const session::TransmitInput,
+        *mut session::ProfileTransmitResult,
+    ) -> c_int,
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -117,6 +152,10 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     session_apply_receive_update: session::apply_receive_update,
     session_apply_transmit_update: session::apply_transmit_update,
     session_destroy_update: session::destroy_update,
+    session_create_profiled: session::create_profiled,
+    session_prepare_profiled_update: session::prepare_profiled_update,
+    session_receive_profiled: session::receive_profiled,
+    session_transmit_profiled: session::transmit_profiled,
 };
 
 /// Return the immutable ABI 4 whole-session function table.

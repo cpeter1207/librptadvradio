@@ -63,6 +63,8 @@ pub enum ToneOffMode {
 /// values are copied into [`TransmitSignaling`] and never retain caller data.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Config {
+    /// Enable a hardware encoder without selecting a native oscillator frequency.
+    pub external_ctcss: bool,
     /// Receive-signaling mode and transmit CTCSS mapping policy.
     pub signal_mode: SignalModeConfig,
     /// Duration of a selected DCS transmitter turn-off tail.
@@ -89,6 +91,7 @@ impl Config {
     #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
+            external_ctcss: false,
             signal_mode: SignalModeConfig::disabled(),
             dcs_turnoff: DcsTurnoffConfig::default(),
             ctcss_render: CtcssRenderStateConfig::disabled(),
@@ -348,6 +351,10 @@ pub struct TransmitSignaling {
 }
 
 impl TransmitSignaling {
+    /// Setup-only selection; profile validation has rejected waveform-only controls.
+    pub(crate) fn use_external_encoder(&mut self) {
+        self.config.external_ctcss = true;
+    }
     /// Replace an already validated policy while retaining PTT and active timers.
     pub(crate) fn update_config_from(&mut self, prepared: &Self) {
         self.config = prepared.config;
@@ -506,7 +513,7 @@ fn validate_config(config: &Config) -> Result<(), Error> {
 
 /// Return whether the copied signal-mode policy enables transmit CTCSS.
 fn ctcss_transmit_enabled(config: &Config) -> bool {
-    config.signal_mode.ctcss_tx_enabled != 0
+    config.external_ctcss || config.signal_mode.ctcss_tx_enabled != 0
 }
 
 /// Keep the shared historical CTCSS option represented by both primitives coherent.
@@ -541,7 +548,7 @@ fn select_start_ctcss(config: &Config, input: &Input, state: &mut State) {
     } else {
         config.signal_mode.default_tx_ctcss_frequency_tenths_hz
     };
-    if selected != 0 {
+    if selected != 0 || config.external_ctcss {
         state.signal_mode.tx_ctcss_frequency_tenths_hz = selected;
         set_ctcss_option(state, ctcss_render_state::OPTION_START);
         state.ctcss_render.enabled = 1;
@@ -798,6 +805,9 @@ fn prepare_transmitter(
         state.settle_remaining_ms = config.tx_settle_time_ms;
     } else if input.external_ptt_request && state.transmitter_state == STATE_ACTIVE {
         state.signal_mode.smode_timer_ms = config.signal_mode.hold_ms;
+        if !input.ctcss_inhibit && state.ctcss_render.enabled == 0 {
+            select_start_ctcss(config, input, state);
+        }
         apply_pending_ctcss_option(config, state)?;
     } else if !input.external_ptt_request && state.transmitter_state == STATE_ACTIVE {
         if config.dcs_transmit_enabled && config.dcs_turnoff_enabled {
@@ -827,6 +837,11 @@ fn prepare_transmitter(
             apply_ctcss_option(config, state, ctcss_render_state::OPTION_START)?;
             state.signal_mode.smode_timer_ms = config.signal_mode.hold_ms;
         }
+    }
+    // Inhibit is live control, not a PTT-edge-only option. Re-enable above
+    // selects the same source without restarting PTT or adding another timer.
+    if input.ctcss_inhibit {
+        apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE)?;
     }
     Ok(())
 }
@@ -1162,6 +1177,7 @@ mod tests {
         signal_mode.default_tx_ctcss_frequency_tenths_hz = 1_000;
         signal_mode.mapped_tx_ctcss_frequency_tenths_hz[4] = 1_230;
         Config {
+            external_ctcss: false,
             signal_mode,
             dcs_turnoff: DcsTurnoffConfig {
                 turnoff_duration_ms: 180,

@@ -288,6 +288,45 @@ pub(crate) struct ReceiveInput {
     pub(crate) subaudible_override: u32,
 }
 
+/// Sized profiled input. Values are normalized booleans, not raw pin polarity.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProfileReceiveInput {
+    pub(crate) struct_size: u32,
+    pub(crate) controls: ReceiveInput,
+    pub(crate) hardware_cor: u32,
+    pub(crate) hardware_cor_valid: u32,
+    pub(crate) external_ctcss: u32,
+    pub(crate) external_ctcss_valid: u32,
+}
+
+/// Sized profiled result, leaving the existing unsized result unchanged.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProfileReceiveResult {
+    pub(crate) struct_size: u32,
+    pub(crate) result: ReceiveResult,
+    pub(crate) external_ctcss: u32,
+    pub(crate) external_ctcss_valid: u32,
+}
+
+/// Prepared logical actions; the hardware adapter still owns safety admission.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreparedOutputs {
+    pub(crate) logical_ptt: u32,
+    pub(crate) external_ctcss_enable: u32,
+}
+
+/// PCM and actions observed atomically on the serial TX owner's call boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProfileTransmitResult {
+    pub(crate) struct_size: u32,
+    pub(crate) result: TransmitResult,
+    pub(crate) outputs: PreparedOutputs,
+}
+
 /// Hardware/control snapshots consumed by the transmit worker.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -632,6 +671,7 @@ impl EventQueue {
 /// Opaque whole-engine runtime generation.
 #[repr(C)]
 pub(crate) struct Session {
+    profile: Option<crate::profile::ValidatedProfile>,
     generation_id: u64,
     maximum_frames: [u32; 2],
     program_ring: ProgramRingPort,
@@ -700,7 +740,9 @@ pub(crate) unsafe extern "C" fn apply_receive_update(
     else {
         return INVALID_ARGUMENT;
     };
-    if session.maximum_frames != update.candidate.maximum_frames {
+    if session.maximum_frames != update.candidate.maximum_frames
+        || session.profile != update.candidate.profile
+    {
         return UNSUPPORTED;
     }
     let _live = match enter(&session.receive_busy) {
@@ -761,7 +803,9 @@ pub(crate) unsafe extern "C" fn apply_transmit_update(
     else {
         return INVALID_ARGUMENT;
     };
-    if session.maximum_frames != update.candidate.maximum_frames {
+    if session.maximum_frames != update.candidate.maximum_frames
+        || session.profile != update.candidate.profile
+    {
         return UNSUPPORTED;
     }
     let _live = match enter(&session.transmit_busy) {
@@ -990,6 +1034,7 @@ fn transmit_config(
         return Err(INVALID_ARGUMENT);
     }
     let signaling = transmit_signaling::Config {
+        external_ctcss: false,
         signal_mode: SignalModeConfig {
             hold_ms: 2_500,
             ctcss_tx_enabled: config.ctcss_transmit_enabled,
@@ -1019,6 +1064,91 @@ fn transmit_config(
         OutputRoute::parse(config.output_a_route)?,
         OutputRoute::parse(config.output_b_route)?,
     ))
+}
+
+/// Check only the common size prefix before reading a new sized ABI record.
+unsafe fn record_fits<T>(record: *const T) -> bool {
+    !record.is_null() && unsafe { *record.cast::<u32>() as usize >= size_of::<T>() }
+}
+
+/// Validate copied profile data before any provider setup or session mutation.
+unsafe fn validated_profile(
+    config: *const SessionConfig,
+    profile: *const crate::profile::Profile,
+    capabilities: *const crate::profile::ProfileCapabilities,
+) -> Result<(SessionConfig, crate::profile::ValidatedProfile), c_int> {
+    if !unsafe { record_fits(config) && record_fits(profile) && record_fits(capabilities) } {
+        return Err(INVALID_ARGUMENT);
+    }
+    let config = unsafe { *config };
+    let selected = crate::profile::ValidatedProfile::new(
+        unsafe { &*profile },
+        unsafe { &*capabilities },
+        &config,
+    )?;
+    Ok((selected.configure(config), selected))
+}
+
+/// Create a profile-owned session. Borrowed ports retain the ordinary lifetime contract.
+pub(crate) unsafe extern "C" fn create_profiled(
+    config: *const SessionConfig,
+    ports: *const SessionPorts,
+    profile: *const crate::profile::Profile,
+    capabilities: *const crate::profile::ProfileCapabilities,
+    output: *mut *mut Session,
+) -> c_int {
+    if output.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    let (config, profile) = match unsafe { validated_profile(config, profile, capabilities) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let status = unsafe { create(&config, ports, output) };
+    if status == OK {
+        // Setup has exclusive ownership; no callback can see the session yet.
+        unsafe { initialize_profile(&mut **output, profile) };
+    }
+    status
+}
+
+/// Prepare a same-profile update; replacing a source requires a stopped session.
+pub(crate) unsafe extern "C" fn prepare_profiled_update(
+    session: *const Session,
+    config: *const SessionConfig,
+    ports: *const SessionPorts,
+    profile: *const crate::profile::Profile,
+    capabilities: *const crate::profile::ProfileCapabilities,
+    output: *mut *mut SessionUpdate,
+) -> c_int {
+    if output.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    let (config, profile) = match unsafe { validated_profile(config, profile, capabilities) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if session.profile != Some(profile) {
+        return UNSUPPORTED;
+    }
+    let status = unsafe { prepare_update(&config, ports, output) };
+    if status == OK {
+        unsafe { initialize_profile(&mut (**output).candidate, profile) };
+    }
+    status
+}
+
+/// Called only before publication; all runtime profile identity remains immutable.
+fn initialize_profile(session: &mut Session, profile: crate::profile::ValidatedProfile) {
+    session.profile = Some(profile);
+    if profile.encode == crate::profile::EXTERNAL {
+        session.transmit.get_mut().signaling.use_external_encoder();
+    }
 }
 
 /// Create and preallocate one runtime with immutable stream geometry and identity.
@@ -1106,6 +1236,7 @@ pub(crate) unsafe extern "C" fn create(
         receive_ctcss_tail_notch: ports.receive_ctcss_tail_notch,
     };
     let session = Box::new(Session {
+        profile: None,
         generation_id: config.generation_id,
         maximum_frames: [
             config.maximum_receive_frame_count,
@@ -1461,9 +1592,89 @@ pub(crate) unsafe extern "C" fn receive(
     controls: *const ReceiveInput,
     result: *mut ReceiveResult,
 ) -> c_int {
-    let Some(session) = (unsafe { session.as_ref() }) else {
+    let Some(current) = (unsafe { session.as_ref() }) else {
         return INVALID_ARGUMENT;
     };
+    if current.profile.is_some() {
+        return UNSUPPORTED;
+    }
+    unsafe { receive_inner(current, input, output, frame_count, controls, result, true) }
+}
+
+/// Resolve valid normalized hardware snapshots, then run the same RX pipeline.
+pub(crate) unsafe extern "C" fn receive_profiled(
+    session: *mut Session,
+    input: *const f32,
+    output: *mut f32,
+    frame_count: u32,
+    controls: *const ProfileReceiveInput,
+    result: *mut ProfileReceiveResult,
+) -> c_int {
+    let Some(current) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    let Some(profile) = current.profile else {
+        return UNSUPPORTED;
+    };
+    if !unsafe { record_fits(controls) && record_fits(result) } {
+        return INVALID_ARGUMENT;
+    }
+    let controls = unsafe { *controls };
+    if [
+        controls.hardware_cor,
+        controls.hardware_cor_valid,
+        controls.external_ctcss,
+        controls.external_ctcss_valid,
+    ]
+    .iter()
+    .any(|value| *value > 1)
+    {
+        return INVALID_ARGUMENT;
+    }
+    let normalized = ReceiveInput {
+        hardware_carrier: controls.hardware_cor & controls.hardware_cor_valid,
+        hardware_subaudible: controls.external_ctcss & controls.external_ctcss_valid,
+        ..controls.controls
+    };
+    let valid = profile.snapshots_valid(
+        controls.hardware_cor_valid != 0,
+        controls.external_ctcss_valid != 0,
+    );
+    let mut received = ReceiveResult::default();
+    let status = unsafe {
+        receive_inner(
+            current,
+            input,
+            output,
+            frame_count,
+            &normalized,
+            &mut received,
+            valid,
+        )
+    };
+    if status == OK {
+        unsafe {
+            result.write(ProfileReceiveResult {
+                struct_size: size_of::<ProfileReceiveResult>() as u32,
+                result: received,
+                external_ctcss: controls.external_ctcss,
+                external_ctcss_valid: controls.external_ctcss_valid,
+            })
+        };
+    }
+    status
+}
+
+/// Both ABI receive entry points share one serial sample-clocked implementation.
+unsafe fn receive_inner(
+    session: &Session,
+    input: *const f32,
+    output: *mut f32,
+    frame_count: u32,
+    controls: *const ReceiveInput,
+    result: *mut ReceiveResult,
+    snapshots_valid: bool,
+) -> c_int {
     if output.is_null() || result.is_null() || frame_count == 0 {
         return INVALID_ARGUMENT;
     }
@@ -1518,6 +1729,10 @@ pub(crate) unsafe extern "C" fn receive(
     let tx_ptt = session.shared.logical_ptt.load(Ordering::Acquire);
     let mut qualification = worker.qualification;
     qualification.subaudible_override |= controls.subaudible_override != 0;
+    if !snapshots_valid {
+        qualification.carrier_source = receive_qualification::CarrierSource::Ignore;
+        qualification.subaudible_override = false;
+    }
     let qualified = receive_qualification::advance(
         &qualification,
         &receive_qualification::Inputs {
@@ -1891,9 +2106,80 @@ pub(crate) unsafe extern "C" fn transmit(
     controls: *const TransmitInput,
     result: *mut TransmitResult,
 ) -> c_int {
-    let Some(session) = (unsafe { session.as_ref() }) else {
+    let Some(current) = (unsafe { session.as_ref() }) else {
         return INVALID_ARGUMENT;
     };
+    if current.profile.is_some() {
+        return UNSUPPORTED;
+    }
+    unsafe {
+        transmit_inner(
+            current,
+            output,
+            frame_count,
+            controls,
+            result,
+            &mut PreparedOutputs::default(),
+        )
+    }
+}
+
+/// Return actions from the exact TX call that produced the PCM, never a later query.
+pub(crate) unsafe extern "C" fn transmit_profiled(
+    session: *mut Session,
+    output: *mut f32,
+    frame_count: u32,
+    controls: *const TransmitInput,
+    result: *mut ProfileTransmitResult,
+) -> c_int {
+    if !unsafe { record_fits(result) } {
+        return INVALID_ARGUMENT;
+    }
+    let result = unsafe { &mut *result };
+    *result = ProfileTransmitResult {
+        struct_size: size_of::<ProfileTransmitResult>() as u32,
+        ..Default::default()
+    };
+    let Some(current) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    let Some(profile) = current.profile else {
+        return UNSUPPORTED;
+    };
+    if frame_count > current.maximum_frames[1] {
+        return FRAME_COUNT_EXCEEDED;
+    }
+    if output.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    unsafe { ptr::write_bytes(output, 0, frame_count as usize * 2) };
+    let Some(controls) = (unsafe { controls.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    if profile.encode != crate::profile::DSP && controls.forced_ctcss_tenths_hz != 0 {
+        return UNSUPPORTED;
+    }
+    unsafe {
+        transmit_inner(
+            current,
+            output,
+            frame_count,
+            controls,
+            &mut result.result,
+            &mut result.outputs,
+        )
+    }
+}
+
+/// Shared sample-clocked implementation; only the owning callback sees mutable TX state.
+unsafe fn transmit_inner(
+    session: &Session,
+    output: *mut f32,
+    frame_count: u32,
+    controls: *const TransmitInput,
+    result: *mut TransmitResult,
+    prepared: &mut PreparedOutputs,
+) -> c_int {
     if output.is_null() || result.is_null() || controls.is_null() || frame_count == 0 {
         return INVALID_ARGUMENT;
     }
@@ -1957,7 +2243,14 @@ pub(crate) unsafe extern "C" fn transmit(
         Ok(value) => value,
         Err(_) => return INVALID_ARGUMENT,
     };
-    render_ctcss(worker, &signaling, count);
+    if session
+        .profile
+        .is_some_and(|profile| profile.encode == crate::profile::EXTERNAL)
+    {
+        worker.ctcss[..count].fill(0.0);
+    } else {
+        render_ctcss(worker, &signaling, count);
+    }
     if render_dcs(worker, &signaling, count).is_err() {
         provider_failure(session, false, worker.sample_index);
         return PROVIDER_FAILED;
@@ -2023,6 +2316,17 @@ pub(crate) unsafe extern "C" fn transmit(
         worker.publication_interval_frames,
     );
     let (output_peak, output_rms, output_rails) = measure(output_slice);
+    *prepared = PreparedOutputs {
+        logical_ptt: u32::from(signaling.logical_ptt),
+        external_ctcss_enable: u32::from(
+            session
+                .profile
+                .is_some_and(|profile| profile.encode == crate::profile::EXTERNAL)
+                && signaling.logical_ptt
+                && signaling.ctcss_render.enabled != 0
+                && controls.ctcss_inhibit == 0,
+        ),
+    };
     if signaling.logical_ptt_raised || signaling.logical_ptt_released {
         push_edge(
             &session.transmit_events,
