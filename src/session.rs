@@ -1598,7 +1598,7 @@ pub(crate) unsafe extern "C" fn receive(
     if current.profile.is_some() {
         return UNSUPPORTED;
     }
-    unsafe { receive_inner(session, input, output, frame_count, controls, result, true) }
+    unsafe { receive_inner(current, input, output, frame_count, controls, result, true) }
 }
 
 /// Resolve valid normalized hardware snapshots, then run the same RX pipeline.
@@ -1643,7 +1643,7 @@ pub(crate) unsafe extern "C" fn receive_profiled(
     let mut received = ReceiveResult::default();
     let status = unsafe {
         receive_inner(
-            session,
+            current,
             input,
             output,
             frame_count,
@@ -1667,7 +1667,7 @@ pub(crate) unsafe extern "C" fn receive_profiled(
 
 /// Both ABI receive entry points share one serial sample-clocked implementation.
 unsafe fn receive_inner(
-    session: *mut Session,
+    session: &Session,
     input: *const f32,
     output: *mut f32,
     frame_count: u32,
@@ -1675,9 +1675,6 @@ unsafe fn receive_inner(
     result: *mut ReceiveResult,
     snapshots_valid: bool,
 ) -> c_int {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return INVALID_ARGUMENT;
-    };
     if output.is_null() || result.is_null() || frame_count == 0 {
         return INVALID_ARGUMENT;
     }
@@ -2117,7 +2114,7 @@ pub(crate) unsafe extern "C" fn transmit(
     }
     unsafe {
         transmit_inner(
-            session,
+            current,
             output,
             frame_count,
             controls,
@@ -2164,7 +2161,7 @@ pub(crate) unsafe extern "C" fn transmit_profiled(
     }
     unsafe {
         transmit_inner(
-            session,
+            current,
             output,
             frame_count,
             controls,
@@ -2176,16 +2173,13 @@ pub(crate) unsafe extern "C" fn transmit_profiled(
 
 /// Shared sample-clocked implementation; only the owning callback sees mutable TX state.
 unsafe fn transmit_inner(
-    session: *mut Session,
+    session: &Session,
     output: *mut f32,
     frame_count: u32,
     controls: *const TransmitInput,
     result: *mut TransmitResult,
     prepared: &mut PreparedOutputs,
 ) -> c_int {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return INVALID_ARGUMENT;
-    };
     if output.is_null() || result.is_null() || controls.is_null() || frame_count == 0 {
         return INVALID_ARGUMENT;
     }

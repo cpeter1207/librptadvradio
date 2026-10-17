@@ -23,6 +23,257 @@ fn config() -> SessionConfig {
     }
 }
 
+#[test]
+fn profile_rejects_each_unused_native_waveform_and_missing_dsp_setting() {
+    for field in 0..6 {
+        let mut c = source_config(2, 0);
+        match field {
+            0 => c.transmit.mapped_ctcss_frequency_tenths_hz[3] = 1000,
+            1 => c.transmit.ctcss_peak = 0.1,
+            2 => c.transmit.ctcss_turnoff_phase_shift_degrees = 120.0,
+            3 => c.transmit.ctcss_turnoff_tail_tone_hz = 55.0,
+            4 => c.transmit.dcs_transmit_enabled = 1,
+            _ => c.transmit.ctcss_transmit_enabled = 1,
+        }
+        assert!(ValidatedProfile::new(&profile(2, 0), &capabilities(), &c).is_err());
+    }
+    let mut c = source_config(0, 1);
+    c.receive.ctcss_tone_mask = 0;
+    assert!(ValidatedProfile::new(&profile(0, 1), &capabilities(), &c).is_err());
+    let mut c = source_config(1, 0);
+    c.transmit.default_ctcss_frequency_tenths_hz = 0;
+    assert!(ValidatedProfile::new(&profile(1, 0), &capabilities(), &c).is_err());
+    let mut c = source_config(1, 0);
+    c.transmit.output_a_route = 1;
+    assert!(ValidatedProfile::new(&profile(1, 0), &capabilities(), &c).is_err());
+    let mut c = config();
+    c.transmit.dcs_transmit_enabled = 1;
+    c.transmit.output_a_route = 2;
+    assert!(ValidatedProfile::new(&profile(0, 0), &capabilities(), &c).is_ok());
+}
+
+#[test]
+fn profile_dcs_encode_requires_a_native_signaling_route() {
+    let mut c = config();
+    c.transmit.dcs_transmit_enabled = 1;
+    let mut caps = capabilities();
+    assert!(ValidatedProfile::new(&profile(0, 0), &caps, &c).is_err());
+    c.transmit.output_a_route = 2;
+    caps.dsp_tone_audio = 0;
+    assert!(ValidatedProfile::new(&profile(0, 0), &caps, &c).is_err());
+}
+
+#[test]
+fn profiled_ffi_rejects_missing_short_and_invalid_records() {
+    let c = config();
+    let p = profile(0, 0);
+    let caps = capabilities();
+    let ports = SessionPorts::default();
+    let runtime = Runtime::new(&p, &c);
+    let short = 0_u32;
+    let mut handle = ptr::null_mut();
+    let mut update = ptr::null_mut();
+    let mut output = [0.0; 2];
+    let mut rx = ProfileReceiveResult {
+        struct_size: size_of::<ProfileReceiveResult>() as u32,
+        ..Default::default()
+    };
+    let mut tx = ProfileTransmitResult {
+        struct_size: size_of::<ProfileTransmitResult>() as u32,
+        ..Default::default()
+    };
+    let mut controls = ProfileReceiveInput {
+        struct_size: size_of::<ProfileReceiveInput>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        assert_eq!(
+            create_profiled(&c, &ports, &p, &caps, ptr::null_mut()),
+            INVALID_ARGUMENT
+        );
+        for bad in [ptr::null(), ptr::from_ref(&short)] {
+            assert_eq!(
+                create_profiled(bad.cast(), &ports, &p, &caps, &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert_eq!(
+                create_profiled(&c, &ports, bad.cast(), &caps, &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert_eq!(
+                create_profiled(&c, &ports, &p, bad.cast(), &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert_eq!(
+                receive_profiled(
+                    runtime.0,
+                    output.as_ptr(),
+                    output.as_mut_ptr(),
+                    1,
+                    bad.cast(),
+                    &mut rx
+                ),
+                INVALID_ARGUMENT
+            );
+            // Mutable short prefixes are supplied below; never cast shared storage writable.
+        }
+        let mut short_result = 0_u32;
+        for bad in [ptr::null_mut(), ptr::from_mut(&mut short_result)] {
+            assert_eq!(
+                receive_profiled(
+                    runtime.0,
+                    output.as_ptr(),
+                    output.as_mut_ptr(),
+                    1,
+                    &controls,
+                    bad.cast()
+                ),
+                INVALID_ARGUMENT
+            );
+            assert_eq!(
+                transmit_profiled(
+                    runtime.0,
+                    output.as_mut_ptr(),
+                    1,
+                    &TransmitInput::default(),
+                    bad.cast()
+                ),
+                INVALID_ARGUMENT
+            );
+        }
+        let mut bad = c;
+        bad.native_sample_rate_hz = 8000;
+        assert_ne!(create_profiled(&bad, &ports, &p, &caps, &mut handle), OK);
+        assert_ne!(
+            prepare_profiled_update(runtime.0, &bad, &ports, &p, &caps, &mut update),
+            OK
+        );
+        assert_eq!(
+            prepare_profiled_update(runtime.0, &c, &ports, &p, &caps, ptr::null_mut()),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            prepare_profiled_update(ptr::null(), &c, &ports, &p, &caps, &mut update),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            prepare_profiled_update(runtime.0, ptr::null(), &ports, &p, &caps, &mut update),
+            INVALID_ARGUMENT
+        );
+        let mut invalid = p;
+        invalid.kind = 2;
+        assert_eq!(
+            create_profiled(&c, &ports, &invalid, &caps, &mut handle),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            receive_profiled(
+                ptr::null_mut(),
+                output.as_ptr(),
+                output.as_mut_ptr(),
+                1,
+                &controls,
+                &mut rx
+            ),
+            INVALID_ARGUMENT
+        );
+        controls.external_ctcss_valid = 2;
+        assert_eq!(
+            receive_profiled(
+                runtime.0,
+                output.as_ptr(),
+                output.as_mut_ptr(),
+                1,
+                &controls,
+                &mut rx
+            ),
+            INVALID_ARGUMENT
+        );
+        controls.external_ctcss_valid = 0;
+        assert_eq!(
+            receive_profiled(
+                runtime.0,
+                ptr::null(),
+                output.as_mut_ptr(),
+                1,
+                &controls,
+                &mut rx
+            ),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            transmit_profiled(
+                ptr::null_mut(),
+                output.as_mut_ptr(),
+                1,
+                &TransmitInput::default(),
+                &mut tx
+            ),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            transmit_profiled(
+                runtime.0,
+                ptr::null_mut(),
+                1,
+                &TransmitInput::default(),
+                &mut tx
+            ),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            transmit_profiled(runtime.0, output.as_mut_ptr(), 1, ptr::null(), &mut tx),
+            INVALID_ARGUMENT
+        );
+        let mut raw_rx = ReceiveResult::default();
+        let mut raw_tx = TransmitResult::default();
+        assert_eq!(
+            receive(
+                runtime.0,
+                output.as_ptr(),
+                output.as_mut_ptr(),
+                1,
+                &ReceiveInput::default(),
+                &mut raw_rx
+            ),
+            UNSUPPORTED
+        );
+        assert_eq!(
+            transmit(
+                runtime.0,
+                output.as_mut_ptr(),
+                1,
+                &TransmitInput::default(),
+                &mut raw_tx
+            ),
+            UNSUPPORTED
+        );
+        assert_eq!(create(&c, &ports, &mut handle), OK);
+        assert_eq!(
+            receive_profiled(
+                handle,
+                output.as_ptr(),
+                output.as_mut_ptr(),
+                1,
+                &controls,
+                &mut rx
+            ),
+            UNSUPPORTED
+        );
+        assert_eq!(
+            transmit_profiled(
+                handle,
+                output.as_mut_ptr(),
+                1,
+                &TransmitInput::default(),
+                &mut tx
+            ),
+            UNSUPPORTED
+        );
+        destroy(handle);
+    }
+}
+
 fn profile(encode: u32, decode: u32) -> Profile {
     Profile {
         struct_size: size_of::<Profile>() as u32,

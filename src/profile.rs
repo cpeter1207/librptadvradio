@@ -72,7 +72,8 @@ impl ValidatedProfile {
         if (p.carrier_source == 0 && caps.hardware_cor == 0)
             || (p.ctcss_decode_source == EXTERNAL && caps.external_ctcss_decode == 0)
             || (p.ctcss_encode_source == EXTERNAL && caps.external_ctcss_encode == 0)
-            || (p.ctcss_encode_source == DSP && caps.dsp_tone_audio == 0)
+            || ((p.ctcss_encode_source == DSP || tx.dcs_transmit_enabled != 0)
+                && caps.dsp_tone_audio == 0)
             || (rx.dcs_enabled != 0 && p.ctcss_decode_source != DISABLED)
             || (tx.dcs_transmit_enabled != 0 && p.ctcss_encode_source != DISABLED)
         {
@@ -81,11 +82,11 @@ impl ValidatedProfile {
         if (rx.ctcss_enabled != u32::from(p.ctcss_decode_source == DSP))
             || (tx.ctcss_transmit_enabled != u32::from(p.ctcss_encode_source == DSP))
             || (p.ctcss_decode_source == DSP && rx.ctcss_tone_mask == 0)
-            || (p.ctcss_encode_source == DSP
-                && (tx.default_ctcss_frequency_tenths_hz <= 0
-                    || ![tx.output_a_route, tx.output_b_route]
-                        .iter()
-                        .any(|v| matches!(v, 2 | 3))))
+            || (p.ctcss_encode_source == DSP && tx.default_ctcss_frequency_tenths_hz <= 0)
+            || ((p.ctcss_encode_source == DSP || tx.dcs_transmit_enabled != 0)
+                && ![tx.output_a_route, tx.output_b_route]
+                    .iter()
+                    .any(|v| matches!(v, 2 | 3)))
         {
             return Err(INVALID_ARGUMENT);
         }
