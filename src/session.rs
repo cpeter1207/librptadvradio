@@ -277,6 +277,11 @@ impl Default for SessionPorts {
     }
 }
 
+// Preserve the existing Boolean override as bit zero in the same ABI-4 word.
+const RECEIVE_TONE_OVERRIDE: u32 = 1;
+const RECEIVE_EXTERNAL_COR_VALID: u32 = 2;
+const RECEIVE_EXTERNAL_COR_PRESENT: u32 = 4;
+
 /// Hardware/control snapshots consumed by the receive worker.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -285,6 +290,7 @@ pub(crate) struct ReceiveInput {
     pub(crate) parallel_carrier: u32,
     pub(crate) hardware_subaudible: u32,
     pub(crate) parallel_subaudible: u32,
+    /// Bit0 tone override; bit1 external COR valid; bit2 external COR present.
     pub(crate) subaudible_override: u32,
 }
 
@@ -894,6 +900,8 @@ fn carrier_source(value: u32) -> Result<receive_qualification::CarrierSource, c_
         4 => Ok(CarrierSource::HardwareInverted),
         5 => Ok(CarrierSource::Parallel),
         6 => Ok(CarrierSource::ParallelInverted),
+        7 => Ok(CarrierSource::External),
+        8 => Ok(CarrierSource::Open),
         _ => Err(INVALID_ARGUMENT),
     }
 }
@@ -1700,6 +1708,17 @@ unsafe fn receive_inner(
     }
     let (input_peak, input_rms, input_rails) = measure_channel(input, worker.receive_channel);
     let controls = unsafe { *controls };
+    if controls.subaudible_override
+        & !(RECEIVE_TONE_OVERRIDE | RECEIVE_EXTERNAL_COR_VALID | RECEIVE_EXTERNAL_COR_PRESENT)
+        != 0
+    {
+        return INVALID_ARGUMENT;
+    }
+    let external_cor = (controls.subaudible_override & RECEIVE_EXTERNAL_COR_VALID != 0)
+        .then_some(controls.subaudible_override & RECEIVE_EXTERNAL_COR_PRESENT != 0);
+    let snapshots_valid = snapshots_valid
+        && (worker.qualification.carrier_source != receive_qualification::CarrierSource::External
+            || external_cor.is_some());
     let duration = session
         .shared
         .receiver_blanking_ms
@@ -1716,6 +1735,7 @@ unsafe fn receive_inner(
                 worker.qualification.carrier_source,
                 controls.hardware_carrier != 0,
                 controls.parallel_carrier != 0,
+                external_cor,
             ),
         )
         .expect("validated session receiver span");
@@ -1728,7 +1748,7 @@ unsafe fn receive_inner(
     };
     let tx_ptt = session.shared.logical_ptt.load(Ordering::Acquire);
     let mut qualification = worker.qualification;
-    qualification.subaudible_override |= controls.subaudible_override != 0;
+    qualification.subaudible_override |= controls.subaudible_override & RECEIVE_TONE_OVERRIDE != 0;
     if !snapshots_valid {
         qualification.carrier_source = receive_qualification::CarrierSource::Ignore;
         qualification.subaudible_override = false;
@@ -1736,6 +1756,7 @@ unsafe fn receive_inner(
     let qualified = receive_qualification::advance(
         &qualification,
         &receive_qualification::Inputs {
+            external_carrier: external_cor,
             hardware_carrier: controls.hardware_carrier != 0,
             parallel_carrier: controls.parallel_carrier != 0,
             dsp_carrier: detected.carrier_detect,
@@ -2659,6 +2680,111 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generic_external_cor_requires_a_valid_snapshot_and_independent_tone() {
+        let mut config = valid_config();
+        config.qualification.carrier_source = 7;
+        config.qualification.subaudible_source = 1;
+        let mut session = ptr::null_mut();
+        assert_eq!(
+            unsafe { create(&config, &SessionPorts::default(), &mut session) },
+            OK
+        );
+        assert_eq!(unsafe { warm(session) }, OK);
+        let input = [0.0; 8];
+        let mut output = [0.0; 4];
+        for (flags, tone, carrier, keyed) in [
+            (0, 1, 0, 0),
+            (1, 1, 0, 0),
+            (4, 1, 0, 0),
+            (2, 1, 0, 0),
+            (6, 0, 1, 0),
+            (7, 0, 1, 1),
+            (6, 1, 1, 1),
+        ] {
+            let controls = ReceiveInput {
+                hardware_carrier: 1,
+                parallel_carrier: 1,
+                hardware_subaudible: tone,
+                subaudible_override: flags,
+                ..ReceiveInput::default()
+            };
+            let mut result = ReceiveResult::default();
+            assert_eq!(
+                unsafe {
+                    receive(
+                        session,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        4,
+                        &controls,
+                        &mut result,
+                    )
+                },
+                OK
+            );
+            assert_eq!(
+                (result.carrier_active, result.receiver_keyed),
+                (carrier, keyed),
+                "flags={flags}, tone={tone}"
+            );
+        }
+        let invalid = ReceiveInput {
+            subaudible_override: 8,
+            ..ReceiveInput::default()
+        };
+        assert_eq!(
+            unsafe {
+                receive(
+                    session,
+                    input.as_ptr(),
+                    output.as_mut_ptr(),
+                    4,
+                    &invalid,
+                    &mut ReceiveResult::default(),
+                )
+            },
+            INVALID_ARGUMENT
+        );
+        unsafe { destroy(session) };
+    }
+
+    #[test]
+    fn explicit_open_carrier_still_requires_the_selected_tone_qualifier() {
+        for (source, tone, keyed) in [(0, 0, 1), (1, 0, 0), (1, 1, 1)] {
+            let mut config = valid_config();
+            config.qualification.carrier_source = 8;
+            config.qualification.subaudible_source = source;
+            let mut session = ptr::null_mut();
+            let input = [0.0; 8];
+            let mut output = [0.0; 4];
+            let controls = ReceiveInput {
+                hardware_subaudible: tone,
+                ..ReceiveInput::default()
+            };
+            let mut result = ReceiveResult::default();
+            // SAFETY: the test owns this session and all complete PCM/control buffers.
+            unsafe {
+                assert_eq!(create(&config, &SessionPorts::default(), &mut session), OK);
+                assert_eq!(warm(session), OK);
+                assert_eq!(
+                    receive(
+                        session,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        4,
+                        &controls,
+                        &mut result
+                    ),
+                    OK
+                );
+                assert_eq!(result.carrier_active, 1);
+                assert_eq!(result.receiver_keyed, keyed);
+                destroy(session);
+            }
+        }
+    }
+
     fn create_result(config: &SessionConfig) -> c_int {
         let ports = SessionPorts::default();
         let mut session = ptr::null_mut();
@@ -3548,7 +3674,7 @@ mod tests {
             |c| c.receive.ctcss_decoder_gain = -1.0,
             |c| c.receive.ctcss_decoder_gain = i32::MAX as f32,
             |c| c.receive.vox_threshold = i32::MAX,
-            |c| c.qualification.carrier_source = 7,
+            |c| c.qualification.carrier_source = 9,
             |c| c.qualification.subaudible_source = 6,
             |c| c.qualification.subaudible_override = 2,
             |c| c.qualification.advanced_transport = 2,

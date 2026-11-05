@@ -31,6 +31,10 @@ pub enum CarrierSource {
     Parallel,
     /// Use the inverted parallel input.
     ParallelInverted,
+    /// Independent normalized carrier snapshot, valid only when supplied.
+    External,
+    /// Explicitly unqualified receive, independent of carrier detector state.
+    Open,
 }
 
 /// Selects the indication used as the receiver subaudible qualification.
@@ -85,6 +89,8 @@ pub struct Config {
 /// Canonical adapter snapshots supplied once for a bounded native tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Inputs {
+    /// Independent normalized carrier; `None` is unavailable/stale, never fallback.
+    pub external_carrier: Option<bool>,
     /// Current normal-polarity CM119/HID carrier input.
     pub hardware_carrier: bool,
     /// Current normal-polarity parallel carrier input.
@@ -162,13 +168,16 @@ pub(crate) fn external_carrier(
     source: CarrierSource,
     hardware: bool,
     parallel: bool,
+    external: Option<bool>,
 ) -> Option<bool> {
     match source {
         CarrierSource::Ignore => Some(false),
+        CarrierSource::Open => Some(true),
         CarrierSource::Hardware => Some(hardware),
         CarrierSource::HardwareInverted => Some(!hardware),
         CarrierSource::Parallel => Some(parallel),
         CarrierSource::ParallelInverted => Some(!parallel),
+        CarrierSource::External => Some(external.unwrap_or(false)),
         CarrierSource::DspNoise | CarrierSource::DspVox => None,
     }
 }
@@ -179,6 +188,7 @@ fn resolve_indications(config: &Config, inputs: &Inputs, state: &mut State) {
         config.carrier_source,
         inputs.hardware_carrier,
         inputs.parallel_carrier,
+        inputs.external_carrier,
     )
     .unwrap_or(inputs.dsp_carrier);
     if matches!(

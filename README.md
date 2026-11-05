@@ -16,8 +16,10 @@ External FFmpeg graphs, RNNoise, and the rate-adjusting program ring are
 represented by narrow borrowed ports. The session owns their ordering but not
 their implementation or lifetime. Prepared per-tone CTCSS notch ports let the
 session select the decoded tone without rebuilding a graph in real time.
-CTCSS qualification follows the configured carrier source: published hardware
-COS for GPIO or parallel inputs, otherwise the native noise or VOX detector.
+Carrier sources include GPIO, parallel inputs, DSP noise squelch, VOX, and an
+independent external snapshot. External snapshots must be marked valid.
+Open carrier keeps receive available while still requiring the selected CTCSS
+or DCS qualifier. CTCSS qualification follows the configured carrier source.
 Receive processing is returned to the adapter with qualification; ABI 4
 intentionally has no direct software local repeat path. Transmit consumes only
 the prepared program-ring port before native signaling and output routing.
@@ -46,12 +48,10 @@ timing; turn-off scheduling and output routing remain in radio.
 The complete C contract is documented in
 `include/rptadvradio/rptadvradio.h`.
 
-For an alpha.7 to alpha.8 package upgrade, refresh the signed USBRadioPlus
-APT index and install `librptadvradio4`, `librptadvsquelch2`, and
-`librptadvctcss2` together; `librptadvdcs1` remains at ABI 1. A process using
-radio alpha.8 needs the new provider SONAMEs available before it starts. The
-alpha.7 squelch/CTCSS ABI-1 runtimes are not substitutes for ABI 2, and an
-already running consumer must be restarted to load the upgraded libraries.
+Refresh the signed USBRadioPlus APT index and install `librptadvradio4`,
+`librptadvsquelch2`, `librptadvctcss2`, and `librptadvdcs1` together.
+Restart the controller or Asterisk after upgrading to load the installed
+libraries.
 
 Build the shared object with `make`. Run `make ci` for the complete local
 quality gate.
