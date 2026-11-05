@@ -1,3 +1,10 @@
+librptadvradio (0.1.0~alpha9-1) unstable; urgency=medium
+
+  * Accept independent external carrier snapshots and an explicit open carrier.
+  * Keep radio ABI 4 and the existing receive-input record layout.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 05 Nov 2026 17:30:00 -0600
+
 librptadvradio (0.1.0~alpha8-1) unstable; urgency=medium
 
   * Adopt released squelch and CTCSS ABI 2 status/out-handle contracts.
