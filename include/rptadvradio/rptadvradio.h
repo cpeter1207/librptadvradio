@@ -45,6 +45,7 @@ enum rptadv_radio_carrier_source {
   RPTADV_RADIO_CARRIER_PARALLEL = 5, /**< Normal parallel input. */
   RPTADV_RADIO_CARRIER_PARALLEL_INVERTED = 6, /**< Inverted parallel input. */
   RPTADV_RADIO_CARRIER_EXTERNAL = 7, /**< Independent normalized COR; validity required. */
+  RPTADV_RADIO_CARRIER_OPEN = 8, /**< Always-open carrier; tone qualification still applies. */
 };
 
 /** @brief Native discriminator-noise detector response. */

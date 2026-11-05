@@ -33,6 +33,8 @@ pub enum CarrierSource {
     ParallelInverted,
     /// Independent normalized carrier snapshot, valid only when supplied.
     External,
+    /// Explicitly unqualified receive, independent of carrier detector state.
+    Open,
 }
 
 /// Selects the indication used as the receiver subaudible qualification.
@@ -170,6 +172,7 @@ pub(crate) fn external_carrier(
 ) -> Option<bool> {
     match source {
         CarrierSource::Ignore => Some(false),
+        CarrierSource::Open => Some(true),
         CarrierSource::Hardware => Some(hardware),
         CarrierSource::HardwareInverted => Some(!hardware),
         CarrierSource::Parallel => Some(parallel),

@@ -901,6 +901,7 @@ fn carrier_source(value: u32) -> Result<receive_qualification::CarrierSource, c_
         5 => Ok(CarrierSource::Parallel),
         6 => Ok(CarrierSource::ParallelInverted),
         7 => Ok(CarrierSource::External),
+        8 => Ok(CarrierSource::Open),
         _ => Err(INVALID_ARGUMENT),
     }
 }
@@ -2748,6 +2749,42 @@ mod tests {
         unsafe { destroy(session) };
     }
 
+    #[test]
+    fn explicit_open_carrier_still_requires_the_selected_tone_qualifier() {
+        for (source, tone, keyed) in [(0, 0, 1), (1, 0, 0), (1, 1, 1)] {
+            let mut config = valid_config();
+            config.qualification.carrier_source = 8;
+            config.qualification.subaudible_source = source;
+            let mut session = ptr::null_mut();
+            let input = [0.0; 8];
+            let mut output = [0.0; 4];
+            let controls = ReceiveInput {
+                hardware_subaudible: tone,
+                ..ReceiveInput::default()
+            };
+            let mut result = ReceiveResult::default();
+            // SAFETY: the test owns this session and all complete PCM/control buffers.
+            unsafe {
+                assert_eq!(create(&config, &SessionPorts::default(), &mut session), OK);
+                assert_eq!(warm(session), OK);
+                assert_eq!(
+                    receive(
+                        session,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        4,
+                        &controls,
+                        &mut result
+                    ),
+                    OK
+                );
+                assert_eq!(result.carrier_active, 1);
+                assert_eq!(result.receiver_keyed, keyed);
+                destroy(session);
+            }
+        }
+    }
+
     fn create_result(config: &SessionConfig) -> c_int {
         let ports = SessionPorts::default();
         let mut session = ptr::null_mut();
@@ -3637,7 +3674,7 @@ mod tests {
             |c| c.receive.ctcss_decoder_gain = -1.0,
             |c| c.receive.ctcss_decoder_gain = i32::MAX as f32,
             |c| c.receive.vox_threshold = i32::MAX,
-            |c| c.qualification.carrier_source = 8,
+            |c| c.qualification.carrier_source = 9,
             |c| c.qualification.subaudible_source = 6,
             |c| c.qualification.subaudible_override = 2,
             |c| c.qualification.advanced_transport = 2,
