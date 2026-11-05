@@ -9,6 +9,14 @@
 
 #include "rptadvradio/rptadvradio.h"
 
+_Static_assert(sizeof(struct rptadv_radio_receive_input) == 5 * sizeof(uint32_t),
+               "generic COR must retain the ABI 4 input size");
+_Static_assert(RPTADV_RADIO_CARRIER_EXTERNAL == 7 &&
+               RPTADV_RADIO_RECEIVE_TONE_OVERRIDE == 1 &&
+               RPTADV_RADIO_RECEIVE_EXTERNAL_COR_VALID == 2 &&
+               RPTADV_RADIO_RECEIVE_EXTERNAL_COR_PRESENT == 4,
+               "generic COR selectors and flags changed");
+
 /* All released descriptor operations retain their offsets. */
 _Static_assert(offsetof(struct rptadv_radio_descriptor, session_destroy_update) ==
                offsetof(struct rptadv_radio_descriptor, session_create) + 11 * sizeof(void (*)(void)),

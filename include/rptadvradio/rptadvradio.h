@@ -44,6 +44,7 @@ enum rptadv_radio_carrier_source {
   RPTADV_RADIO_CARRIER_USB_INVERTED = 4, /**< Inverted USB GPIO. */
   RPTADV_RADIO_CARRIER_PARALLEL = 5, /**< Normal parallel input. */
   RPTADV_RADIO_CARRIER_PARALLEL_INVERTED = 6, /**< Inverted parallel input. */
+  RPTADV_RADIO_CARRIER_EXTERNAL = 7, /**< Independent normalized COR; validity required. */
 };
 
 /** @brief Native discriminator-noise detector response. */
@@ -249,13 +250,21 @@ struct rptadv_radio_session_ports {
   struct rptadv_radio_processor_port receive_ctcss_tail_notch; /**< Prepared 55 Hz tail notch. */
 };
 
+/** @brief Flags carried by receive_input.subaudible_override. */
+enum rptadv_radio_receive_flags {
+  RPTADV_RADIO_RECEIVE_TONE_OVERRIDE = 1, /**< Admit carrier without decoded tone. */
+  RPTADV_RADIO_RECEIVE_EXTERNAL_COR_VALID = 2, /**< Independent COR snapshot is fresh. */
+  RPTADV_RADIO_RECEIVE_EXTERNAL_COR_PRESENT = 4 /**< Independent COR is asserted. */
+};
 /** @brief Hardware snapshots supplied to one receive callback. */
 struct rptadv_radio_receive_input {
   uint32_t hardware_carrier; /**< Normal GPIO COR. */
   uint32_t parallel_carrier; /**< Normal parallel COR. */
   uint32_t hardware_subaudible; /**< Normal GPIO tone input. */
   uint32_t parallel_subaudible; /**< Normal parallel tone input. */
-  uint32_t subaudible_override; /**< Admit carrier without tone for this span. */
+  uint32_t subaudible_override; /**< rptadv_radio_receive_flags; unknown bits rejected.
+    External COR is independent of GPIO and tone. A missing valid bit closes
+    CARRIER_EXTERNAL even with tone override, without USB/DSP fallback. */
 };
 
 /** @brief Control/hardware snapshots supplied to one transmit callback. */
