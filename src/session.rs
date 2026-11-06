@@ -3119,10 +3119,12 @@ mod tests {
             ..SessionPorts::default()
         };
         let session = TestSession::prepared(&config, &ports);
-        deemp.fail = true;
+        // SAFETY: The retained port points to the live test-owned processor.
+        unsafe { (*ports.receive_deemphasis.context.cast::<TestProcessor>()).fail = true };
         assert_eq!(session.receive(true).0, PROVIDER_FAILED);
         assert_eq!(session.snapshot().provider_failures, 1);
-        deemp.fail = false;
+        // SAFETY: The retained port points to the same live test-owned processor.
+        unsafe { (*ports.receive_deemphasis.context.cast::<TestProcessor>()).fail = false };
         assert_eq!(session.receive(true).0, OK);
         config.qualification.carrier_source = 1;
         config.maximum_receive_frame_count = 960;
@@ -3608,7 +3610,8 @@ mod tests {
         assert_eq!(tail.calls, 1);
         assert_eq!(selected.calls, 1);
 
-        selected.fail = true;
+        // SAFETY: Notch port five retains the live selected test processor.
+        unsafe { (*ports.receive_ctcss_notch[5].context.cast::<TestProcessor>()).fail = true };
         assert_eq!(
             unsafe { run_receive_filters(&ports, 5, false, &input, &mut filtered, &mut notched) },
             Err(PROVIDER_FAILED)
@@ -4482,7 +4485,8 @@ mod tests {
                 }
                 let session = TestSession::new(&valid_config(), &ports);
                 assert_eq!(unsafe { warm(session.0) }, PROVIDER_FAILED);
-                processor.fail = false;
+                // SAFETY: This retained port points to the live test-owned processor.
+                unsafe { (*port.context.cast::<TestProcessor>()).fail = false };
                 assert_eq!(unsafe { warm(session.0) }, OK);
             }
         }
@@ -4603,6 +4607,8 @@ mod tests {
             }
         }
         for invalid in 0..6 {
+            // SAFETY: The ring port retains this live test-owned ring for serialized calls.
+            let ring = unsafe { &mut *ports.program_ring.context.cast::<TestRing>() };
             ring.fail = invalid == 0;
             ring.sample = if invalid == 1 { f32::NAN } else { 0.25 };
             ring.result.receiver_keyed = if invalid == 2 { 2 } else { 0 };
@@ -4647,7 +4653,14 @@ mod tests {
         assert_eq!(session.receive(true).1, [0.0, 0.0, 0.25, 0.25]);
         assert_eq!(session.receive(false).1, [0.0; 4]);
         assert_eq!(processor.calls, 2);
-        processor.fail = true;
+        // SAFETY: The retained noise-reduction port points to the live test processor.
+        unsafe {
+            (*ports
+                .receive_noise_reduction
+                .context
+                .cast::<TestProcessor>())
+            .fail = true
+        };
         assert_eq!(session.receive(false).0, PROVIDER_FAILED);
         assert_eq!(session.receive(true).0, PROVIDER_FAILED);
         assert_eq!(session.snapshot().provider_failures, 2);
