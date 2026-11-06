@@ -1364,7 +1364,7 @@ mod tests {
             .filter_map(|(peak, offset)| {
                 ((peak * 32_768.0) as i32 >= 9_000).then_some(start_frame + *offset as usize)
             })
-            .last()
+            .next_back()
     }
 
     #[derive(Debug, PartialEq, Eq)]

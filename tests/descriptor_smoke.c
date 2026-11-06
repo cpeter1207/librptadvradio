@@ -1,6 +1,6 @@
 /**
  * @file descriptor_smoke.c
- * @brief Exercise the ABI 4 session lifecycle through the installed header.
+ * @brief Exercise the ABI 5 session lifecycle through the installed header.
  */
 
 #include <assert.h>
@@ -9,8 +9,10 @@
 
 #include "rptadvradio/rptadvradio.h"
 
+_Static_assert(RPTADV_RADIO_ABI_VERSION == 5U, "speech qualification requires ABI 5");
+
 _Static_assert(sizeof(struct rptadv_radio_receive_input) == 5 * sizeof(uint32_t),
-               "generic COR must retain the ABI 4 input size");
+               "generic COR must retain the ABI 5 input size");
 _Static_assert(RPTADV_RADIO_CARRIER_EXTERNAL == 7 &&
                RPTADV_RADIO_CARRIER_OPEN == 8 &&
                RPTADV_RADIO_RECEIVE_TONE_OVERRIDE == 1 &&
@@ -21,7 +23,7 @@ _Static_assert(RPTADV_RADIO_CARRIER_EXTERNAL == 7 &&
 /* All released descriptor operations retain their offsets. */
 _Static_assert(offsetof(struct rptadv_radio_descriptor, session_destroy_update) ==
                offsetof(struct rptadv_radio_descriptor, session_create) + 11 * sizeof(void (*)(void)),
-               "ABI 4 prefix changed");
+               "ABI 5 prefix changed");
 _Static_assert(offsetof(struct rptadv_radio_descriptor, session_create_profiled) ==
                offsetof(struct rptadv_radio_descriptor, session_destroy_update) + sizeof(void (*)(void)),
                "profile operations must be a descriptor tail");
@@ -96,6 +98,7 @@ static struct rptadv_radio_session_config valid_config(void)
 	config.receive_input_gain = 1.0F;
 	config.receive.noise_filter_profile = RPTADV_RADIO_NOISE_FILTER_STANDARD;
 	config.receive.ctcss_decoder_gain = 1.0F;
+	config.receive.vad_hang_ms = 1000;
 	config.qualification.carrier_source = RPTADV_RADIO_CARRIER_USB;
 	config.qualification.subaudible_source = RPTADV_RADIO_SUBAUDIBLE_DISABLED;
 	config.qualification.radio_duplex = 1;
@@ -184,6 +187,11 @@ int main(void)
 	       RPTADV_RADIO_OK);
 	assert(receive_result.generation_id == 42);
 	assert(receive_result.frame_count == 4);
+	assert(receive_result.raw_receiver_keyed == receive_result.receiver_keyed);
+	assert(receive_result.rf_burst_id == 0);
+	assert(receive_result.vad_mode == RPTADV_RADIO_VAD_OFF);
+	assert(receive_result.vad_voice_sample_index == UINT64_MAX);
+	assert(receive_result.vad_preroll_frames == 0);
 	assert(receive_result.ctcss_decoder_peak == 0.0F);
 	assert(receive[0] > 0.29F && receive[0] < 0.31F);
 	assert(receive[1] > -0.21F && receive[1] < -0.19F);

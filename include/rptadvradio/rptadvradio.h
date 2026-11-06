@@ -1,6 +1,6 @@
 /**
  * @file rptadvradio.h
- * @brief ABI 4 for one prepared, portable 48 kHz radio session.
+ * @brief ABI 5 for one prepared, portable 48 kHz radio session.
  *
  * The shared object owns radio DSP and signaling state. Device, Asterisk,
  * FFmpeg, RNNoise, and elastic-ring implementations remain in independently
@@ -13,7 +13,18 @@
 extern "C" {
 #endif
 
-#define RPTADV_RADIO_ABI_VERSION 4U /**< Breaking whole-session ABI. */
+#define RPTADV_RADIO_ABI_VERSION 5U /**< Breaking whole-session ABI. */
+/** Speech qualification mode: unchanged receive policy. */
+#define RPTADV_RADIO_VAD_OFF 0U
+/** Speech qualification mode: first speech latches the RF burst. */
+#define RPTADV_RADIO_VAD_KERCHUNK 1U
+/** Speech qualification mode: speech plus its configured hang. */
+#define RPTADV_RADIO_VAD_ON 2U
+/** Minimum active speech lookback at the native 48 kHz rate. */
+#define RPTADV_RADIO_VAD_PREROLL_FRAMES 7680U
+/** Minimum active speech lookback in milliseconds. */
+#define RPTADV_RADIO_VAD_PREROLL_MS 160U
+
 #define RPTADV_RADIO_NATIVE_SAMPLE_RATE_HZ 48000U /**< Immutable native rate. */
 #define RPTADV_RADIO_CANONICAL_CHANNELS 2U /**< Interleaved device channels. */
 #define RPTADV_RADIO_CTCSS_TONE_COUNT 38U /**< CTCSS mapping-table length. */
@@ -170,7 +181,10 @@ struct rptadv_radio_receive_config {
   int32_t dcs_code; /**< Three-octal-digit DCS code. */
   uint32_t dcs_inverted; /**< Invert receive DCS polarity. */
   uint32_t cpu_saver_enabled; /**< Freeze idle voice/calibration work. */
-  uint32_t native_squelch_delay_frames; /**< Native pre-deemphasis delay. */
+  uint32_t native_squelch_delay_frames; /**< Native audible delay; active internal VAD enforces its minimum. */
+  uint32_t vad_mode; /**< 0 Off, 1 first-speech Kerchunk, 2 speech plus hang. */
+  uint32_t vad_hang_ms; /**< Native-clock speech hang; default 1000 ms. */
+  uint32_t vad_external_delay; /**< 0 reuse internal delay, 1 controller-owned delay. */
 };
 
 /** @brief Immutable receiver qualification and duplex policy. */
@@ -298,6 +312,13 @@ struct rptadv_radio_receive_result {
   float output_rms; /**< Processed normalized RMS. */
   uint64_t output_rail_samples; /**< Processed samples at a hardware rail. */
   uint32_t periodic_status_due; /**< Publication deadline crossed. */
+  uint32_t raw_receiver_keyed; /**< RF qualification before speech admission. */
+  uint64_t rf_burst_id; /**< Receive-owner burst identity; zero/untracked when Off. */
+  uint32_t vad_mode; /**< Effective speech mode; Kerchunk may normalize to On. */
+  uint32_t vad_voice_active; /**< Most recent fresh speech decision. */
+  float vad_score; /**< Most recent Earshot probability, zero when unavailable. */
+  uint64_t vad_voice_sample_index; /**< Last fresh voice native position, UINT64_MAX if absent. */
+  uint32_t vad_preroll_frames; /**< Required native delay reserve; zero when Off. */
 };
 
 /** @brief Immediate observation from one transmit callback. */
@@ -354,6 +375,13 @@ struct rptadv_radio_snapshot {
   int32_t ctcss_decoded_index; /**< Latest CTCSS index. */
   uint32_t dcs_valid; /**< Latest DCS state. */
   struct rptadv_radio_ring_observation program_ring; /**< Ring diagnostics. */
+  uint32_t raw_receiver_keyed; /**< RF qualification before speech admission. */
+  uint64_t rf_burst_id; /**< Receive-owner burst identity; zero/untracked when Off. */
+  uint32_t vad_mode; /**< Effective speech mode; Kerchunk may normalize to On. */
+  uint32_t vad_voice_active; /**< Most recent fresh speech decision. */
+  float vad_score; /**< Most recent Earshot probability, zero when unavailable. */
+  uint64_t vad_voice_sample_index; /**< Last fresh voice native position, UINT64_MAX if absent. */
+  uint32_t vad_preroll_frames; /**< Required native delay reserve; zero when Off. */
 };
 
 /** @brief Independent encoder/decoder assignment. */
@@ -412,7 +440,7 @@ struct rptadv_radio_profile_transmit_result {
   struct rptadv_radio_prepared_outputs outputs; /**< Released on errors. */
 };
 
-/** @brief Immutable whole-session ABI 4 function table. */
+/** @brief Immutable whole-session ABI 5 function table. */
 struct rptadv_radio_descriptor {
   uint32_t struct_size; /**< Descriptor size. */
   uint32_t abi_version; /**< Descriptor ABI. */
@@ -496,7 +524,7 @@ struct rptadv_radio_descriptor {
 };
 
 /**
- * @brief Return the process-lifetime ABI 4 descriptor.
+ * @brief Return the process-lifetime ABI 5 descriptor.
  *
  * Validate `abi_version` and `struct_size` before use. ABI 2 granular
  * operations were removed rather than retained as compatibility slots.

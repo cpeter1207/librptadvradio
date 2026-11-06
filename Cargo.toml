@@ -1,8 +1,8 @@
 [package]
 name = "librptadvradio"
-version = "0.1.0-alpha.9"
+version = "0.1.0-alpha.10"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "GPL-2.0-only"
 description = "Portable f32 radio-core ABI for rpt_advanced"
 repository = "https://github.com/cpeter1207/librptadvradio"
@@ -11,6 +11,9 @@ publish = false
 [lib]
 name = "rptadvradio"
 crate-type = ["cdylib"]
+
+[dependencies]
+earshot = "=1.2.2"
 
 [profile.release]
 codegen-units = 1
