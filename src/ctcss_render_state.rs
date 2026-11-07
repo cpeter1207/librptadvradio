@@ -111,6 +111,7 @@ pub(crate) fn validate_config(config: &CtcssRenderStateConfig) -> Result<(), c_i
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_input(input: &CtcssRenderStateInput) -> Result<(), c_int> {
     if input.elapsed_ms < 0 {
         return Err(RADIO_INVALID_ARGUMENT);
@@ -118,6 +119,7 @@ fn validate_input(input: &CtcssRenderStateInput) -> Result<(), c_int> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_state(state: &CtcssRenderState) -> Result<(), c_int> {
     if state.option > OPTION_DISABLE
         || state.oscillator_state > STATE_TURNOFF
@@ -139,6 +141,7 @@ fn validate_state(state: &CtcssRenderState) -> Result<(), c_int> {
 /// consumes that time from its remaining timer and requests disable only for
 /// the next callback.  This preserves the CTCSS oscillator's existing
 /// phase/tail timing across arbitrary callback partitions.
+#[cfg(test)]
 pub(crate) fn advance(
     config: &CtcssRenderStateConfig,
     input: &CtcssRenderStateInput,
@@ -148,6 +151,16 @@ pub(crate) fn advance(
     validate_input(input)?;
     validate_state(state)?;
 
+    advance_validated(config, input, state);
+    Ok(())
+}
+
+/// Apply prepared renderer controls to the valid state retained by its owner.
+pub(crate) fn advance_validated(
+    config: &CtcssRenderStateConfig,
+    input: &CtcssRenderStateInput,
+    state: &mut CtcssRenderState,
+) {
     let mut next = *state;
 
     next.phase_shift_degrees = 0.0;
@@ -187,7 +200,6 @@ pub(crate) fn advance(
     }
 
     *state = next;
-    Ok(())
 }
 
 /// C ABI entry for the final legacy CTCSS render-control transition.

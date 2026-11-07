@@ -537,7 +537,7 @@ impl ReceivePath {
             return Ok(self.last_result);
         }
 
-        let (input, blanked_native_frames) = self.apply_receive_blanking(native_input)?;
+        let (input, blanked_native_frames) = self.apply_receive_blanking(native_input);
         // The accepted frame count cannot exceed the setup-time u32 maximum.
         let native_frame_count_u32 = native_frame_count as u32;
         let decimator_before = self.frontend_state.decimator;
@@ -650,9 +650,9 @@ impl ReceivePath {
         Ok(self.last_result)
     }
 
-    fn apply_receive_blanking(&mut self, native_input: &[f32]) -> Result<(*const f32, u32), i32> {
+    fn apply_receive_blanking(&mut self, native_input: &[f32]) -> (*const f32, u32) {
         if self.blanking_remaining_ms <= 0 {
-            return Ok((native_input.as_ptr(), 0));
+            return (native_input.as_ptr(), 0);
         }
         let native_frame_count = (native_input.len() / 2) as u32;
         let remainder_before = self.blanking_remainder;
@@ -661,20 +661,20 @@ impl ReceivePath {
             remaining_ms: self.blanking_remaining_ms,
             blanked_frame_count: 0,
         };
-        rx_blanking::advance(
+        rx_blanking::advance_validated(
             &RxBlankingInput {
                 elapsed_ms,
                 native_frame_count,
                 sample_remainder_before: remainder_before,
             },
             &mut state,
-        )?;
+        );
         self.blanking_remaining_ms = state.remaining_ms;
         self.native_work[..native_input.len()].copy_from_slice(native_input);
         for frame in 0..state.blanked_frame_count as usize {
             self.native_work[frame * 2] = 0.0;
         }
-        Ok((self.native_work.as_ptr(), state.blanked_frame_count))
+        (self.native_work.as_ptr(), state.blanked_frame_count)
     }
 
     /// Advance the VOX hold from each emitted detector sample's native offset.

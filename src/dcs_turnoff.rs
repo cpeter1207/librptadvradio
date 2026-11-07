@@ -102,14 +102,7 @@ pub(crate) fn advance(
             if input.tx_ptt_in != 0 || input.begin_turnoff == 0 {
                 return Err(RADIO_INVALID_ARGUMENT);
             }
-            next.tx_state = STATE_TOC;
-            next.dcs_turnoff_remaining_ms = config.turnoff_duration_ms;
-            next.tx_hang_remaining_ms = 0;
-            let residual = timer::consume(&mut next.dcs_turnoff_remaining_ms, input.elapsed_ms);
-            if next.dcs_turnoff_remaining_ms == 0 {
-                next.finish_requested = 1;
-                next.finish_elapsed_ms = residual;
-            }
+            begin_validated(config, input.elapsed_ms, &mut next);
         }
         STATE_TOC => {
             if input.begin_turnoff != 0 || next.dcs_turnoff_remaining_ms <= 0 {
@@ -131,6 +124,26 @@ pub(crate) fn advance(
 
     *state = next;
     Ok(())
+}
+
+/// Begin a prepared positive-duration DCS tail with nonnegative elapsed time.
+pub(crate) fn begin_validated(
+    config: &DcsTurnoffConfig,
+    elapsed_ms: i32,
+    state: &mut DcsTurnoffState,
+) {
+    let mut next = *state;
+    next.finish_requested = 0;
+    next.finish_elapsed_ms = 0;
+    next.tx_state = STATE_TOC;
+    next.dcs_turnoff_remaining_ms = config.turnoff_duration_ms;
+    next.tx_hang_remaining_ms = 0;
+    let residual = timer::consume(&mut next.dcs_turnoff_remaining_ms, elapsed_ms);
+    if next.dcs_turnoff_remaining_ms == 0 {
+        next.finish_requested = 1;
+        next.finish_elapsed_ms = residual;
+    }
+    *state = next;
 }
 
 /// C ABI entry for one DCS transmitter turn-off state transition.

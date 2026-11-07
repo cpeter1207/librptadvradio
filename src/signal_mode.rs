@@ -131,6 +131,7 @@ pub(crate) fn validate_config(config: &SignalModeConfig) -> Result<(), c_int> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_input(input: &SignalModeInput) -> Result<(), c_int> {
     if input.dcs_valid > 1
         || input.tx_ptt_in > 1
@@ -148,6 +149,7 @@ fn validate_input(input: &SignalModeInput) -> Result<(), c_int> {
 /// while PTT input is present.  CTCSS gets first claim when the current mode
 /// permits it; a valid DCS result then gets the same claim only when CTCSS did
 /// not select the mode.  This preserves the original ordering exactly.
+#[cfg(test)]
 pub(crate) fn advance(
     config: &SignalModeConfig,
     input: &SignalModeInput,
@@ -156,6 +158,16 @@ pub(crate) fn advance(
     validate_config(config)?;
     validate_input(input)?;
 
+    advance_validated(config, input, state);
+    Ok(())
+}
+
+/// Apply a prepared policy and normalized decoder input without repeating validation.
+pub(crate) fn advance_validated(
+    config: &SignalModeConfig,
+    input: &SignalModeInput,
+    state: &mut SignalModeState,
+) {
     let mut next = *state;
 
     if next.smode_timer_ms > 0 && input.tx_ptt_in == 0 {
@@ -199,7 +211,6 @@ pub(crate) fn advance(
     }
 
     *state = next;
-    Ok(())
 }
 
 /// C ABI entry for the narrow legacy signaling-mode resolver.

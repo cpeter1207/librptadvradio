@@ -2862,6 +2862,10 @@ pub(crate) unsafe extern "C" fn destroy(session: *mut Session) {
 mod tests {
     use super::*;
 
+    mod update_rekey {
+        include!("session_update_rekey_tests.rs");
+    }
+
     struct TestProcessor {
         bias: f32,
         gain: f32,
