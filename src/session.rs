@@ -1714,6 +1714,17 @@ fn provider_failure(session: &Session, receive: bool, sample_index: u64) {
     );
 }
 
+/// Schedule fresh speech analysis and discard delayed PCM after an RX provider failure.
+fn receive_provider_failure(session: &Session, worker: &mut ReceiveWorker) -> c_int {
+    if worker.vad_mode != 0 {
+        worker.vad_needs_reset = true;
+        worker.delay_valid = 0;
+        worker.delay_index = 0;
+    }
+    provider_failure(session, true, worker.sample_index);
+    PROVIDER_FAILED
+}
+
 /// Consume exactly one variable-size native capture span.
 pub(crate) unsafe extern "C" fn receive(
     session: *mut Session,
@@ -1945,8 +1956,7 @@ unsafe fn receive_inner(
         }
         .is_err()
         {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
         if worker.per_sample_noise_gate {
             for (sample, gate) in worker.work_a[..count]
@@ -1966,8 +1976,7 @@ unsafe fn receive_inner(
     } else {
         if worker.vad_needs_reset {
             if worker.vad.reset().is_err() {
-                provider_failure(session, true, worker.sample_index);
-                return PROVIDER_FAILED;
+                return receive_provider_failure(session, worker);
             }
             worker.vad_needs_reset = false;
             worker.delay_valid = 0;
@@ -1985,8 +1994,7 @@ unsafe fn receive_inner(
         }
         .is_err()
         {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
         if worker.per_sample_noise_gate {
             for (sample, gate) in worker.work_a[..count]
@@ -2007,8 +2015,7 @@ unsafe fn receive_inner(
         ) {
             Ok(decision) => decision,
             Err(_) => {
-                provider_failure(session, true, worker.sample_index);
-                return PROVIDER_FAILED;
+                return receive_provider_failure(session, worker);
             }
         };
         if !raw_receiver_keyed {
@@ -2048,14 +2055,12 @@ unsafe fn receive_inner(
     } {
         Ok(value) => value,
         Err(_) => {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
     };
     if worker.cpu_saver_enabled && !raw_receiver_keyed {
         if unsafe { bypass_port(worker.ports.receive_noise_reduction, frame_count) }.is_err() {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
         if notched {
             worker.work_b[..count].copy_from_slice(&worker.work_c[..count]);
@@ -2079,8 +2084,7 @@ unsafe fn receive_inner(
             }
         };
         if noise_result.is_err() {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
         if unsafe {
             run_processor(
@@ -2091,8 +2095,7 @@ unsafe fn receive_inner(
         }
         .is_err()
         {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
     }
     unsafe { ptr::copy_nonoverlapping(worker.work_b.as_ptr(), output, count) };
@@ -2864,6 +2867,10 @@ mod tests {
 
     mod update_rekey {
         include!("session_update_rekey_tests.rs");
+    }
+
+    mod receive_failure {
+        include!("session_receive_failure_tests.rs");
     }
 
     struct TestProcessor {
