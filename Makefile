@@ -14,11 +14,12 @@ PKG_CONFIG ?= pkg-config
 
 PACKAGE := librptadvradio
 CRATE := rptadvradio
-PACKAGE_VERSION ?= 0.1.0-alpha.9
-SOVERSION := 4
+PACKAGE_VERSION ?= 0.1.0-alpha.10
+SOVERSION := 5
 PREFIX ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib
+DOCDIR ?= $(PREFIX)/share/doc/$(PACKAGE)$(SOVERSION)
 CARGO_TARGET_DIR ?= target
 TARGET_RELEASE := $(CARGO_TARGET_DIR)/release
 LIBRARY_BASENAME := lib$(CRATE)
@@ -40,7 +41,7 @@ DEBIAN_OUTPUT_DIR = $(abspath $(DEBIAN_SOURCE_PARENT))
 DEBIAN_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librptadvradio$(SOVERSION)_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_DEV_DEB = $(DEBIAN_OUTPUT_DIR)/librptadvradio-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_STAGE = build/debian-package-stage
-COVERAGE_TOOLCHAIN ?= nightly-2025-02-20
+COVERAGE_TOOLCHAIN ?= nightly-2025-06-01
 COVERAGE_DIR = build/coverage
 COVERAGE_TARGET_DIR = build/llvm-cov-target
 COVERAGE_JSON = $(COVERAGE_DIR)/coverage.json
@@ -126,12 +127,13 @@ container-coverage: quality-image
 
 install: all $(PC_FILE)
 	install -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PREFIX)/include/rptadvradio \
-		$(DESTDIR)$(LIBDIR)/pkgconfig
+		$(DESTDIR)$(LIBDIR)/pkgconfig $(DESTDIR)$(DOCDIR)
 	install -m 0755 $(LIBRARY_VERSIONED) $(DESTDIR)$(LIBDIR)/
 	ln -sf $(notdir $(LIBRARY_VERSIONED)) $(DESTDIR)$(LIBDIR)/$(notdir $(LIBRARY_SONAME))
 	ln -sf $(notdir $(LIBRARY_SONAME)) $(DESTDIR)$(LIBDIR)/$(notdir $(LIBRARY_LINK))
 	install -m 0644 $(HEADER) $(DESTDIR)$(PREFIX)/include/rptadvradio/
 	install -m 0644 $(PC_FILE) $(DESTDIR)$(LIBDIR)/pkgconfig/
+	install -m 0644 debian/copyright $(DESTDIR)$(DOCDIR)/copyright
 
 install-check: all
 	rm -rf build/stage
@@ -144,8 +146,10 @@ install-check: all
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadvsquelch.so.2'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadvctcss.so.2'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadvdcs.so.1'
+	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librptadv_samplerate_adapter.so.2'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -E 'res_usbradio.so|libportaudio.so|libasound.so|libhamlib.so|libavfilter.so'
 	test -f build/stage/usr/include/rptadvradio/$(notdir $(HEADER))
+	test -f build/stage/usr/share/doc/$(PACKAGE)$(SOVERSION)/copyright
 	test -f build/stage/usr/lib/pkgconfig/rptadvradio.pc
 	test "$$(PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig $(PKG_CONFIG) --variable=abi_version rptadvradio)" = '$(SOVERSION)'
 	PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig \
@@ -192,7 +196,7 @@ dist: | build
 	tar --exclude=.git --exclude=.work --exclude=build --exclude=target --exclude=__pycache__ \
 		--exclude=debian/.debhelper --exclude=debian/debhelper-build-stamp \
 		--exclude=debian/files --exclude=debian/tmp \
-		--exclude=debian/librptadvradio4 --exclude=debian/librptadvradio-dev \
+		--exclude=debian/librptadvradio5 --exclude=debian/librptadvradio-dev \
 		--exclude='debian/*.substvars' --exclude='debian/*.debhelper.log' \
 		--transform='s|^|$(PACKAGE)-$(PACKAGE_VERSION)/|' -czf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz \
 		.dockerignore AGENTS.md Cargo.lock Cargo.toml COPYING Doxyfile Makefile QUALITY.md README.md \

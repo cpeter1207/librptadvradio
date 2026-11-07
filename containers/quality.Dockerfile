@@ -4,8 +4,8 @@ FROM ${BASE_IMAGE}
 
 ARG TARGETARCH
 ARG RUSTUP_INIT_VERSION=1.28.2
-ARG RUST_STABLE=1.85.0
-ARG RUST_NIGHTLY=nightly-2025-02-20
+ARG RUST_STABLE=1.87.0
+ARG RUST_NIGHTLY=nightly-2025-06-01
 ARG CARGO_LLVM_COV_VERSION=0.6.21
 
 ENV RUSTUP_HOME=/opt/rustup
@@ -53,7 +53,16 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 		librptadvsquelch2=0.1.0~alpha2-1 librptadvsquelch-dev=0.1.0~alpha2-1 \
 		librptadvctcss2=0.1.0~alpha2-1 librptadvctcss-dev=0.1.0~alpha2-1 \
-		librptadvdcs1=0.1.0~alpha1-1 librptadvdcs-dev=0.1.0~alpha1-1 && \
+		librptadvdcs1=0.1.0~alpha1-1 librptadvdcs-dev=0.1.0~alpha1-1 \
+		librptadv-samplerate-adapter2=0.2.0~alpha2-1 librptadv-samplerate-adapter-dev=0.2.0~alpha2-1 && \
 	rm -rf /var/lib/apt/lists/*
+
+# Real Debian compiler packages satisfy native packaging dependencies; rustup
+# below still selects the library's minimum supported compiler for QA.
+RUN printf 'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian trixie-backports main\n' \
+        > /etc/apt/sources.list.d/trixie-backports.list && \
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        -t trixie-backports rustc cargo libstd-rust-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

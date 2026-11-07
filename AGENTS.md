@@ -6,9 +6,9 @@ retain compatibility-only code or descriptor slots. Preserve required current
 behavior and external interoperability, and reject mismatched artifacts safely.
 
 This repository follows the shared rpt_advanced project baseline.  The library
-is a portable, versioned, dynamically linked radio-core boundary.  It has no
-Asterisk, OSS, PortAudio, ALSA, Hamlib, HID, FFmpeg, or direct hardware
-dependency.
+is a portable, versioned, dynamically linked radio-core boundary.  It has no direct
+Asterisk, OSS, PortAudio, ALSA, Hamlib, HID, FFmpeg, or hardware dependency.
+Its analysis converter uses the released samplerate ABI2 descriptor.
 
 The native tick is real-time safe: it must not allocate, lock, block, log, or
 perform I/O.  It accepts and produces canonical interleaved normalized `f32`

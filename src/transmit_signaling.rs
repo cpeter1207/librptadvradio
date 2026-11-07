@@ -407,7 +407,7 @@ impl TransmitSignaling {
             &mut next.rx_timer_remainder_frames,
             input.native_frame_count,
         );
-        component(signal_mode::advance(
+        signal_mode::advance_validated(
             &self.config.signal_mode,
             &SignalModeInput {
                 elapsed_ms: rx_elapsed_ms,
@@ -416,7 +416,7 @@ impl TransmitSignaling {
                 tx_ptt_in: u32::from(input.external_ptt_request),
             },
             &mut next.signal_mode,
-        ))?;
+        );
         // A selected tail owns renderer state until it completes; a later
         // receive-side selection cannot overwrite an audible tail.
         if next.turnoff_phase == TurnoffPhase::None {
@@ -451,7 +451,7 @@ impl TransmitSignaling {
         let mut saver = TxCpuSaverState {
             halted: u32::from(next.cpu_halted),
         };
-        component(tx_cpu_saver::advance(
+        tx_cpu_saver::advance_validated(
             &TxCpuSaverInput {
                 enabled: u32::from(self.config.tx_cpu_saver_enabled),
                 tx_ptt_in: u32::from(input.external_ptt_request),
@@ -459,14 +459,14 @@ impl TransmitSignaling {
                 tx_idle: u32::from(next.transmitter_state == STATE_IDLE),
             },
             &mut saver,
-        ))?;
+        );
         next.cpu_halted = saver.halted != 0;
 
         // Completion queues the historical disable option.  Match the C
         // ordering by consuming it after CPU-saver selection, while retaining
         // it untouched when an idle saver skips renderer work.
         if !next.cpu_halted && next.ctcss_render.option == ctcss_render_state::OPTION_DISABLE {
-            apply_ctcss_option(&self.config, &mut next, ctcss_render_state::OPTION_DISABLE)?;
+            apply_ctcss_option(&self.config, &mut next, ctcss_render_state::OPTION_DISABLE);
         }
 
         let raised = !previous_ptt && next.logical_ptt;
@@ -631,24 +631,23 @@ fn consume_phase(remaining: &mut u32, requested: u32) -> u32 {
 }
 
 /// Consume one renderer option immediately before emitting its PCM intent.
-fn apply_ctcss_option(config: &Config, state: &mut State, option: u32) -> Result<(), Error> {
+fn apply_ctcss_option(config: &Config, state: &mut State, option: u32) {
     if option == ctcss_render_state::OPTION_START {
         state.ctcss_render.enabled = 1;
     }
     set_ctcss_option(state, option);
-    component(ctcss_render_state::advance(
+    ctcss_render_state::advance_validated(
         &ctcss_render_config(config),
         &CtcssRenderStateInput { elapsed_ms: 0 },
         &mut state.ctcss_render,
-    ))?;
+    );
     sync_signal_mode_option(state);
-    Ok(())
 }
 
 /// Consume a pending signal-mode CTCSS request before renderer intent is emitted.
-fn apply_pending_ctcss_option(config: &Config, state: &mut State) -> Result<(), Error> {
+fn apply_pending_ctcss_option(config: &Config, state: &mut State) {
     if state.ctcss_render.option == ctcss_render_state::OPTION_HOLD {
-        return Ok(());
+        return;
     }
     apply_ctcss_option(config, state, state.ctcss_render.option)
 }
@@ -660,7 +659,8 @@ fn start_ctcss_tail(config: &Config, state: &mut State) -> Result<(), Error> {
     state.turnoff_remaining_frames = ctcss_tail_frames(config.ctcss_render.turnoff_duration_ms)?;
     state.ctcss_legacy_remaining_frames = duration_frames(config.ctcss_render.turnoff_duration_ms)?;
     state.tx_hang_remaining_ms = 0;
-    apply_ctcss_option(config, state, ctcss_render_state::OPTION_TURNOFF)
+    apply_ctcss_option(config, state, ctcss_render_state::OPTION_TURNOFF);
+    Ok(())
 }
 
 /// Start the compatibility no-tone dwell with CTCSS muted immediately.
@@ -670,7 +670,8 @@ fn start_no_tone(config: &Config, state: &mut State) -> Result<(), Error> {
     state.turnoff_remaining_frames =
         no_tone_output_frames(config.ctcss_render.turnoff_duration_ms)?;
     state.tx_hang_remaining_ms = remaining_milliseconds(state.turnoff_remaining_frames);
-    apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE)
+    apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE);
+    Ok(())
 }
 
 /// Start an exact DCS tail while retaining normal CTCSS render intent.
@@ -682,15 +683,7 @@ fn start_dcs_tail(config: &Config, state: &mut State) -> Result<(), Error> {
         finish_requested: 0,
         finish_elapsed_ms: 0,
     };
-    component(dcs_turnoff::advance(
-        &config.dcs_turnoff,
-        &DcsTurnoffInput {
-            elapsed_ms: 0,
-            tx_ptt_in: 0,
-            begin_turnoff: 1,
-        },
-        &mut dcs,
-    ))?;
+    dcs_turnoff::begin_validated(&config.dcs_turnoff, 0, &mut dcs);
     state.transmitter_state = dcs.tx_state;
     state.dcs_turnoff_remaining_ms = dcs.dcs_turnoff_remaining_ms;
     state.tx_hang_remaining_ms = dcs.tx_hang_remaining_ms;
@@ -733,10 +726,7 @@ fn start_finishing(state: &mut State, tail_tone: bool) -> Result<(), Error> {
         finish_remaining_ms: state.finish_remaining_ms,
         tx_state: state.transmitter_state,
     };
-    component(tx_finish::advance(
-        &TxFinishInput { elapsed_ms: 0 },
-        &mut finish,
-    ))?;
+    tx_finish::advance_validated(&TxFinishInput { elapsed_ms: 0 }, &mut finish);
     state.buffer_clear_frames = if tail_tone {
         TAIL_TONE_BUFFER_CLEAR_FRAMES
     } else {
@@ -785,7 +775,7 @@ fn prepare_transmitter(
 ) -> Result<(), Error> {
     if input.external_ptt_request && state.transmitter_state == STATE_IDLE {
         select_start_ctcss(config, input, state);
-        apply_pending_ctcss_option(config, state)?;
+        apply_pending_ctcss_option(config, state);
         if config.dcs_transmit_enabled {
             state.dcs_turnoff_remaining_ms = 0;
         }
@@ -808,13 +798,13 @@ fn prepare_transmitter(
         if !input.ctcss_inhibit && state.ctcss_render.enabled == 0 {
             select_start_ctcss(config, input, state);
         }
-        apply_pending_ctcss_option(config, state)?;
+        apply_pending_ctcss_option(config, state);
     } else if !input.external_ptt_request && state.transmitter_state == STATE_ACTIVE {
         if config.dcs_transmit_enabled && config.dcs_turnoff_enabled {
             start_dcs_tail(config, state)?;
         } else if state.ctcss_render.enabled != 0 && !input.ctcss_inhibit {
             if config.tone_off_mode == ToneOffMode::None || !ctcss_transmit_enabled(config) {
-                apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE)?;
+                apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE);
                 start_finishing(state, false)?;
             } else if config.tone_off_mode == ToneOffMode::ToneRemove {
                 start_no_tone(config, state)?;
@@ -822,7 +812,7 @@ fn prepare_transmitter(
                 start_ctcss_tail(config, state)?;
             }
         } else {
-            apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE)?;
+            apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE);
             start_finishing(state, false)?;
         }
     } else if state.transmitter_state == STATE_TOC {
@@ -834,14 +824,14 @@ fn prepare_transmitter(
             state.turnoff_phase = TurnoffPhase::None;
             state.turnoff_remaining_frames = 0;
             state.ctcss_legacy_remaining_frames = 0;
-            apply_ctcss_option(config, state, ctcss_render_state::OPTION_START)?;
+            apply_ctcss_option(config, state, ctcss_render_state::OPTION_START);
             state.signal_mode.smode_timer_ms = config.signal_mode.hold_ms;
         }
     }
     // Inhibit is live control, not a PTT-edge-only option. Re-enable above
     // selects the same source without restarting PTT or adding another timer.
     if input.ctcss_inhibit {
-        apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE)?;
+        apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE);
     }
     Ok(())
 }
@@ -870,7 +860,7 @@ fn advance_render_timeline(
                     state.ctcss_render.turnoff_remaining_ms =
                         remaining_milliseconds(state.ctcss_legacy_remaining_frames);
                     if state.turnoff_remaining_frames == 0 {
-                        apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE)?;
+                        apply_ctcss_option(config, state, ctcss_render_state::OPTION_DISABLE);
                         state.turnoff_phase = TurnoffPhase::CtcssGap;
                         state.turnoff_remaining_frames = LEGACY_SIGNAL_INTERVAL_FRAMES;
                     }

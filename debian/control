@@ -2,22 +2,22 @@ Source: librptadvradio
 Section: libs
 Priority: optional
 Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
-Build-Depends: cargo (>= 1.85), debhelper-compat (= 13), librptadvctcss-dev (>= 0.1.0~alpha2-1), librptadvdcs-dev (>= 0.1.0~alpha1-1), librptadvsquelch-dev (>= 0.1.0~alpha2-1), pkg-config, rustc (>= 1.85)
+Build-Depends: cargo (>= 1.87), debhelper-compat (= 13), librptadvctcss-dev (>= 0.1.0~alpha2-1), librptadvdcs-dev (>= 0.1.0~alpha1-1), librptadvsquelch-dev (>= 0.1.0~alpha2-1), librptadv-samplerate-adapter-dev (>= 0.2.0~alpha2-1), pkg-config, rustc (>= 1.87)
 Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/librptadvradio
 Rules-Requires-Root: no
 
-Package: librptadvradio4
+Package: librptadvradio5
 Architecture: any
 Multi-Arch: same
-Depends: ${misc:Depends}, ${shlibs:Depends}, librptadvctcss2 (>= 0.1.0~alpha2-1), librptadvdcs1 (>= 0.1.0~alpha1-1), librptadvsquelch2 (>= 0.1.0~alpha2-1)
+Depends: ${misc:Depends}, ${shlibs:Depends}, librptadvctcss2 (>= 0.1.0~alpha2-1), librptadvdcs1 (>= 0.1.0~alpha1-1), librptadvsquelch2 (>= 0.1.0~alpha2-1), librptadv-samplerate-adapter2 (>= 0.2.0~alpha2-1)
 Description: portable f32 radio core for rpt_advanced
  Versioned Asterisk-free native radio-core ABI used by rpt_advanced adapters.
 
 Package: librptadvradio-dev
 Architecture: any
 Multi-Arch: same
-Depends: ${misc:Depends}, librptadvradio4 (= ${binary:Version})
+Depends: ${misc:Depends}, librptadvradio5 (= ${binary:Version})
 Description: development files for the rpt_advanced radio core
  Public C header and pkg-config metadata for dynamic consumers of the
  portable native radio-core ABI.

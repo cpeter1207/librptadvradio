@@ -7,13 +7,14 @@
 //! isolated lets a caller retain its established C path if this append-only
 //! descriptor member is unavailable or rejects a snapshot.
 
+#[cfg(test)]
 use std::ffi::c_int;
 #[cfg(test)]
 use std::ptr::NonNull;
 
+use crate::timer;
 #[cfg(test)]
-use crate::RADIO_OK;
-use crate::{RADIO_INVALID_ARGUMENT, timer};
+use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
 
 /// Legacy transmitter state while the final output drain is in progress.
 pub const STATE_FINISHING: i32 = 4;
@@ -53,11 +54,18 @@ pub struct TxFinishState {
     pub tx_state: i32,
 }
 
+#[cfg(test)]
 pub(crate) fn advance(input: &TxFinishInput, state: &mut TxFinishState) -> Result<(), c_int> {
     if input.elapsed_ms < 0 {
         return Err(RADIO_INVALID_ARGUMENT);
     }
 
+    advance_validated(input, state);
+    Ok(())
+}
+
+/// Enter finishing with nonnegative elapsed time established by the owner.
+pub(crate) fn advance_validated(input: &TxFinishInput, state: &mut TxFinishState) {
     // Copy before changing the caller-owned ABI storage.  Although this entry
     // overwrites every state field, the copy keeps the FFI transaction rule
     // explicit and protects it if validation expands with a future ABI tail.
@@ -72,7 +80,6 @@ pub(crate) fn advance(input: &TxFinishInput, state: &mut TxFinishState) -> Resul
     }
 
     *state = next;
-    Ok(())
 }
 
 /// Advance one already-entered historical transmitter finishing drain.

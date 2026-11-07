@@ -5,13 +5,13 @@
 //! has no PCM, device, or renderer ownership, so it can move independently
 //! while the C caller retains the exact early-return behavior.
 
+#[cfg(test)]
 use std::ffi::c_int;
 #[cfg(test)]
 use std::ptr::NonNull;
 
-use crate::RADIO_INVALID_ARGUMENT;
 #[cfg(test)]
-use crate::RADIO_OK;
+use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
 
 /// Immutable transmitter activity snapshot for one CPU-saver update.
 #[repr(C)]
@@ -35,11 +35,18 @@ pub struct TxCpuSaverState {
     pub halted: u32,
 }
 
+#[cfg(test)]
 pub(crate) fn advance(input: &TxCpuSaverInput, state: &mut TxCpuSaverState) -> Result<(), c_int> {
     if input.enabled > 1 || input.tx_ptt_in > 1 || input.tx_ptt_out > 1 || input.tx_idle > 1 {
         return Err(RADIO_INVALID_ARGUMENT);
     }
 
+    advance_validated(input, state);
+    Ok(())
+}
+
+/// Apply already-normalized boolean activity to the owned halt state.
+pub(crate) fn advance_validated(input: &TxCpuSaverInput, state: &mut TxCpuSaverState) {
     // This is algebraically identical to the historical two-branch update:
     // halt only while saving is enabled and every transmit activity indicator
     // is inactive; otherwise clear an existing halt.
@@ -52,7 +59,6 @@ pub(crate) fn advance(input: &TxCpuSaverInput, state: &mut TxCpuSaverState) -> R
         ),
     };
     *state = next;
-    Ok(())
 }
 
 /// C ABI entry for one legacy transmitter CPU-saver state transition.

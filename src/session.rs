@@ -20,7 +20,7 @@ use crate::{
 
 pub(crate) const NATIVE_SAMPLE_RATE_HZ: u32 = 48_000;
 pub(crate) const CANONICAL_CHANNELS: u32 = 2;
-pub(crate) const ABI_VERSION: u32 = 4;
+pub(crate) const ABI_VERSION: u32 = 5;
 pub(crate) const OK: c_int = 0;
 pub(crate) const INVALID_ARGUMENT: c_int = -1;
 pub(crate) const PROVIDER_FAILED: c_int = -2;
@@ -30,6 +30,8 @@ pub(crate) const NOT_READY: c_int = -5;
 pub(crate) const BUSY: c_int = -6;
 
 const EVENT_CAPACITY: usize = 64;
+/// Minimum native speech lookback using the existing audible delay storage.
+const VAD_PREROLL_FRAMES: u32 = 7680;
 const MAX_SIGNED_PCM_LEVEL: u32 = i16::MAX as u32;
 const VALID_CTCSS_TONE_MASK: u64 = (1_u64 << ctcss_client::TONE_COUNT) - 1;
 
@@ -132,7 +134,7 @@ impl Default for ProgramRingResult {
 
 /// Immutable native receive-detector configuration.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct ReceiveConfig {
     pub(crate) noise_filter_profile: u32,
     pub(crate) squelch_open_level: u32,
@@ -148,6 +150,33 @@ pub(crate) struct ReceiveConfig {
     pub(crate) dcs_inverted: u32,
     pub(crate) cpu_saver_enabled: u32,
     pub(crate) native_squelch_delay_frames: u32,
+    pub(crate) vad_mode: u32,
+    pub(crate) vad_hang_ms: u32,
+    pub(crate) vad_external_delay: u32,
+}
+
+impl Default for ReceiveConfig {
+    fn default() -> Self {
+        Self {
+            noise_filter_profile: 0,
+            squelch_open_level: 0,
+            squelch_hysteresis: 0,
+            ctcss_decoder_gain: 0.0,
+            vox_threshold: 0,
+            vox_hang_ms: 0,
+            ctcss_enabled: 0,
+            ctcss_tone_mask: 0,
+            ctcss_relax: 0,
+            dcs_enabled: 0,
+            dcs_code: 0,
+            dcs_inverted: 0,
+            cpu_saver_enabled: 0,
+            native_squelch_delay_frames: 0,
+            vad_mode: 0,
+            vad_hang_ms: 1000,
+            vad_external_delay: 0,
+        }
+    }
 }
 
 /// Immutable receiver source and qualification policy.
@@ -367,6 +396,13 @@ pub(crate) struct ReceiveResult {
     pub(crate) output_rms: f32,
     pub(crate) output_rail_samples: u64,
     pub(crate) periodic_status_due: u32,
+    pub(crate) raw_receiver_keyed: u32,
+    pub(crate) rf_burst_id: u64,
+    pub(crate) vad_mode: u32,
+    pub(crate) vad_voice_active: u32,
+    pub(crate) vad_score: f32,
+    pub(crate) vad_voice_sample_index: u64,
+    pub(crate) vad_preroll_frames: u32,
 }
 
 /// Immediate result of one transmit callback.
@@ -446,6 +482,13 @@ pub(crate) struct Snapshot {
     pub(crate) ctcss_decoded_index: i32,
     pub(crate) dcs_valid: u32,
     pub(crate) program_ring: RingObservation,
+    pub(crate) raw_receiver_keyed: u32,
+    pub(crate) rf_burst_id: u64,
+    pub(crate) vad_mode: u32,
+    pub(crate) vad_voice_active: u32,
+    pub(crate) vad_score: f32,
+    pub(crate) vad_voice_sample_index: u64,
+    pub(crate) vad_preroll_frames: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -465,6 +508,8 @@ struct ReceiveWorker {
     ports: Ports,
     config: ReceiveConfig,
     detector: receive_path::ReceivePath,
+    vad: crate::vad::SpeechVad,
+    vad_needs_reset: bool,
     qualification: receive_qualification::Config,
     qualification_state: receive_qualification::State,
     cpu_saver_enabled: bool,
@@ -486,6 +531,8 @@ struct ReceiveWorker {
     input_mono: Vec<f32>,
     delay: Vec<f32>,
     delay_index: usize,
+    delay_valid: usize,
+    vad_mode: u32,
     work_a: Vec<f32>,
     work_b: Vec<f32>,
     work_c: Vec<f32>,
@@ -586,11 +633,25 @@ struct AtomicSnapshot {
     ring_underruns: AtomicU64,
     ring_overruns: AtomicU64,
     ring_concealment: AtomicU64,
+    raw_receiver_keyed: AtomicBool,
+    rf_burst_id: AtomicU64,
+    vad_mode: AtomicU32,
+    vad_voice_active: AtomicBool,
+    vad_score: AtomicU32,
+    vad_voice_sample_index: AtomicU64,
+    vad_preroll_frames: AtomicU32,
 }
 
 impl Default for AtomicSnapshot {
     fn default() -> Self {
         Self {
+            raw_receiver_keyed: AtomicBool::new(false),
+            rf_burst_id: AtomicU64::new(0),
+            vad_mode: AtomicU32::new(0),
+            vad_voice_active: AtomicBool::new(false),
+            vad_score: AtomicU32::new(0),
+            vad_voice_sample_index: AtomicU64::new(u64::MAX),
+            vad_preroll_frames: AtomicU32::new(0),
             receive_frames: AtomicU64::new(0),
             transmit_frames: AtomicU64::new(0),
             receive_input_peak: AtomicU32::new(0),
@@ -779,10 +840,25 @@ pub(crate) unsafe extern "C" fn apply_receive_update(
     } else {
         std::mem::swap(&mut live.detector, &mut next.detector);
     }
-    if live.delay.len() != next.delay.len() {
+    if !live.vad.settings_equal(&next.vad) {
+        next.vad.inherit_burst_id(&live.vad);
+        std::mem::swap(&mut live.vad, &mut next.vad);
+        live.vad_needs_reset = false;
+        live.delay_valid = 0;
+        live.delay_index = 0;
+    } else if live.qualification != next.qualification
+        || live.receive_channel != next.receive_channel
+        || (live.input_gain == 0.0) != (next.input_gain == 0.0)
+        || live.config.vad_external_delay != next.config.vad_external_delay
+    {
+        live.vad_needs_reset = true;
+    }
+    if live.delay.len() != next.delay.len() || (old.vad_mode == 0) != (new.vad_mode == 0) {
         std::mem::swap(&mut live.delay, &mut next.delay);
         live.delay_index = 0;
+        live.delay_valid = 0;
     }
+    live.vad_mode = next.vad_mode;
     live.ports = next.ports;
     live.config = new;
     live.qualification = next.qualification;
@@ -1159,6 +1235,30 @@ fn initialize_profile(session: &mut Session, profile: crate::profile::ValidatedP
     }
 }
 
+/// Without a configured RF gate that can close a burst, use speech plus hang.
+fn effective_vad_mode(
+    config: &ReceiveConfig,
+    qualification: &receive_qualification::Config,
+) -> u32 {
+    use receive_qualification::{CarrierSource, SubaudibleSource};
+    let carrier = !matches!(
+        qualification.carrier_source,
+        CarrierSource::Ignore | CarrierSource::Open
+    );
+    let tone = !qualification.subaudible_override
+        && match qualification.subaudible_source {
+            SubaudibleSource::Ignore | SubaudibleSource::Dsp => {
+                config.ctcss_enabled != 0 || config.dcs_enabled != 0
+            }
+            _ => true,
+        };
+    if config.vad_mode == 1 && !carrier && !tone {
+        2
+    } else {
+        config.vad_mode
+    }
+}
+
 /// Create and preallocate one runtime with immutable stream geometry and identity.
 pub(crate) unsafe extern "C" fn create(
     config: *const SessionConfig,
@@ -1175,6 +1275,12 @@ pub(crate) unsafe extern "C" fn create(
         || ports.struct_size < size_of::<SessionPorts>() as u32
         || config.abi_version != ABI_VERSION
         || config.maximum_receive_frame_count == 0
+        || config.receive.vad_mode > 2
+        || config.receive.vad_hang_ms > 32767
+        || config.receive.vad_external_delay > 1
+        || (config.receive.vad_external_delay != 0
+            && config.receive.native_squelch_delay_frames != 0)
+        || (config.receive.vad_mode != 0 && config.maximum_receive_frame_count > 4096)
         || config.maximum_transmit_frame_count == 0
         || config.publication_interval_ms == 0
         || config.receive_channel >= CANONICAL_CHANNELS
@@ -1220,6 +1326,19 @@ pub(crate) unsafe extern "C" fn create(
     };
     let publication_frames = u64::from(config.publication_interval_ms) * 48;
     let rx_max = config.maximum_receive_frame_count as usize;
+    let vad_mode = effective_vad_mode(&config.receive, &qualification);
+    let delay_frames = if vad_mode != 0 && config.receive.vad_external_delay == 0 {
+        config
+            .receive
+            .native_squelch_delay_frames
+            .max(VAD_PREROLL_FRAMES)
+    } else {
+        config.receive.native_squelch_delay_frames
+    };
+    let vad = match crate::vad::SpeechVad::new(vad_mode, config.receive.vad_hang_ms, rx_max) {
+        Ok(vad) => vad,
+        Err(error) => return error,
+    };
     let tx_max = config.maximum_transmit_frame_count as usize;
     let mut dcs = match dcs_client::Transmit::new() {
         Ok(handle) => handle,
@@ -1255,6 +1374,8 @@ pub(crate) unsafe extern "C" fn create(
             ports: processor_ports,
             config: config.receive,
             detector,
+            vad,
+            vad_needs_reset: false,
             qualification,
             qualification_state: receive_qualification::State::default(),
             cpu_saver_enabled: receive_cpu_saver,
@@ -1277,8 +1398,10 @@ pub(crate) unsafe extern "C" fn create(
             previous_ctcss: -1,
             previous_dcs: false,
             input_mono: vec![0.0; rx_max],
-            delay: vec![0.0; config.receive.native_squelch_delay_frames as usize],
+            delay: vec![0.0; delay_frames as usize],
             delay_index: 0,
+            delay_valid: 0,
+            vad_mode,
             work_a: vec![0.0; rx_max],
             work_b: vec![0.0; rx_max],
             work_c: vec![0.0; rx_max],
@@ -1591,6 +1714,17 @@ fn provider_failure(session: &Session, receive: bool, sample_index: u64) {
     );
 }
 
+/// Schedule fresh speech analysis and discard delayed PCM after an RX provider failure.
+fn receive_provider_failure(session: &Session, worker: &mut ReceiveWorker) -> c_int {
+    if worker.vad_mode != 0 {
+        worker.vad_needs_reset = true;
+        worker.delay_valid = 0;
+        worker.delay_index = 0;
+    }
+    provider_failure(session, true, worker.sample_index);
+    PROVIDER_FAILED
+}
+
 /// Consume exactly one variable-size native capture span.
 pub(crate) unsafe extern "C" fn receive(
     session: *mut Session,
@@ -1726,13 +1860,22 @@ unsafe fn receive_inner(
     if duration > 0 {
         worker.detector.arm_receive_blanking(duration);
     }
+    let mut qualification = worker.qualification;
+    if worker.vad_mode != 0 {
+        if qualification.carrier_source == receive_qualification::CarrierSource::Ignore {
+            qualification.carrier_source = receive_qualification::CarrierSource::Open;
+        }
+        if !snapshots_valid || worker.input_gain == 0.0 {
+            qualification.carrier_source = receive_qualification::CarrierSource::Ignore;
+        }
+    }
     // Count and finite PCM were checked above; detector state is session-owned.
     let detected = worker
         .detector
         .process_with_carrier(
             input,
             receive_qualification::external_carrier(
-                worker.qualification.carrier_source,
+                qualification.carrier_source,
                 controls.hardware_carrier != 0,
                 controls.parallel_carrier != 0,
                 external_cor,
@@ -1747,13 +1890,12 @@ unsafe fn receive_inner(
         receive_qualification::SignalMode::None
     };
     let tx_ptt = session.shared.logical_ptt.load(Ordering::Acquire);
-    let mut qualification = worker.qualification;
     qualification.subaudible_override |= controls.subaudible_override & RECEIVE_TONE_OVERRIDE != 0;
     if !snapshots_valid {
         qualification.carrier_source = receive_qualification::CarrierSource::Ignore;
         qualification.subaudible_override = false;
     }
-    let qualified = receive_qualification::advance(
+    let mut qualified = receive_qualification::advance(
         &qualification,
         &receive_qualification::Inputs {
             external_carrier: external_cor,
@@ -1789,45 +1931,117 @@ unsafe fn receive_inner(
         .detector
         .set_voice_processing_active(worker.cpu_saver_state.halted == 0);
 
-    for (index, sample) in worker.input_mono[..count].iter_mut().enumerate() {
-        let captured = input[index * 2 + worker.receive_channel];
-        if worker.delay.is_empty() {
-            *sample = captured;
-        } else {
-            *sample = worker.delay[worker.delay_index];
-            worker.delay[worker.delay_index] = captured;
-            worker.delay_index += 1;
-            if worker.delay_index == worker.delay.len() {
-                worker.delay_index = 0;
+    let raw_receiver_keyed = qualified.rx_keyed;
+    let mut speech = crate::vad::Decision::default();
+    if worker.vad_mode == 0 {
+        for (index, sample) in worker.input_mono[..count].iter_mut().enumerate() {
+            let captured = input[index * 2 + worker.receive_channel];
+            if worker.delay.is_empty() {
+                *sample = captured;
+            } else {
+                *sample = worker.delay[worker.delay_index];
+                worker.delay[worker.delay_index] = captured;
+                worker.delay_index += 1;
+                if worker.delay_index == worker.delay.len() {
+                    worker.delay_index = 0;
+                }
             }
         }
-    }
-    if unsafe {
-        run_processor(
-            worker.ports.receive_deemphasis,
-            &worker.input_mono[..count],
-            &mut worker.work_a[..count],
-        )
-    }
-    .is_err()
-    {
-        provider_failure(session, true, worker.sample_index);
-        return PROVIDER_FAILED;
-    }
-    if worker.per_sample_noise_gate {
-        for (sample, gate) in worker.work_a[..count]
-            .iter_mut()
-            .zip(worker.detector.carrier_gates())
+        if unsafe {
+            run_processor(
+                worker.ports.receive_deemphasis,
+                &worker.input_mono[..count],
+                &mut worker.work_a[..count],
+            )
+        }
+        .is_err()
         {
-            if *gate == 0 {
-                *sample = 0.0;
-            }
+            return receive_provider_failure(session, worker);
         }
-    } else if !qualified.carrier_active {
-        worker.work_a[..count].fill(0.0);
-    }
-    for sample in &mut worker.work_a[..count] {
-        *sample *= worker.input_gain;
+        if worker.per_sample_noise_gate {
+            for (sample, gate) in worker.work_a[..count]
+                .iter_mut()
+                .zip(worker.detector.carrier_gates())
+            {
+                if *gate == 0 {
+                    *sample = 0.0;
+                }
+            }
+        } else if !qualified.carrier_active {
+            worker.work_a[..count].fill(0.0);
+        }
+        for sample in &mut worker.work_a[..count] {
+            *sample *= worker.input_gain;
+        }
+    } else {
+        if worker.vad_needs_reset {
+            if worker.vad.reset().is_err() {
+                return receive_provider_failure(session, worker);
+            }
+            worker.vad_needs_reset = false;
+            worker.delay_valid = 0;
+            worker.delay_index = 0;
+        }
+        for (index, sample) in worker.input_mono[..count].iter_mut().enumerate() {
+            *sample = input[index * 2 + worker.receive_channel];
+        }
+        if unsafe {
+            run_processor(
+                worker.ports.receive_deemphasis,
+                &worker.input_mono[..count],
+                &mut worker.work_a[..count],
+            )
+        }
+        .is_err()
+        {
+            return receive_provider_failure(session, worker);
+        }
+        if worker.per_sample_noise_gate {
+            for (sample, gate) in worker.work_a[..count]
+                .iter_mut()
+                .zip(worker.detector.carrier_gates())
+            {
+                if *gate == 0 {
+                    *sample = 0.0;
+                }
+            }
+        } else if !qualified.carrier_active {
+            worker.work_a[..count].fill(0.0);
+        }
+        speech = match worker.vad.process(
+            &worker.work_a[..count],
+            raw_receiver_keyed,
+            worker.sample_index,
+        ) {
+            Ok(decision) => decision,
+            Err(_) => {
+                return receive_provider_failure(session, worker);
+            }
+        };
+        if !raw_receiver_keyed {
+            worker.delay_valid = 0;
+            worker.delay_index = 0;
+        }
+        for sample in &mut worker.work_a[..count] {
+            let captured = if raw_receiver_keyed { *sample } else { 0.0 };
+            if worker.delay.is_empty() {
+                *sample = captured;
+            } else {
+                let valid = worker.delay_valid == worker.delay.len();
+                let delayed = worker.delay[worker.delay_index];
+                worker.delay[worker.delay_index] = captured;
+                worker.delay_index = (worker.delay_index + 1) % worker.delay.len();
+                if raw_receiver_keyed {
+                    worker.delay_valid = (worker.delay_valid + 1).min(worker.delay.len());
+                }
+                *sample = if valid { delayed } else { 0.0 };
+            }
+            *sample *= worker.input_gain;
+        }
+        qualified.rx_keyed = raw_receiver_keyed && speech.admitted;
+        if worker.config.vad_external_delay == 0 && !qualified.rx_keyed {
+            worker.work_a[..count].fill(0.0);
+        }
     }
     let notched = match unsafe {
         run_receive_filters(
@@ -1841,14 +2055,12 @@ unsafe fn receive_inner(
     } {
         Ok(value) => value,
         Err(_) => {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
     };
-    if worker.cpu_saver_enabled && !qualified.rx_keyed {
+    if worker.cpu_saver_enabled && !raw_receiver_keyed {
         if unsafe { bypass_port(worker.ports.receive_noise_reduction, frame_count) }.is_err() {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
         if notched {
             worker.work_b[..count].copy_from_slice(&worker.work_c[..count]);
@@ -1872,8 +2084,7 @@ unsafe fn receive_inner(
             }
         };
         if noise_result.is_err() {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
         if unsafe {
             run_processor(
@@ -1884,8 +2095,7 @@ unsafe fn receive_inner(
         }
         .is_err()
         {
-            provider_failure(session, true, worker.sample_index);
-            return PROVIDER_FAILED;
+            return receive_provider_failure(session, worker);
         }
     }
     unsafe { ptr::copy_nonoverlapping(worker.work_b.as_ptr(), output, count) };
@@ -1975,6 +2185,38 @@ unsafe fn receive_inner(
         .fetch_add(output_rails, Ordering::Relaxed);
     session
         .snapshot
+        .raw_receiver_keyed
+        .store(raw_receiver_keyed, Ordering::Relaxed);
+    session
+        .snapshot
+        .rf_burst_id
+        .store(speech.rf_burst_id, Ordering::Relaxed);
+    session
+        .snapshot
+        .vad_mode
+        .store(worker.vad_mode, Ordering::Relaxed);
+    session
+        .snapshot
+        .vad_voice_active
+        .store(speech.voice_active, Ordering::Relaxed);
+    session
+        .snapshot
+        .vad_score
+        .store(speech.score.to_bits(), Ordering::Relaxed);
+    session.snapshot.vad_voice_sample_index.store(
+        speech.last_voice_sample_index.unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    session.snapshot.vad_preroll_frames.store(
+        if worker.vad_mode == 0 {
+            0
+        } else {
+            VAD_PREROLL_FRAMES
+        },
+        Ordering::Relaxed,
+    );
+    session
+        .snapshot
         .carrier
         .store(qualified.carrier_active, Ordering::Relaxed);
     session
@@ -1995,6 +2237,17 @@ unsafe fn receive_inner(
         .store(detected.dcs_valid, Ordering::Release);
     unsafe {
         result.write(ReceiveResult {
+            raw_receiver_keyed: u32::from(raw_receiver_keyed),
+            rf_burst_id: speech.rf_burst_id,
+            vad_mode: worker.vad_mode,
+            vad_voice_active: u32::from(speech.voice_active),
+            vad_score: speech.score,
+            vad_voice_sample_index: speech.last_voice_sample_index.unwrap_or(u64::MAX),
+            vad_preroll_frames: if worker.vad_mode == 0 {
+                0
+            } else {
+                VAD_PREROLL_FRAMES
+            },
             generation_id: session.generation_id,
             first_sample_index: first_sample,
             frame_count,
@@ -2487,6 +2740,18 @@ pub(crate) unsafe extern "C" fn snapshot(session: *const Session, output: *mut S
     }
     unsafe {
         output.write(Snapshot {
+            raw_receiver_keyed: u32::from(
+                session.snapshot.raw_receiver_keyed.load(Ordering::Relaxed),
+            ),
+            rf_burst_id: session.snapshot.rf_burst_id.load(Ordering::Relaxed),
+            vad_mode: session.snapshot.vad_mode.load(Ordering::Relaxed),
+            vad_voice_active: u32::from(session.snapshot.vad_voice_active.load(Ordering::Relaxed)),
+            vad_score: f32::from_bits(session.snapshot.vad_score.load(Ordering::Relaxed)),
+            vad_voice_sample_index: session
+                .snapshot
+                .vad_voice_sample_index
+                .load(Ordering::Relaxed),
+            vad_preroll_frames: session.snapshot.vad_preroll_frames.load(Ordering::Relaxed),
             generation_id: session.generation_id,
             receive_frames: session.snapshot.receive_frames.load(Ordering::Acquire),
             transmit_frames: session.snapshot.transmit_frames.load(Ordering::Acquire),
@@ -2600,6 +2865,14 @@ pub(crate) unsafe extern "C" fn destroy(session: *mut Session) {
 mod tests {
     use super::*;
 
+    mod update_rekey {
+        include!("session_update_rekey_tests.rs");
+    }
+
+    mod receive_failure {
+        include!("session_receive_failure_tests.rs");
+    }
+
     struct TestProcessor {
         bias: f32,
         gain: f32,
@@ -2678,6 +2951,298 @@ mod tests {
             },
             ..SessionConfig::default()
         }
+    }
+
+    #[test]
+    fn vad_retains_rf_requirements_and_normalizes_only_disabled_carrier() {
+        for (carrier, tone_source, tone, flags, gain, requested, effective, raw) in [
+            (0, 0, 0, 0, 1.0, 1, 2, 1),
+            (0, 1, 0, 1, 1.0, 1, 2, 1),
+            (8, 0, 0, 0, 1.0, 2, 2, 1),
+            (0, 1, 0, 0, 1.0, 1, 1, 0),
+            (0, 1, 1, 0, 1.0, 1, 1, 1),
+            (3, 0, 0, 0, 1.0, 1, 1, 1),
+            (7, 0, 0, 0, 1.0, 2, 2, 0),
+            (7, 0, 0, 6, 1.0, 2, 2, 1),
+            (0, 0, 0, 0, 0.0, 2, 2, 0),
+        ] {
+            let mut config = valid_config();
+            config.receive.vad_mode = requested;
+            config.receive.vad_external_delay = 1;
+            config.qualification.carrier_source = carrier;
+            config.qualification.subaudible_source = tone_source;
+            config.qualification.subaudible_override = u32::from(flags == 1);
+            config.receive_input_gain = gain;
+            let session = TestSession::prepared(&config, &SessionPorts::default());
+            let input = [0.0; 8];
+            let mut output = [9.0; 4];
+            let controls = ReceiveInput {
+                hardware_carrier: 1,
+                hardware_subaudible: tone,
+                subaudible_override: flags,
+                ..ReceiveInput::default()
+            };
+            let mut result = ReceiveResult::default();
+            assert_eq!(
+                unsafe {
+                    receive(
+                        session.0,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        4,
+                        &controls,
+                        &mut result,
+                    )
+                },
+                OK
+            );
+            assert_eq!(
+                result.raw_receiver_keyed, raw,
+                "carrier={carrier}, tone={tone}"
+            );
+            assert_eq!(result.receiver_keyed, 0);
+            assert_eq!(result.vad_mode, effective);
+            assert_eq!(result.vad_preroll_frames, VAD_PREROLL_FRAMES);
+            assert_eq!(result.vad_voice_sample_index, u64::MAX);
+            assert_eq!(session.snapshot().raw_receiver_keyed, raw);
+            assert_eq!(session.snapshot().vad_mode, effective);
+        }
+    }
+
+    #[test]
+    fn vad_internal_delay_keeps_one_buffer_and_invalidates_old_bursts() {
+        let mut config = valid_config();
+        config.receive.vad_mode = 1;
+        config.receive.native_squelch_delay_frames = 2;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        for _ in 0..1921 {
+            assert_eq!(session.receive(true).0, OK);
+        }
+        let worker = unsafe { &*(*session.0).receive.get() };
+        assert_eq!(worker.delay.len(), VAD_PREROLL_FRAMES as usize);
+        assert_eq!(worker.delay_valid, VAD_PREROLL_FRAMES as usize);
+        assert_eq!(worker.delay[0], 0.25);
+        assert_eq!(session.receive(false).1, [0.0; 4]);
+        let worker = unsafe { &*(*session.0).receive.get() };
+        assert_eq!(worker.delay_valid, 0);
+        assert_eq!(session.receive(true).1, [0.0; 4]);
+        let worker = unsafe { &*(*session.0).receive.get() };
+        assert_eq!(worker.delay_valid, 4);
+        config.receive.native_squelch_delay_frames = VAD_PREROLL_FRAMES + 1;
+        let larger = TestSession::new(&config, &SessionPorts::default());
+        assert_eq!(
+            unsafe { &*(*larger.0).receive.get() }.delay.len(),
+            VAD_PREROLL_FRAMES as usize + 1
+        );
+    }
+
+    #[test]
+    fn vad_uses_deemphasis_once_and_mode_changes_discard_storage_interpretation() {
+        let mut config = valid_config();
+        config.receive.vad_mode = 1;
+        config.receive.native_squelch_delay_frames = VAD_PREROLL_FRAMES;
+        let mut deemp = TestProcessor {
+            gain: 1.0,
+            bias: 0.125,
+            ..TestProcessor::default()
+        };
+        let ports = SessionPorts {
+            receive_deemphasis: test_port(&mut deemp),
+            ..SessionPorts::default()
+        };
+        let session = TestSession::prepared(&config, &ports);
+        deemp.calls = 0;
+        assert_eq!(session.receive(true).0, OK);
+        assert_eq!(deemp.calls, 1);
+        assert_eq!(unsafe { &*(*session.0).receive.get() }.delay[0], 0.375);
+        config.receive.vad_mode = 0;
+        let mut update = ptr::null_mut();
+        assert_eq!(unsafe { prepare_update(&config, &ports, &mut update) }, OK);
+        assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+        assert!(
+            unsafe { &*(*session.0).receive.get() }
+                .delay
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        unsafe { destroy_update(update) };
+    }
+
+    #[test]
+    fn vad_same_configuration_keeps_history_and_changed_settings_rearm() {
+        let mut config = valid_config();
+        config.receive.vad_mode = 1;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let before = session.receive(true).2.rf_burst_id;
+        assert_ne!(before, 0);
+        for changed in [false, true] {
+            if changed {
+                config.receive.vad_hang_ms += 1;
+            }
+            let mut update = ptr::null_mut();
+            assert_eq!(
+                unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+                OK
+            );
+            assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+            unsafe { destroy_update(update) };
+            let after = session.receive(true).2.rf_burst_id;
+            assert_eq!(after, before + u64::from(changed));
+            let worker = unsafe { &*(*session.0).receive.get() };
+            assert_eq!(worker.delay_valid, if changed { 4 } else { 8 });
+        }
+    }
+
+    #[test]
+    fn vad_receive_updates_rearm_channel_disabled_gain_and_delay_owner() {
+        for change in 0..3 {
+            let mut config = valid_config();
+            config.receive.vad_mode = 1;
+            let session = TestSession::prepared(&config, &SessionPorts::default());
+            let original = session.receive(true).2.rf_burst_id;
+            match change {
+                0 => config.receive_channel = 1,
+                1 => config.receive_input_gain = 0.0,
+                _ => config.receive.vad_external_delay = 1,
+            }
+            let mut update = ptr::null_mut();
+            assert_eq!(
+                unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+                OK
+            );
+            assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+            unsafe { destroy_update(update) };
+            let result = session.receive(true).2;
+            assert_eq!(result.raw_receiver_keyed, u32::from(change != 1));
+            assert_eq!(result.receiver_keyed, 0);
+            assert_eq!(result.rf_burst_id, original + u64::from(change != 1));
+            assert_eq!(result.vad_voice_sample_index, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn vad_deemphasis_failure_and_real_noise_squelch_gates_are_preserved() {
+        let mut config = valid_config();
+        config.receive.vad_mode = 1;
+        let mut deemp = TestProcessor::default();
+        let ports = SessionPorts {
+            receive_deemphasis: test_port(&mut deemp),
+            ..SessionPorts::default()
+        };
+        let session = TestSession::prepared(&config, &ports);
+        // SAFETY: The retained port points to the live test-owned processor.
+        unsafe { (*ports.receive_deemphasis.context.cast::<TestProcessor>()).fail = true };
+        assert_eq!(session.receive(true).0, PROVIDER_FAILED);
+        assert_eq!(session.snapshot().provider_failures, 1);
+        // SAFETY: The retained port points to the same live test-owned processor.
+        unsafe { (*ports.receive_deemphasis.context.cast::<TestProcessor>()).fail = false };
+        assert_eq!(session.receive(true).0, OK);
+        config.qualification.carrier_source = 1;
+        config.maximum_receive_frame_count = 960;
+        config.receive.squelch_open_level = 1;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let mut input = [0.0; 1920];
+        let mut output = [0.0; 960];
+        let mut result = ReceiveResult::default();
+        let mut opened = false;
+        for _ in 0..100 {
+            assert_eq!(
+                unsafe {
+                    receive(
+                        session.0,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        960,
+                        &ReceiveInput::default(),
+                        &mut result,
+                    )
+                },
+                OK
+            );
+            opened |= result.raw_receiver_keyed != 0;
+        }
+        assert!(opened);
+        for (index, sample) in input.iter_mut().enumerate() {
+            *sample = if index % 4 < 2 { 0.9 } else { -0.9 };
+        }
+        for _ in 0..100 {
+            assert_eq!(
+                unsafe {
+                    receive(
+                        session.0,
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        960,
+                        &ReceiveInput::default(),
+                        &mut result,
+                    )
+                },
+                OK
+            );
+        }
+        assert_eq!(result.raw_receiver_keyed, 0);
+    }
+
+    #[test]
+    fn vad_provider_failures_leave_setup_empty_and_receive_fail_closed() {
+        use crate::samplerate_client::{TestFailure, with_test_failure};
+        let mut config = valid_config();
+        config.receive.vad_mode = 1;
+        config.receive.vad_external_delay = 1;
+        with_test_failure(TestFailure::Create, || {
+            let mut output = ptr::null_mut();
+            assert_eq!(
+                unsafe { create(&config, &SessionPorts::default(), &mut output) },
+                PROVIDER_FAILED
+            );
+            assert!(output.is_null());
+        });
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        assert_eq!(session.receive(true).0, OK);
+        for failure in [TestFailure::Reset, TestFailure::Process] {
+            let keyed = failure == TestFailure::Process;
+            with_test_failure(failure, || {
+                assert_eq!(session.receive(keyed).0, PROVIDER_FAILED);
+            });
+            assert_eq!(session.receive(keyed).0, OK);
+        }
+        assert_eq!(session.snapshot().provider_failures, 2);
+        config.qualification.carrier_source = 4;
+        let mut update = ptr::null_mut();
+        assert_eq!(
+            unsafe { prepare_update(&config, &SessionPorts::default(), &mut update) },
+            OK
+        );
+        assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+        unsafe { destroy_update(update) };
+        with_test_failure(TestFailure::Reset, || {
+            assert_eq!(session.receive(false).0, PROVIDER_FAILED);
+        });
+        assert_eq!(session.receive(false).0, OK);
+        assert_eq!(session.snapshot().provider_failures, 3);
+    }
+
+    #[test]
+    fn vad_off_preserves_the_existing_positive_receive_setup_bound() {
+        let mut config = valid_config();
+        config.maximum_receive_frame_count = 4097;
+        let session = TestSession::new(&config, &SessionPorts::default());
+        assert_eq!(unsafe { &*(*session.0).receive.get() }.maximum_frames, 4097);
+    }
+
+    #[test]
+    fn vad_pending_keeps_raw_external_pcm_but_does_not_admit_receive() {
+        let mut config = valid_config();
+        config.qualification.carrier_source = 3;
+        config.receive.vad_mode = 1;
+        config.receive.vad_hang_ms = 1000;
+        config.receive.vad_external_delay = 1;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let (status, output, result) = session.receive(true);
+        assert_eq!(status, OK);
+        assert_eq!(result.raw_receiver_keyed, 1);
+        assert_eq!(result.receiver_keyed, 0);
+        assert_eq!(output, [0.25; 4]);
     }
 
     #[test]
@@ -3056,7 +3621,8 @@ mod tests {
         assert_eq!(tail.calls, 1);
         assert_eq!(selected.calls, 1);
 
-        selected.fail = true;
+        // SAFETY: Notch port five retains the live selected test processor.
+        unsafe { (*ports.receive_ctcss_notch[5].context.cast::<TestProcessor>()).fail = true };
         assert_eq!(
             unsafe { run_receive_filters(&ports, 5, false, &input, &mut filtered, &mut notched) },
             Err(PROVIDER_FAILED)
@@ -3658,6 +4224,17 @@ mod tests {
         let edits: &[fn(&mut SessionConfig)] = &[
             |c| c.struct_size = 0,
             |c| c.abi_version = ABI_VERSION - 1,
+            |c| c.receive.vad_mode = 3,
+            |c| c.receive.vad_hang_ms = 32768,
+            |c| c.receive.vad_external_delay = 2,
+            |c| {
+                c.receive.vad_external_delay = 1;
+                c.receive.native_squelch_delay_frames = 1;
+            },
+            |c| {
+                c.receive.vad_mode = 1;
+                c.maximum_receive_frame_count = 4097;
+            },
             |c| c.maximum_receive_frame_count = 0,
             |c| c.maximum_transmit_frame_count = 0,
             |c| c.publication_interval_ms = 0,
@@ -3919,7 +4496,8 @@ mod tests {
                 }
                 let session = TestSession::new(&valid_config(), &ports);
                 assert_eq!(unsafe { warm(session.0) }, PROVIDER_FAILED);
-                processor.fail = false;
+                // SAFETY: This retained port points to the live test-owned processor.
+                unsafe { (*port.context.cast::<TestProcessor>()).fail = false };
                 assert_eq!(unsafe { warm(session.0) }, OK);
             }
         }
@@ -4040,6 +4618,8 @@ mod tests {
             }
         }
         for invalid in 0..6 {
+            // SAFETY: The ring port retains this live test-owned ring for serialized calls.
+            let ring = unsafe { &mut *ports.program_ring.context.cast::<TestRing>() };
             ring.fail = invalid == 0;
             ring.sample = if invalid == 1 { f32::NAN } else { 0.25 };
             ring.result.receiver_keyed = if invalid == 2 { 2 } else { 0 };
@@ -4084,7 +4664,14 @@ mod tests {
         assert_eq!(session.receive(true).1, [0.0, 0.0, 0.25, 0.25]);
         assert_eq!(session.receive(false).1, [0.0; 4]);
         assert_eq!(processor.calls, 2);
-        processor.fail = true;
+        // SAFETY: The retained noise-reduction port points to the live test processor.
+        unsafe {
+            (*ports
+                .receive_noise_reduction
+                .context
+                .cast::<TestProcessor>())
+            .fail = true
+        };
         assert_eq!(session.receive(false).0, PROVIDER_FAILED);
         assert_eq!(session.receive(true).0, PROVIDER_FAILED);
         assert_eq!(session.snapshot().provider_failures, 2);

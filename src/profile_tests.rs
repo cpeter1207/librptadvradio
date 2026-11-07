@@ -615,6 +615,22 @@ fn profiled_external_receive_qualification() {
 }
 
 #[test]
+fn profiled_vad_preserves_raw_external_qualification_and_rejects_stale_snapshots() {
+    let mut c = config();
+    c.receive.vad_mode = 1;
+    let runtime = Runtime::new(&profile(0, 2), &c);
+    for count in [1, 17, 480, 960] {
+        let result = runtime.receive(1, 1, 1, count).result;
+        assert_eq!(result.raw_receiver_keyed, 1);
+        assert_eq!(result.receiver_keyed, 0);
+        assert_eq!(result.vad_preroll_frames, 7680);
+        assert_eq!(runtime.receive(1, 1, 0, count).result.raw_receiver_keyed, 0);
+        assert_eq!(runtime.receive(1, 0, 1, count).result.receiver_keyed, 0);
+        assert_eq!(runtime.receive(0, 1, 1, count).result.receiver_keyed, 0);
+    }
+}
+
+#[test]
 fn profiled_disabled_decode_keeps_carrier_gate() {
     let runtime = Runtime::new(&profile(0, 0), &config());
     assert_eq!(runtime.receive(1, 0, 1, 17).result.receiver_keyed, 1);

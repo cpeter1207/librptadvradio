@@ -1,6 +1,6 @@
 //! Portable whole-session radio engine for rpt_advanced.
 //!
-//! ABI 4 owns independent variable-frame receive and transmit workers at the
+//! ABI 5 owns independent variable-frame receive and transmit workers at the
 //! fixed 48 kHz native rate.  Platform adapters provide only prepared external
 //! processing and program-ring ports plus hardware/control snapshots.
 
@@ -28,6 +28,7 @@ mod receive_profiles;
 mod receive_qualification;
 mod rx_blanking;
 mod rx_cpu_saver;
+mod samplerate_client;
 mod session;
 mod signal_mode;
 mod squelch_client;
@@ -36,6 +37,7 @@ mod transmit_signaling;
 mod tx_complete;
 mod tx_cpu_saver;
 mod tx_finish;
+mod vad;
 
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
@@ -57,7 +59,7 @@ const RADIO_OK: c_int = 0;
 const RADIO_INVALID_ARGUMENT: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.radio-core\0";
 
-/// ABI 4 whole-session function table.
+/// ABI 5 whole-session function table.
 #[repr(C)]
 pub struct RadioDescriptor {
     struct_size: u32,
@@ -158,7 +160,7 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     session_transmit_profiled: session::transmit_profiled,
 };
 
-/// Return the immutable ABI 4 whole-session function table.
+/// Return the immutable ABI 5 whole-session function table.
 #[unsafe(no_mangle)]
 pub extern "C" fn rptadv_radio_descriptor() -> *const RadioDescriptor {
     &DESCRIPTOR
@@ -178,7 +180,7 @@ mod tests {
             descriptor.struct_size as usize,
             size_of::<RadioDescriptor>()
         );
-        assert_eq!(descriptor.abi_version, 4);
+        assert_eq!(descriptor.abi_version, 5);
         assert_eq!(
             unsafe { std::ffi::CStr::from_ptr(descriptor.capability_name) }.to_bytes(),
             b"rptadv.radio-core"

@@ -1,0 +1,43 @@
+{
+  "attribution": "Google Speech Commands dataset, PeteWarden2018, from officialTensorFlow MicroSpeech testdata",
+  "upstream_commit": "4eaa491c1c8dedd9a3baf421968afd0d5b82f6aa",
+  "dataset_license": "CC BY4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "source_repository_license": "TFLM-LICENSE",
+  "dataset_source": "https://www.tensorflow.org/tutorials/audio/simple_audio",
+  "files": [
+    {
+      "file": "yes-48000-s16le.pcm",
+      "sha256": "46173e596860b29db01b4daa9f7ad7cfd2d58d5d9395daa2b2840ba45d3a61ba",
+      "source": {
+        "name": "yes_1000ms.wav",
+        "url": "https://raw.githubusercontent.com/tensorflow/tflite-micro/4eaa491c1c8dedd9a3baf421968afd0d5b82f6aa/tensorflow/lite/micro/examples/micro_speech/testdata/yes_1000ms.wav",
+        "sha256": "b40e137a9d25bbdf135e03fa0f6bff4696d0bfc203aef8bc73b27c9428ba5a92",
+        "bytes": 32044
+      },
+      "conversion": "FFmpeg7.1.5 -ar48000 -ac1 -c:a pcm_s16le -f s16le"
+    },
+    {
+      "file": "no-48000-s16le.pcm",
+      "sha256": "cb21178846f10430c9a5dd2d8a4dbae2842861ec96809cf0704d2f58e6b9c783",
+      "source": {
+        "name": "no_1000ms.wav",
+        "url": "https://raw.githubusercontent.com/tensorflow/tflite-micro/4eaa491c1c8dedd9a3baf421968afd0d5b82f6aa/tensorflow/lite/micro/examples/micro_speech/testdata/no_1000ms.wav",
+        "sha256": "21e2b640385e4a751d480a87ae5a1633a6ff00e838b0e2ad48b22f8034e946d8",
+        "bytes": 32044
+      },
+      "conversion": "FFmpeg7.1.5 -ar48000 -ac1 -c:a pcm_s16le -f s16le"
+    },
+    {
+      "file": "noise-48000-s16le.pcm",
+      "sha256": "4f2202fbfc666f868b568b4ce394548b43544dfd3f6414927d3a93559d57faf5",
+      "source": {
+        "name": "noise_1000ms.wav",
+        "url": "https://raw.githubusercontent.com/tensorflow/tflite-micro/4eaa491c1c8dedd9a3baf421968afd0d5b82f6aa/tensorflow/lite/micro/examples/micro_speech/testdata/noise_1000ms.wav",
+        "sha256": "7f9cbb350f20ea8aafcd43a9386d8490241f9da64da6d3ad624e2aa36fe2029c",
+        "bytes": 32044
+      },
+      "conversion": "FFmpeg7.1.5 -ar48000 -ac1 -c:a pcm_s16le -f s16le"
+    }
+  ]
+}

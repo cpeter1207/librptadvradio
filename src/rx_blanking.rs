@@ -7,13 +7,14 @@
 //! hardware boundary and lets a rejected descriptor call use the exact C
 //! fallback without changing callback ordering.
 
+#[cfg(test)]
 use std::ffi::c_int;
 #[cfg(test)]
 use std::ptr::NonNull;
 
+use crate::timer::FRAMES_PER_MILLISECOND;
 #[cfg(test)]
-use crate::RADIO_OK;
-use crate::{RADIO_INVALID_ARGUMENT, timer::FRAMES_PER_MILLISECOND};
+use crate::{RADIO_INVALID_ARGUMENT, RADIO_OK};
 
 /// Input snapshot for one post-transmit receive-blanking advance.
 #[repr(C)]
@@ -41,11 +42,18 @@ pub struct RxBlankingState {
 ///
 /// The owned native receive path uses this exact arithmetic directly; the
 /// exported compatibility entry below remains the adapter-facing wrapper.
+#[cfg(test)]
 pub(crate) fn advance(input: &RxBlankingInput, state: &mut RxBlankingState) -> Result<(), c_int> {
     if input.elapsed_ms < 0 || state.remaining_ms <= 0 {
         return Err(RADIO_INVALID_ARGUMENT);
     }
 
+    advance_validated(input, state);
+    Ok(())
+}
+
+/// Apply blanking with a positive timer and nonnegative sample-clock elapsed time.
+pub(crate) fn advance_validated(input: &RxBlankingInput, state: &mut RxBlankingState) {
     // The C implementation multiplies only a positive signed-16 timer today,
     // but a u64 intermediate also preserves its comparison semantics for any
     // restored positive value without allowing an arithmetic wrap.
@@ -63,7 +71,6 @@ pub(crate) fn advance(input: &RxBlankingInput, state: &mut RxBlankingState) -> R
         state.remaining_ms - input.elapsed_ms
     };
     *state = next;
-    Ok(())
 }
 
 /// C ABI entry for one post-transmit receive-blanking state transition.
