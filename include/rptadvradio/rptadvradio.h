@@ -8,6 +8,7 @@
  */
 #ifndef RPTADV_RADIO_H
 #define RPTADV_RADIO_H
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
@@ -440,6 +441,18 @@ struct rptadv_radio_profile_transmit_result {
   struct rptadv_radio_prepared_outputs outputs; /**< Released on errors. */
 };
 
+/** @brief Opaque, serially owned prepared speech classifier. */
+struct rptadv_speech_analysis;
+
+/** @brief Shared classifier output on the input source sample clock. */
+struct rptadv_speech_analysis_result {
+  uint32_t struct_size; /**< Caller sets writable size before every call. */
+  uint32_t voice_active; /**< Latest complete analysis score is at least 0.5. */
+  float score; /**< Latest probability; zero before a complete frame. */
+  uint32_t reserved; /**< Always zero. */
+  uint64_t last_voice_source_sample; /**< Last positive position; UINT64_MAX if none. */
+};
+
 /** @brief Immutable whole-session ABI 5 function table. */
 struct rptadv_radio_descriptor {
   uint32_t struct_size; /**< Descriptor size. */
@@ -521,7 +534,34 @@ struct rptadv_radio_descriptor {
       struct rptadv_radio_session *, float *, uint32_t,
       const struct rptadv_radio_transmit_input *,
       struct rptadv_radio_profile_transmit_result *);
+  /** Prepare shared Earshot analysis independently of a radio session.
+   * Source is finite mono F32 at a fixed 8000..192000 Hz. Maximum frames
+   * are 1..4096. Setup prepares storage, model state and analysis-only SRC;
+   * programme PCM, source admission and manual keying belong to the caller.
+   * Failure leaves a valid output handle pointer null. */
+  enum rptadv_radio_result (*speech_analysis_create)(
+      uint32_t source_rate_hz, uint32_t maximum_source_frames,
+      struct rptadv_speech_analysis **out_analysis);
+  /** Analyze a nonempty bounded source span without allocation, locks or I/O.
+   * Input and sized output are valid disjoint storage; one serialized owner
+   * retains the handle and library. Source discontinuity rearms analysis.
+   * Complete frames use 256 analysis samples at 16 kHz; partial calls retain
+   * the latest result. Hangtime and RF/phone admission are not applied here.
+   * Errors clear a valid full output to inactive/zero/no last voice; a short
+   * output prefix is rejected without accessing its unavailable tail. */
+  enum rptadv_radio_result (*speech_analysis_process)(
+      struct rptadv_speech_analysis *, const float *, uint32_t,
+      uint64_t first_source_sample, struct rptadv_speech_analysis_result *);
+  /** Clear classifier/converter history without allocation, retaining setup. */
+  enum rptadv_radio_result (*speech_analysis_reset)(struct rptadv_speech_analysis *);
+  /** Destroy a stopped uniquely owned classifier off audio; null is accepted. */
+  void (*speech_analysis_destroy)(struct rptadv_speech_analysis *);
 };
+
+/** @brief Required readable prefix for optional shared speech-analysis operations. */
+#define RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE \
+  (offsetof(struct rptadv_radio_descriptor, speech_analysis_destroy) + \
+   sizeof(((struct rptadv_radio_descriptor *)0)->speech_analysis_destroy))
 
 /**
  * @brief Return the process-lifetime ABI 5 descriptor.

@@ -4,7 +4,6 @@
  */
 
 #include <assert.h>
-#include <stddef.h>
 #include <string.h>
 
 #include "rptadvradio/rptadvradio.h"
@@ -228,6 +227,22 @@ int main(void)
 	descriptor->session_destroy_update(NULL);
 	descriptor->session_destroy(session);
 	descriptor->session_destroy(NULL);
+
+	struct rptadv_speech_analysis *analysis = NULL;
+	struct rptadv_speech_analysis_result speech = { .struct_size = sizeof(speech) };
+	float silence[128] = { 0 };
+	assert(descriptor->struct_size >= RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE);
+	assert(descriptor->speech_analysis_create(8000, 128, &analysis) == RPTADV_RADIO_OK);
+	assert(analysis != NULL);
+	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) == RPTADV_RADIO_OK);
+	assert(speech.voice_active == 0 && speech.last_voice_source_sample == UINT64_MAX);
+	uint32_t short_speech = sizeof(short_speech);
+	assert(descriptor->speech_analysis_process(analysis, silence, 128, 128,
+	       (struct rptadv_speech_analysis_result *)&short_speech) == RPTADV_RADIO_INVALID_ARGUMENT);
+	assert(short_speech == sizeof(short_speech));
+	assert(descriptor->speech_analysis_reset(analysis) == RPTADV_RADIO_OK);
+	descriptor->speech_analysis_destroy(analysis);
+	descriptor->speech_analysis_destroy(NULL);
 
 	struct rptadv_radio_profile profile = { sizeof(profile), 1, 0, 0, 2 };
 	struct rptadv_radio_profile_capabilities caps = { sizeof(caps), 1, 1, 0, 0 };

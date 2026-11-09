@@ -80,6 +80,7 @@ impl Policy {
 
 /// One serial receive owner with prepared analysis storage; Off has no SRC or NN.
 pub struct SpeechVad {
+    source_rate: u32,
     mode: u32,
     hang_ms: u32,
     maximum_native_frames: usize,
@@ -92,7 +93,18 @@ impl SpeechVad {
     /// Prepare mode 0/1/2 and a 0..32767 ms hang outside the audio callback.
     /// Active analysis accepts at most 4096 native frames; Off retains positive bounds.
     pub fn new(mode: u32, hang_ms: u32, maximum_native_frames: usize) -> Result<Self, i32> {
-        if mode > 2
+        Self::new_source_rate(48000, mode, hang_ms, maximum_native_frames)
+    }
+    /// Prepare the shared classifier on a mono 8..192 kHz source sample clock.
+    /// Only analysis is converted to 16 kHz; programme PCM remains untouched.
+    pub fn new_source_rate(
+        source_rate: u32,
+        mode: u32,
+        hang_ms: u32,
+        maximum_native_frames: usize,
+    ) -> Result<Self, i32> {
+        if !(8000..=192000).contains(&source_rate)
+            || mode > 2
             || hang_ms > 32767
             || maximum_native_frames == 0
             || (mode != 0 && maximum_native_frames > 4096)
@@ -102,19 +114,20 @@ impl SpeechVad {
         let active = if mode == 0 {
             None
         } else {
-            Some(Active::new(maximum_native_frames)?)
+            Some(Active::new(source_rate, maximum_native_frames)?)
         };
         Ok(Self {
+            source_rate,
             mode,
             hang_ms,
             maximum_native_frames,
-            policy: Policy::new(mode, u64::from(hang_ms) * 48),
+            policy: Policy::new(mode, u64::from(hang_ms) * u64::from(source_rate) / 1000),
             active,
             expected_next: None,
             needs_rearm: false,
         })
     }
-    /// Analyze an undelayed finite mono 48 kHz span without changing programme PCM.
+    /// Analyze an undelayed finite mono source span without changing programme PCM.
     /// Raw loss closes immediately; a discontinuous source clock rearms a fresh burst.
     pub fn process(
         &mut self,
@@ -182,8 +195,17 @@ impl SpeechVad {
     }
     /// Whether an update can retain this exact live analysis instance and history.
     pub fn settings_equal(&self, other: &Self) -> bool {
-        (self.mode, self.hang_ms, self.maximum_native_frames)
-            == (other.mode, other.hang_ms, other.maximum_native_frames)
+        (
+            self.source_rate,
+            self.mode,
+            self.hang_ms,
+            self.maximum_native_frames,
+        ) == (
+            other.source_rate,
+            other.mode,
+            other.hang_ms,
+            other.maximum_native_frames,
+        )
     }
 }
 /// Setup-owned converter, fixed neural framer, and reusable clamped analysis copy.
@@ -196,9 +218,9 @@ struct Active {
     origin: u64,
 }
 impl Active {
-    fn new(maximum_frames: usize) -> Result<Self, i32> {
+    fn new(source_rate: u32, maximum_frames: usize) -> Result<Self, i32> {
         let mut active = Self {
-            client: crate::samplerate_client::Client::new(maximum_frames)?,
+            client: crate::samplerate_client::Client::new(source_rate, maximum_frames)?,
             detector: earshot::Detector::default(),
             frame: [0.0; 256],
             used: 0,
@@ -225,7 +247,9 @@ impl Active {
             *output = input.clamp(-1.0, 1.0);
         }
         let mut consumed = 0;
-        for _ in 0..native.len() + 64 {
+        // The lowest supported source rate can produce two analysis samples
+        // per source sample; retain a fixed allowance for the prepared filter.
+        for _ in 0..native.len() * 2 + 64 {
             let step = self
                 .client
                 .process_one(&self.input[consumed..native.len()])?;
@@ -272,6 +296,225 @@ impl Active {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Policy, SpeechVad};
+
+    #[test]
+    fn source_rate_analysis_preserves_source_positions_and_prepared_storage() {
+        for rate in [8000, 16000, 48000, 96000] {
+            let mut vad = SpeechVad::new_source_rate(rate, 2, 1000, 256).unwrap();
+            assert_eq!(vad.policy.hang_frames, u64::from(rate));
+            AUDIO_ALLOCATIONS.with(|count| count.set(0));
+            AUDIO_ACTIVE.with(|active| active.set(true));
+            for block in 0..40 {
+                let first = 1000 + block * 127;
+                let decision = vad.process(&[0.0; 127], true, first).unwrap();
+                assert!(!decision.admitted);
+                assert!(!decision.voice_active);
+                assert!(decision.score.is_finite());
+                assert_eq!(vad.expected_next, Some(first + 127));
+            }
+            vad.reset().unwrap();
+            AUDIO_ACTIVE.with(|active| active.set(false));
+            AUDIO_ALLOCATIONS.with(|count| assert_eq!(count.get(), 0));
+        }
+    }
+
+    #[test]
+    fn source_rate_analysis_rejects_unsupported_source_rates() {
+        for rate in [0, 7999, 192001, u32::MAX] {
+            assert!(matches!(
+                SpeechVad::new_source_rate(rate, 2, 1000, 256),
+                Err(crate::session::INVALID_ARGUMENT)
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_analysis_descriptor_uses_one_prepared_source_classifier() {
+        // SAFETY: The provider descriptor has immutable process lifetime.
+        let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: Setup receives initialized, writable handle storage.
+        assert_eq!(
+            unsafe { (descriptor.speech_analysis_create)(8000, 128, &mut handle) },
+            0
+        );
+        let mut result = crate::speech_analysis::AnalysisResult::default();
+        AUDIO_ALLOCATIONS.with(|count| count.set(0));
+        AUDIO_ACTIVE.with(|active| active.set(true));
+        for first in (0..2560).step_by(128) {
+            // SAFETY: Handle, bounded input and sized result remain alive and disjoint.
+            assert_eq!(
+                unsafe {
+                    (descriptor.speech_analysis_process)(
+                        handle,
+                        [0.0; 128].as_ptr(),
+                        128,
+                        first,
+                        &mut result,
+                    )
+                },
+                0
+            );
+            assert_eq!(result.voice_active, 0);
+            assert!(result.score.is_finite());
+            assert_eq!(result.last_voice_source_sample, u64::MAX);
+        }
+        // SAFETY: Reset is serialized with this handle's processing.
+        assert_eq!(unsafe { (descriptor.speech_analysis_reset)(handle) }, 0);
+        AUDIO_ACTIVE.with(|active| active.set(false));
+        AUDIO_ALLOCATIONS.with(|count| assert_eq!(count.get(), 0));
+        // SAFETY: Processing has stopped; this is the unique owned handle.
+        unsafe { (descriptor.speech_analysis_destroy)(handle) };
+    }
+
+    #[test]
+    fn shared_analysis_descriptor_rejects_invalid_spans_and_clears_results() {
+        use crate::session::{FRAME_COUNT_EXCEEDED, INVALID_ARGUMENT};
+        // SAFETY: The descriptor has immutable process lifetime.
+        let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: Null setup output must be rejected without dereferencing it.
+        assert_eq!(
+            unsafe { (descriptor.speech_analysis_create)(8000, 32, std::ptr::null_mut()) },
+            INVALID_ARGUMENT
+        );
+        // SAFETY: Invalid rate with valid output storage leaves no handle.
+        assert_eq!(
+            unsafe { (descriptor.speech_analysis_create)(0, 32, &mut handle) },
+            INVALID_ARGUMENT
+        );
+        assert!(handle.is_null());
+        // SAFETY: Writable setup output owns the successful prepared handle.
+        assert_eq!(
+            unsafe { (descriptor.speech_analysis_create)(8000, 32, &mut handle) },
+            0
+        );
+        let mut result = crate::speech_analysis::AnalysisResult::default();
+        let oversized = [0.0; 33];
+        let nonfinite = [f32::NAN; 32];
+        let valid = [0.0; 32];
+        for (pointer, count, first, expected) in [
+            (std::ptr::null(), 1, 0, INVALID_ARGUMENT),
+            (valid.as_ptr(), 0, 0, INVALID_ARGUMENT),
+            (oversized.as_ptr(), 33, 0, FRAME_COUNT_EXCEEDED),
+            (nonfinite.as_ptr(), 32, 0, INVALID_ARGUMENT),
+            (valid.as_ptr(), 32, u64::MAX, INVALID_ARGUMENT),
+        ] {
+            result.voice_active = 1;
+            result.score = 1.0;
+            // SAFETY: Each pointer is either valid for the stated test span or rejected before access.
+            assert_eq!(
+                unsafe {
+                    (descriptor.speech_analysis_process)(handle, pointer, count, first, &mut result)
+                },
+                expected
+            );
+            assert_eq!(result.voice_active, 0);
+            assert_eq!(result.score, 0.0);
+            assert_eq!(result.last_voice_source_sample, u64::MAX);
+        }
+        // SAFETY: Null result and null handles are rejected before dereference.
+        assert_eq!(
+            unsafe {
+                (descriptor.speech_analysis_process)(
+                    handle,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe {
+                (descriptor.speech_analysis_process)(
+                    std::ptr::null_mut(),
+                    [0.0].as_ptr(),
+                    1,
+                    0,
+                    &mut result,
+                )
+            },
+            INVALID_ARGUMENT
+        );
+        result.struct_size = 0;
+        // SAFETY: The short prefix is readable and must be rejected before tail access.
+        assert_eq!(
+            unsafe {
+                (descriptor.speech_analysis_process)(handle, [0.0].as_ptr(), 1, 0, &mut result)
+            },
+            INVALID_ARGUMENT
+        );
+        // SAFETY: Null reset/destroy are respectively rejected/accepted without access.
+        assert_eq!(
+            unsafe { (descriptor.speech_analysis_reset)(std::ptr::null_mut()) },
+            INVALID_ARGUMENT
+        );
+        unsafe {
+            (descriptor.speech_analysis_destroy)(std::ptr::null_mut());
+            (descriptor.speech_analysis_destroy)(handle);
+        }
+    }
+
+    #[test]
+    fn shared_analysis_voice_positions_follow_each_source_rate_and_reset() {
+        let speech = pcm(include_bytes!("../tests/fixtures/vad/yes-48000-s16le.pcm"));
+        // SAFETY: The provider descriptor has immutable process lifetime.
+        let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
+        for rate in [8000, 16000, 48000] {
+            // Test-only decimation retains an actual speech fixture; production
+            // analysis uses the prepared samplerate provider, not this copy.
+            let source: Vec<f32> = speech
+                .iter()
+                .step_by((48000 / rate) as usize)
+                .copied()
+                .collect();
+            let mut handle = std::ptr::null_mut();
+            // SAFETY: Setup receives writable unique handle storage.
+            assert_eq!(
+                unsafe { (descriptor.speech_analysis_create)(rate, 256, &mut handle) },
+                0
+            );
+            let mut result = crate::speech_analysis::AnalysisResult::default();
+            let mut first = 1000;
+            for block in source.chunks(127) {
+                // SAFETY: Bounded live source input and sized result are disjoint.
+                assert_eq!(
+                    unsafe {
+                        (descriptor.speech_analysis_process)(
+                            handle,
+                            block.as_ptr(),
+                            block.len() as u32,
+                            first,
+                            &mut result,
+                        )
+                    },
+                    0
+                );
+                first += block.len() as u64;
+            }
+            assert!((1000..first).contains(&result.last_voice_source_sample));
+            // SAFETY: The handle is used by one serial owner throughout.
+            assert_eq!(unsafe { (descriptor.speech_analysis_reset)(handle) }, 0);
+            assert_eq!(
+                unsafe {
+                    (descriptor.speech_analysis_process)(
+                        handle,
+                        [0.0; 32].as_ptr(),
+                        32,
+                        0,
+                        &mut result,
+                    )
+                },
+                0
+            );
+            assert_eq!(result.voice_active, 0);
+            assert_eq!(result.last_voice_source_sample, u64::MAX);
+            // SAFETY: Processing is stopped and ownership is returned once.
+            unsafe { (descriptor.speech_analysis_destroy)(handle) };
+        }
+    }
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     thread_local! {
@@ -646,7 +889,7 @@ mod tests {
     #[test]
     fn invalid_external_analysis_observations_do_not_grant_admission() {
         use crate::session::PROVIDER_FAILED;
-        let mut active = super::Active::new(960).unwrap();
+        let mut active = super::Active::new(48000, 960).unwrap();
         active.origin = 100;
         let mut policy = Policy::new(1, 48000);
         policy.set_raw(true);

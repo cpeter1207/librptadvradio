@@ -28,6 +28,15 @@ their established levels remain independent.
 
 ABI 5 replaces earlier granular migration operations.
 Consumers must validate the descriptor and SONAME before creating a session.
+
+An optional sized ABI 5 descriptor tail provides prepared Earshot speech-analysis
+handles without creating a radio session. Each handle accepts mono source PCM
+at a fixed 8–192 kHz rate and converts only its detector input to 16 kHz. Results
+report instantaneous voice/probability and the last positive input-source sample
+position. Callers retain their own VAD hangtime, manual key state, qualification,
+pre-roll and programme conversion. Check
+`RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE` before using the four operations;
+prepare/destroy off audio and serialize process/reset on the source owner.
 Radio links dynamically to `librptadvsquelch.so.2` for MICOR noise squelch and
 VOX hold timing. Building requires `librptadvsquelch-dev` 0.1.0~alpha2-1 or
 newer, and running requires `librptadvsquelch2` of the same minimum version.
