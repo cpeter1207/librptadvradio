@@ -1,3 +1,11 @@
+librptadvradio (0.1.0~alpha11-1) unstable; urgency=medium
+
+  * Expose prepared shared Earshot analysis through an optional ABI5 tail.
+  * Support source-rate mono analysis while retaining local 48 kHz behavior.
+  * Preserve caller-owned admission, hangtime, keying and programme processing.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Mon, 09 Nov 2026 12:00:00 -0600
+
 librptadvradio (0.1.0~alpha10-1) unstable; urgency=medium
 
   * Add Earshot local receive speech qualification with Off, Kerchunk and On.

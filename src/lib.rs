@@ -31,6 +31,7 @@ mod rx_cpu_saver;
 mod samplerate_client;
 mod session;
 mod signal_mode;
+mod speech_analysis;
 mod squelch_client;
 mod timer;
 mod transmit_signaling;
@@ -133,6 +134,17 @@ pub struct RadioDescriptor {
         *const session::TransmitInput,
         *mut session::ProfileTransmitResult,
     ) -> c_int,
+    speech_analysis_create:
+        unsafe extern "C" fn(u32, u32, *mut *mut speech_analysis::SpeechAnalysis) -> c_int,
+    speech_analysis_process: unsafe extern "C" fn(
+        *mut speech_analysis::SpeechAnalysis,
+        *const f32,
+        u32,
+        u64,
+        *mut speech_analysis::AnalysisResult,
+    ) -> c_int,
+    speech_analysis_reset: unsafe extern "C" fn(*mut speech_analysis::SpeechAnalysis) -> c_int,
+    speech_analysis_destroy: unsafe extern "C" fn(*mut speech_analysis::SpeechAnalysis),
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -158,6 +170,10 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     session_prepare_profiled_update: session::prepare_profiled_update,
     session_receive_profiled: session::receive_profiled,
     session_transmit_profiled: session::transmit_profiled,
+    speech_analysis_create: speech_analysis::create,
+    speech_analysis_process: speech_analysis::process,
+    speech_analysis_reset: speech_analysis::reset,
+    speech_analysis_destroy: speech_analysis::destroy,
 };
 
 /// Return the immutable ABI 5 whole-session function table.

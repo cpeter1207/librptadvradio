@@ -1,4 +1,4 @@
-//! Setup-validated mono 48-to-16 kHz client of released samplerate ABI 2.
+//! Setup-validated mono source-to-16 kHz client of released samplerate ABI 2.
 
 use crate::session::{INVALID_ARGUMENT, PROVIDER_FAILED, UNSUPPORTED};
 use std::{
@@ -51,6 +51,7 @@ unsafe extern "C" {
 /// A serial converter owner with checked and cached callback-safe operations.
 pub struct Client {
     handle: NonNull<Converter>,
+    ratio: f64,
     maximum_frames: usize,
     accepted: u64,
     reset: Reset,
@@ -70,15 +71,22 @@ pub struct Step {
 }
 impl Client {
     /// Validate ABI 2 including live delay metadata and prepare storage off callback.
-    pub fn new(maximum_frames: usize) -> Result<Self, i32> {
+    pub fn new(source_rate: u32, maximum_frames: usize) -> Result<Self, i32> {
         // SAFETY: The linked provider owns an immutable process-lifetime descriptor.
-        unsafe { Self::from_descriptor(rptadv_samplerate_adapter_descriptor(), maximum_frames) }
+        unsafe {
+            Self::from_descriptor(
+                rptadv_samplerate_adapter_descriptor(),
+                source_rate,
+                maximum_frames,
+            )
+        }
     }
     unsafe fn from_descriptor(
         pointer: *const Descriptor,
+        source_rate: u32,
         maximum_frames: usize,
     ) -> Result<Self, i32> {
-        if !(1..=4096).contains(&maximum_frames) {
+        if !(8000..=192000).contains(&source_rate) || !(1..=4096).contains(&maximum_frames) {
             return Err(INVALID_ARGUMENT);
         }
         // SAFETY: A nonnull provider pointer supplies at least the readable ABI prefix.
@@ -115,12 +123,13 @@ impl Client {
         };
         let mut raw = std::ptr::null_mut();
         // SAFETY: The checked callback receives valid setup bounds and an initialized output pointer.
-        if unsafe { create(48000, 16000, maximum_frames as u32, 1, &mut raw) } != 0 {
+        if unsafe { create(source_rate, 16000, maximum_frames as u32, 1, &mut raw) } != 0 {
             return Err(PROVIDER_FAILED);
         }
         let handle = NonNull::new(raw).ok_or(PROVIDER_FAILED)?;
         Ok(Self {
             handle,
+            ratio: 16000.0 / f64::from(source_rate),
             maximum_frames,
             accepted: 0,
             reset,
@@ -162,7 +171,7 @@ impl Client {
                 input.len() as u32,
                 &mut output,
                 1,
-                1.0 / 3.0,
+                self.ratio,
                 &mut consumed,
                 &mut generated,
             )
@@ -288,7 +297,7 @@ mod tests {
     use crate::session::INVALID_ARGUMENT;
     #[test]
     fn real_impulse_tracks_actual_counts_and_native_source_positions() {
-        let mut client = Client::new(960).unwrap();
+        let mut client = Client::new(48000, 960).unwrap();
         let mut input = [0.0; 960];
         input[0] = 1.0;
         let mut consumed = 0;
@@ -336,7 +345,13 @@ mod tests {
     #[test]
     fn invalid_prepared_bounds_are_rejected_before_provider_setup() {
         for maximum in [0, 4097] {
-            assert!(matches!(Client::new(maximum), Err(INVALID_ARGUMENT)));
+            assert!(matches!(Client::new(48000, maximum), Err(INVALID_ARGUMENT)));
+        }
+        for source_rate in [0, 7999, 192001, u32::MAX] {
+            assert!(matches!(
+                Client::new(source_rate, 256),
+                Err(INVALID_ARGUMENT)
+            ));
         }
     }
     use super::{Converter, Descriptor, DescriptorPrefix, Process};
@@ -496,7 +511,7 @@ mod tests {
     fn rejects_short_wrong_and_incomplete_descriptors_before_reading_callbacks() {
         assert!(matches!(
             // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-            unsafe { Client::from_descriptor(ptr::null(), 4) },
+            unsafe { Client::from_descriptor(ptr::null(), 48000, 4) },
             Err(UNSUPPORTED)
         ));
         let prefix = DescriptorPrefix {
@@ -506,7 +521,9 @@ mod tests {
         };
         assert!(matches!(
             // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-            unsafe { Client::from_descriptor((&prefix as *const DescriptorPrefix).cast(), 4) },
+            unsafe {
+                Client::from_descriptor((&prefix as *const DescriptorPrefix).cast(), 48000, 4)
+            },
             Err(UNSUPPORTED)
         ));
         for field in 0..9 {
@@ -524,7 +541,7 @@ mod tests {
             }
             assert!(matches!(
                 // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-                unsafe { Client::from_descriptor(&table, 4) },
+                unsafe { Client::from_descriptor(&table, 48000, 4) },
                 Err(UNSUPPORTED)
             ));
         }
@@ -534,7 +551,7 @@ mod tests {
         FREES.with(|v| v.set(0));
         let table = descriptor();
         // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-        let mut client = unsafe { Client::from_descriptor(&table, 4) }.unwrap();
+        let mut client = unsafe { Client::from_descriptor(&table, 48000, 4) }.unwrap();
         let first = client.process_one(&[0.0; 2]).unwrap();
         assert_eq!(first.consumed, 2);
         assert_eq!(first.sample, Some(0.25));
@@ -569,7 +586,7 @@ mod tests {
             table.create = Some(callback);
             assert!(matches!(
                 // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-                unsafe { Client::from_descriptor(&table, 4) },
+                unsafe { Client::from_descriptor(&table, 48000, 4) },
                 Err(PROVIDER_FAILED)
             ));
         }
@@ -582,18 +599,18 @@ mod tests {
             let mut table = descriptor();
             table.process = Some(callback);
             // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-            let mut client = unsafe { Client::from_descriptor(&table, 4) }.unwrap();
+            let mut client = unsafe { Client::from_descriptor(&table, 48000, 4) }.unwrap();
             assert!(matches!(client.process_one(&[0.0]), Err(PROVIDER_FAILED)));
         }
         let mut table = descriptor();
         table.reset = Some(reset_error);
         // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-        let mut client = unsafe { Client::from_descriptor(&table, 4) }.unwrap();
+        let mut client = unsafe { Client::from_descriptor(&table, 48000, 4) }.unwrap();
         assert!(matches!(client.reset(), Err(PROVIDER_FAILED)));
         table.reset = Some(reset);
         table.input_delay = Some(delay_error);
         // SAFETY: Fixture storage is alive; short prefixes are rejected before tail access.
-        let mut client = unsafe { Client::from_descriptor(&table, 4) }.unwrap();
+        let mut client = unsafe { Client::from_descriptor(&table, 48000, 4) }.unwrap();
         assert!(matches!(client.process_one(&[0.0]), Err(PROVIDER_FAILED)));
     }
 }
