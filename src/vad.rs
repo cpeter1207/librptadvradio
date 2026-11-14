@@ -5,7 +5,7 @@
 pub struct Decision {
     /// Whether the selected speech policy admits this raw-qualified burst.
     pub admitted: bool,
-    /// Latest classifier score is at least 0.5 while raw qualification is open.
+    /// Latest complete frame satisfies the configured consecutive-score qualification.
     pub voice_active: bool,
     /// Latest score, cleared when raw qualification closes.
     pub score: f32,
@@ -22,14 +22,24 @@ struct Policy {
     raw: bool,
     latched: bool,
     score: f32,
+    threshold: f32,
+    onset_frames: u32,
+    positive_frames: u32,
     last_voice: Option<u64>,
     rf_burst_id: u64,
 }
 impl Policy {
+    #[cfg(test)]
     fn new(mode: u32, hang_frames: u64) -> Self {
+        Self::configured(mode, hang_frames, 0.5, 1)
+    }
+    fn configured(mode: u32, hang_frames: u64, threshold: f32, onset_frames: u32) -> Self {
         Self {
             mode,
             hang_frames,
+            threshold,
+            onset_frames,
+            positive_frames: 0,
             raw: false,
             latched: false,
             score: 0.0,
@@ -45,20 +55,28 @@ impl Policy {
         if !raw {
             self.latched = false;
             self.score = 0.0;
+            self.positive_frames = 0;
             self.last_voice = None;
         }
     }
     fn observe(&mut self, score: f32, position: u64) {
         if self.raw {
             self.score = score;
-            if score >= 0.5 {
+            self.positive_frames = if score >= self.threshold {
+                self.positive_frames
+                    .saturating_add(1)
+                    .min(self.onset_frames)
+            } else {
+                0
+            };
+            if self.positive_frames >= self.onset_frames {
                 self.last_voice = Some(position);
                 self.latched = true;
             }
         }
     }
     fn decision(&self, end_exclusive: u64) -> Decision {
-        let voice_active = self.raw && self.score >= 0.5;
+        let voice_active = self.raw && self.positive_frames >= self.onset_frames;
         let held = self.last_voice.is_some_and(|index| {
             end_exclusive.saturating_sub(index.saturating_add(1)) < self.hang_frames
         });
@@ -103,6 +121,21 @@ impl SpeechVad {
         hang_ms: u32,
         maximum_native_frames: usize,
     ) -> Result<Self, i32> {
+        Self::configured(source_rate, mode, hang_ms, maximum_native_frames, 0.5, 1)
+    }
+    /// Prepare per-source classification without changing native radio defaults.
+    /// Positive frames count complete 16-ms classifier frames, not caller spans.
+    pub fn configured(
+        source_rate: u32,
+        mode: u32,
+        hang_ms: u32,
+        maximum_native_frames: usize,
+        threshold: f32,
+        onset_frames: u32,
+    ) -> Result<Self, i32> {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) || onset_frames == 0 {
+            return Err(crate::session::INVALID_ARGUMENT);
+        }
         if !(8000..=192000).contains(&source_rate)
             || mode > 2
             || hang_ms > 32767
@@ -121,7 +154,12 @@ impl SpeechVad {
             mode,
             hang_ms,
             maximum_native_frames,
-            policy: Policy::new(mode, u64::from(hang_ms) * u64::from(source_rate) / 1000),
+            policy: Policy::configured(
+                mode,
+                u64::from(hang_ms) * u64::from(source_rate) / 1000,
+                threshold,
+                onset_frames,
+            ),
             active,
             expected_next: None,
             needs_rearm: false,
@@ -200,11 +238,15 @@ impl SpeechVad {
             self.mode,
             self.hang_ms,
             self.maximum_native_frames,
+            self.policy.threshold.to_bits(),
+            self.policy.onset_frames,
         ) == (
             other.source_rate,
             other.mode,
             other.hang_ms,
             other.maximum_native_frames,
+            other.policy.threshold.to_bits(),
+            other.policy.onset_frames,
         )
     }
 }
@@ -296,6 +338,151 @@ impl Active {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Policy, SpeechVad};
+
+    #[test]
+    fn configured_onset_requires_four_consecutive_threshold_frames() {
+        let mut policy = Policy::configured(2, 0, 0.75, 4);
+        policy.set_raw(true);
+        for (index, score) in [0.74, 0.75, 0.99, 0.749, 0.75, 0.75, 0.75]
+            .into_iter()
+            .enumerate()
+        {
+            policy.observe(score, index as u64);
+            assert!(!policy.decision(index as u64 + 1).voice_active);
+            assert_eq!(policy.last_voice, None);
+        }
+        policy.observe(0.75, 7);
+        assert!(policy.decision(8).voice_active);
+        assert_eq!(policy.last_voice, Some(7));
+        policy.observe(0.9, 8);
+        assert_eq!(policy.last_voice, Some(8));
+        policy.observe(0.74, 9);
+        assert!(!policy.decision(10).voice_active);
+        policy.observe(0.8, 10);
+        assert!(!policy.decision(11).voice_active);
+        policy.set_raw(false);
+        policy.set_raw(true);
+        for index in 11..14 {
+            policy.observe(0.8, index);
+            assert!(!policy.decision(index + 1).voice_active);
+            assert_eq!(policy.last_voice, None);
+        }
+        policy.observe(0.8, 14);
+        assert!(policy.decision(15).voice_active);
+    }
+
+    #[test]
+    fn configured_settings_validate_and_reset_without_changing_radio_defaults() {
+        for (threshold, frames) in [
+            (f32::NAN, 4),
+            (f32::INFINITY, 4),
+            (-0.1, 4),
+            (1.1, 4),
+            (0.75, 0),
+        ] {
+            assert!(SpeechVad::configured(48000, 2, 0, 256, threshold, frames).is_err());
+        }
+        for threshold in [0.0, 1.0] {
+            assert!(SpeechVad::configured(48000, 2, 0, 256, threshold, 1).is_ok());
+        }
+        let default = SpeechVad::new(2, 0, 256).unwrap();
+        assert_eq!(
+            (default.policy.threshold, default.policy.onset_frames),
+            (0.5, 1)
+        );
+        let mut tuned = SpeechVad::configured(48000, 2, 0, 256, 0.75, 4).unwrap();
+        assert!(!default.settings_equal(&tuned));
+        let onset_only = SpeechVad::configured(48000, 2, 0, 256, 0.5, 4).unwrap();
+        assert!(!default.settings_equal(&onset_only));
+        assert!(tuned.settings_equal(&SpeechVad::configured(48000, 2, 0, 256, 0.75, 4).unwrap()));
+        tuned.policy.set_raw(true);
+        for index in 0..3 {
+            tuned.policy.observe(0.9, index);
+        }
+        tuned.reset().unwrap();
+        assert_eq!(
+            (tuned.policy.threshold, tuned.policy.onset_frames),
+            (0.75, 4)
+        );
+        assert_eq!(tuned.policy.positive_frames, 0);
+        tuned.policy.set_raw(true);
+        tuned.policy.observe(0.9, 10);
+        assert!(!tuned.policy.decision(11).voice_active);
+        // The normal discontinuity path also cancels a partly qualified streak.
+        tuned.expected_next = Some(100);
+        tuned.process(&[0.0], true, 200).unwrap();
+        assert_eq!(tuned.policy.positive_frames, 0);
+    }
+
+    #[test]
+    fn configured_onset_counts_complete_analysis_frames_independently_of_partial_calls() {
+        for rate in [8000, 48000] {
+            let mut expected = None;
+            for size in [1, 7, 127] {
+                let silence = vec![0.0; size];
+                let mut positions = Vec::new();
+                for onset in [1, 4] {
+                    // Every finite score qualifies at zero, isolating frame-count
+                    // semantics from changing classifier confidence.
+                    let mut vad = SpeechVad::configured(rate, 2, 0, 127, 0.0, onset).unwrap();
+                    let mut clock = 1000;
+                    let first = loop {
+                        let result = vad.process(&silence, true, clock).unwrap();
+                        clock += size as u64;
+                        if let Some(position) = result.last_voice_sample_index {
+                            break position;
+                        }
+                        assert!(clock < 1000 + u64::from(rate));
+                    };
+                    positions.push(first);
+                }
+                assert_eq!(positions[1] - positions[0], u64::from(rate) * 48 / 1000);
+                if let Some(ref expected) = expected {
+                    assert_eq!(&positions, expected);
+                } else {
+                    expected = Some(positions);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configured_real_speech_preserves_source_positions_and_storage_across_partial_calls() {
+        let speech = pcm(include_bytes!("../tests/fixtures/vad/yes-48000-s16le.pcm"));
+        for scale in [1.0, 0.25] {
+            let source: Vec<_> = speech.iter().map(|sample| sample * scale).collect();
+            let mut expected = None;
+            for size in [7, 127, 960, 4096] {
+                let mut vad = SpeechVad::configured(48000, 2, 0, 4096, 0.75, 4).unwrap();
+                let mut clock = 0;
+                let mut first = None;
+                let mut last = None;
+                AUDIO_ALLOCATIONS.with(|count| count.set(0));
+                AUDIO_ACTIVE.with(|active| active.set(true));
+                for block in source.chunks(size) {
+                    let decision = vad.process(block, true, clock).unwrap();
+                    if let Some(position) = decision.last_voice_sample_index {
+                        first.get_or_insert(position);
+                        last = Some(position);
+                    }
+                    clock += block.len() as u64;
+                }
+                AUDIO_ACTIVE.with(|active| active.set(false));
+                AUDIO_ALLOCATIONS.with(|count| assert_eq!(count.get(), 0));
+                // Detection is measurable, but stricter settings do not promise an
+                // acoustic-onset deadline. The original failed 160-ms hypothesis
+                // and four-setting measurements remain in experimental evidence.
+                assert!(first.is_some(), "scale={scale} size={size}");
+                if let Some(expected) = expected {
+                    // Callback coalescing can hide an intermediate positive frame,
+                    // but final source position is invariant to caller partition.
+                    assert_eq!(last, Some(expected));
+                } else {
+                    expected = last;
+                }
+            }
+        }
+    }
 
     #[test]
     fn source_rate_analysis_preserves_source_positions_and_prepared_storage() {

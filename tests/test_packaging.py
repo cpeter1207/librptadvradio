@@ -12,14 +12,20 @@ ROOT = Path(__file__).resolve().parents[1]
 class PackagingContracts(unittest.TestCase):
     """Reject artifacts that could silently use an incompatible descriptor layout."""
 
+    def test_quality_image_uses_published_samplerate_abi2_pin(self):
+        image = (ROOT / "containers/quality.Dockerfile").read_text()
+        for package in ("librptadv-samplerate-adapter2", "librptadv-samplerate-adapter-dev"):
+            self.assertIn(package + "=0.2.0~alpha3-1", image)
+        self.assertIn("samplerate at `0.2.0~alpha3-1`", (ROOT / "QUALITY.md").read_text())
+
     def test_candidate_version_and_abi_identifiers_match(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
-        self.assertEqual(manifest["package"]["version"], "0.1.0-alpha.11")
+        self.assertEqual(manifest["package"]["version"], "0.1.0-alpha.12")
         self.assertEqual(next(package for package in lock["package"] if package["name"] == manifest["package"]["name"])["version"], manifest["package"]["version"])
         self.assertEqual(manifest["lib"]["crate-type"], ["cdylib"])
         makefile = (ROOT / "Makefile").read_text()
-        self.assertIn("PACKAGE_VERSION ?= 0.1.0-alpha.11", makefile)
+        self.assertIn("PACKAGE_VERSION ?= 0.1.0-alpha.12", makefile)
         self.assertIn("SOVERSION := 5", makefile)
         self.assertIn("libstd-", makefile)
         header = (ROOT / "include/rptadvradio/rptadvradio.h").read_text()
@@ -45,7 +51,7 @@ class PackagingContracts(unittest.TestCase):
         self.assertEqual((ROOT / "debian/librptadvradio5.install").read_text().strip(),
                          "usr/lib/*/librptadvradio.so.5*\nusr/share/doc/librptadvradio5/copyright")
         self.assertTrue((ROOT / "debian/changelog").read_text().startswith(
-            "librptadvradio (0.1.0~alpha11-1)"))
+            "librptadvradio (0.1.0~alpha12-1)"))
 
     def test_released_squelch_is_a_resolved_dynamic_dependency(self):
         subprocess.run(["make", "all"], cwd=ROOT, check=True,

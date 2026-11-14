@@ -27,6 +27,16 @@ _Static_assert(offsetof(struct rptadv_radio_descriptor, session_create_profiled)
                offsetof(struct rptadv_radio_descriptor, session_destroy_update) + sizeof(void (*)(void)),
                "profile operations must be a descriptor tail");
 
+_Static_assert(offsetof(struct rptadv_radio_descriptor, speech_analysis_create_configured) ==
+               RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE,
+               "configured speech must preserve the complete released prefix");
+_Static_assert(sizeof(struct rptadv_speech_analysis_config) == 20,
+               "speech setup uses five scalar fields");
+_Static_assert(sizeof(void *) != 8 ||
+               (RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE == 176 &&
+                sizeof(struct rptadv_radio_descriptor) == 184),
+               "64-bit speech descriptor sizes changed");
+
 struct processor_context {
 	float scale;
 	float bias;
@@ -243,6 +253,16 @@ int main(void)
 	assert(descriptor->speech_analysis_reset(analysis) == RPTADV_RADIO_OK);
 	descriptor->speech_analysis_destroy(analysis);
 	descriptor->speech_analysis_destroy(NULL);
+	struct rptadv_speech_analysis_config speech_config = {
+		.struct_size = sizeof(speech_config), .source_rate_hz = 8000,
+		.maximum_source_frames = 128, .speech_threshold = 0.75F,
+		.speech_onset_frames = 4,
+	};
+	assert(descriptor->struct_size >= RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE);
+	assert(descriptor->speech_analysis_create_configured(&speech_config, &analysis) == RPTADV_RADIO_OK);
+	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) == RPTADV_RADIO_OK);
+	assert(speech.voice_active == 0 && speech.last_voice_source_sample == UINT64_MAX);
+	descriptor->speech_analysis_destroy(analysis);
 
 	struct rptadv_radio_profile profile = { sizeof(profile), 1, 0, 0, 2 };
 	struct rptadv_radio_profile_capabilities caps = { sizeof(caps), 1, 1, 0, 0 };

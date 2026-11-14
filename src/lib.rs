@@ -145,6 +145,10 @@ pub struct RadioDescriptor {
     ) -> c_int,
     speech_analysis_reset: unsafe extern "C" fn(*mut speech_analysis::SpeechAnalysis) -> c_int,
     speech_analysis_destroy: unsafe extern "C" fn(*mut speech_analysis::SpeechAnalysis),
+    speech_analysis_create_configured: unsafe extern "C" fn(
+        *const speech_analysis::AnalysisConfig,
+        *mut *mut speech_analysis::SpeechAnalysis,
+    ) -> c_int,
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -174,6 +178,7 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     speech_analysis_process: speech_analysis::process,
     speech_analysis_reset: speech_analysis::reset,
     speech_analysis_destroy: speech_analysis::destroy,
+    speech_analysis_create_configured: speech_analysis::create_configured,
 };
 
 /// Return the immutable ABI 5 whole-session function table.

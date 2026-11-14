@@ -54,7 +54,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
 		librptadvsquelch2=0.1.0~alpha2-1 librptadvsquelch-dev=0.1.0~alpha2-1 \
 		librptadvctcss2=0.1.0~alpha2-1 librptadvctcss-dev=0.1.0~alpha2-1 \
 		librptadvdcs1=0.1.0~alpha1-1 librptadvdcs-dev=0.1.0~alpha1-1 \
-		librptadv-samplerate-adapter2=0.2.0~alpha2-1 librptadv-samplerate-adapter-dev=0.2.0~alpha2-1 && \
+		librptadv-samplerate-adapter2=0.2.0~alpha3-1 librptadv-samplerate-adapter-dev=0.2.0~alpha3-1 && \
 	rm -rf /var/lib/apt/lists/*
 
 # Real Debian compiler packages satisfy native packaging dependencies; rustup

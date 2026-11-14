@@ -11,12 +11,27 @@ pub struct SpeechAnalysis {
     maximum_frames: u32,
 }
 
+/// Sized per-source setup; caller owns programme retention and hangtime.
+#[repr(C)]
+pub struct AnalysisConfig {
+    /// Readable size of this configuration.
+    pub struct_size: u32,
+    /// Fixed mono source sample rate, 8000 through 192000 Hz.
+    pub source_rate_hz: u32,
+    /// Maximum source frames per call, 1 through 4096.
+    pub maximum_source_frames: u32,
+    /// Finite inclusive speech-score threshold, 0 through 1.
+    pub speech_threshold: f32,
+    /// Positive consecutive complete 256-sample frames required for onset.
+    pub speech_onset_frames: u32,
+}
+
 /// Sized C result; source positions use the input sample clock.
 #[repr(C)]
 pub struct AnalysisResult {
     /// Caller-provided writable size, preserved as the current result size.
     pub struct_size: u32,
-    /// Latest complete analysis frame meets the shared 0.5 speech threshold.
+    /// Latest complete analysis frame satisfies the configured onset qualification.
     pub voice_active: u32,
     /// Latest finite classifier score, zero before a complete frame.
     pub score: f32,
@@ -45,16 +60,48 @@ pub(crate) unsafe extern "C" fn create(
     maximum_source_frames: u32,
     output: *mut *mut SpeechAnalysis,
 ) -> i32 {
+    let config = AnalysisConfig {
+        struct_size: size_of::<AnalysisConfig>() as u32,
+        source_rate_hz,
+        maximum_source_frames,
+        speech_threshold: 0.5,
+        speech_onset_frames: 1,
+    };
+    // SAFETY: Local configuration is complete; caller promises writable output storage.
+    unsafe { create_configured(&config, output) }
+}
+
+/// Prepare configured analysis off audio; retains the legacy descriptor prefix.
+/// A short/null configuration is rejected before accessing its unavailable tail.
+pub(crate) unsafe extern "C" fn create_configured(
+    config: *const AnalysisConfig,
+    output: *mut *mut SpeechAnalysis,
+) -> i32 {
     let Some(output) = NonNull::new(output) else {
         return INVALID_ARGUMENT;
     };
     // SAFETY: Setup promises writable handle storage, initialized on every path.
     unsafe { output.as_ptr().write(ptr::null_mut()) };
-    match SpeechVad::new_source_rate(source_rate_hz, 2, 0, maximum_source_frames as usize) {
+    if config.is_null()
+        // SAFETY: A nonnull configuration promises a readable size prefix.
+        || unsafe { config.cast::<u32>().read() } < size_of::<AnalysisConfig>() as u32
+    {
+        return INVALID_ARGUMENT;
+    }
+    // SAFETY: The checked prefix covers this complete immutable configuration.
+    let config = unsafe { &*config };
+    match SpeechVad::configured(
+        config.source_rate_hz,
+        2,
+        0,
+        config.maximum_source_frames as usize,
+        config.speech_threshold,
+        config.speech_onset_frames,
+    ) {
         Ok(vad) => {
             let handle = Box::new(SpeechAnalysis {
                 vad,
-                maximum_frames: maximum_source_frames,
+                maximum_frames: config.maximum_source_frames,
             });
             // SAFETY: Setup transfers exactly one owned opaque handle.
             unsafe { output.as_ptr().write(Box::into_raw(handle)) };
@@ -126,5 +173,57 @@ pub(crate) unsafe extern "C" fn destroy(handle: *mut SpeechAnalysis) {
     if !handle.is_null() {
         // SAFETY: Ownership was returned exactly once after processing stopped.
         drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_descriptor_validates_sized_setup_and_clears_output() {
+        let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
+        let mut config = AnalysisConfig {
+            struct_size: size_of::<AnalysisConfig>() as u32,
+            source_rate_hz: 8000,
+            maximum_source_frames: 128,
+            speech_threshold: 0.75,
+            speech_onset_frames: 4,
+        };
+        let mut handle = ptr::null_mut();
+        // SAFETY: Local records cover each advertised readable/writable prefix.
+        unsafe {
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(&config, ptr::null_mut()),
+                INVALID_ARGUMENT
+            );
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(ptr::null(), &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert!(handle.is_null());
+            let short = 4_u32;
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(
+                    (&short as *const u32).cast(),
+                    &mut handle
+                ),
+                INVALID_ARGUMENT
+            );
+            config.speech_onset_frames = 0;
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(&config, &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert!(handle.is_null());
+            config.speech_onset_frames = 4;
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(&config, &mut handle),
+                0
+            );
+            assert!(!handle.is_null());
+            (descriptor.speech_analysis_destroy)(handle);
+        }
     }
 }
