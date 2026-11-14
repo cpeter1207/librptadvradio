@@ -12,6 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class PackagingContracts(unittest.TestCase):
     """Reject artifacts that could silently use an incompatible descriptor layout."""
 
+    def test_quality_image_uses_published_samplerate_abi2_pin(self):
+        image = (ROOT / "containers/quality.Dockerfile").read_text()
+        for package in ("librptadv-samplerate-adapter2", "librptadv-samplerate-adapter-dev"):
+            self.assertIn(package + "=0.2.0~alpha3-1", image)
+        self.assertIn("samplerate at `0.2.0~alpha3-1`", (ROOT / "QUALITY.md").read_text())
+
     def test_candidate_version_and_abi_identifiers_match(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
