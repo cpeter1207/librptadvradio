@@ -199,7 +199,7 @@ dist: | build
 		--exclude=debian/librptadvradio5 --exclude=debian/librptadvradio-dev \
 		--exclude='debian/*.substvars' --exclude='debian/*.debhelper.log' \
 		--transform='s|^|$(PACKAGE)-$(PACKAGE_VERSION)/|' -czf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz \
-		.dockerignore AGENTS.md Cargo.lock Cargo.toml COPYING Doxyfile Makefile QUALITY.md README.md \
+		.dockerignore AGENTS.md Cargo.lock Cargo.toml COPYING Doxyfile Makefile QUALITY.md README.md SPEECH_CONFIGURATION.md \
 		rptadvradio.pc.in rust-toolchain.toml containers debian include src tests tools
 
 distcheck: dist
