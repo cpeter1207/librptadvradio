@@ -1,3 +1,11 @@
+librptadvradio (0.1.0~alpha12-1) UNRELEASED; urgency=medium
+
+  * Append per-source score/onset setup to the existing ABI 5 descriptor.
+  * Keep radio and legacy speech defaults at threshold 0.5 and one frame.
+  * Preserve SONAME 5, dynamic providers and caller-owned programme retention.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Sat, 14 Nov 2026 12:00:00 +0000
+
 librptadvradio (0.1.0~alpha11-1) unstable; urgency=medium
 
   * Expose prepared shared Earshot analysis through an optional ABI5 tail.

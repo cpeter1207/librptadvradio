@@ -444,10 +444,19 @@ struct rptadv_radio_profile_transmit_result {
 /** @brief Opaque, serially owned prepared speech classifier. */
 struct rptadv_speech_analysis;
 
+/** @brief Per-source classification; no programme retention or hangtime. */
+struct rptadv_speech_analysis_config {
+  uint32_t struct_size; /**< Caller-provided readable size. */
+  uint32_t source_rate_hz; /**< Fixed mono source rate, 8000..192000 Hz. */
+  uint32_t maximum_source_frames; /**< Maximum nonempty span, 1..4096 frames. */
+  float speech_threshold; /**< Finite inclusive score threshold, 0..1. */
+  uint32_t speech_onset_frames; /**< Positive consecutive 16-ms analysis frames. */
+};
+
 /** @brief Shared classifier output on the input source sample clock. */
 struct rptadv_speech_analysis_result {
   uint32_t struct_size; /**< Caller sets writable size before every call. */
-  uint32_t voice_active; /**< Latest complete analysis score is at least 0.5. */
+  uint32_t voice_active; /**< Latest complete frame satisfies configured onset. */
   float score; /**< Latest probability; zero before a complete frame. */
   uint32_t reserved; /**< Always zero. */
   uint64_t last_voice_source_sample; /**< Last positive position; UINT64_MAX if none. */
@@ -556,12 +565,27 @@ struct rptadv_radio_descriptor {
   enum rptadv_radio_result (*speech_analysis_reset)(struct rptadv_speech_analysis *);
   /** Destroy a stopped uniquely owned classifier off audio; null is accepted. */
   void (*speech_analysis_destroy)(struct rptadv_speech_analysis *);
+  /** Prepare independent per-source threshold/consecutive-frame qualification.
+   * Existing create retains threshold 0.5 and one frame. Count only completed
+   * 256-sample 16-kHz frames; partial calls do not advance onset. A score below
+   * threshold, reset or discontinuity clears the streak. Caller retains sole
+   * ownership of programme pre-roll/hang, sized for its configured onset delay.
+   * Configuration and output storage must be valid and disjoint.
+   * Invalid setup leaves a valid output handle pointer null. */
+  enum rptadv_radio_result (*speech_analysis_create_configured)(
+      const struct rptadv_speech_analysis_config *,
+      struct rptadv_speech_analysis **out_analysis);
 };
 
 /** @brief Required readable prefix for optional shared speech-analysis operations. */
 #define RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE \
   (offsetof(struct rptadv_radio_descriptor, speech_analysis_destroy) + \
    sizeof(((struct rptadv_radio_descriptor *)0)->speech_analysis_destroy))
+
+/** @brief Required prefix for per-source speech configuration. */
+#define RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE \
+  (offsetof(struct rptadv_radio_descriptor, speech_analysis_create_configured) + \
+   sizeof(((struct rptadv_radio_descriptor *)0)->speech_analysis_create_configured))
 
 /**
  * @brief Return the process-lifetime ABI 5 descriptor.
