@@ -27,6 +27,19 @@ impl Default for PreprocessSettings {
     }
 }
 impl PreprocessSettings {
+    /// Decode only the documented overall, bandpass and RNNoise selection bits.
+    pub(crate) fn from_flags(flags: u32, low_hz: f32, high_hz: f32) -> Result<Self, i32> {
+        if flags & !7 != 0 {
+            return Err(crate::session::INVALID_ARGUMENT);
+        }
+        Ok(Self {
+            enabled: flags & 1 != 0,
+            bandpass_enabled: flags & 2 != 0,
+            low_hz,
+            high_hz,
+            rnnoise_enabled: flags & 4 != 0,
+        })
+    }
     /// Reject a selected band outside the actual decoded source bandwidth.
     /// Upsampling for RNNoise does not create frequencies absent from that source.
     pub fn validate(&self, source_rate: u32) -> Result<(), i32> {

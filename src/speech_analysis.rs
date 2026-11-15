@@ -1,7 +1,7 @@
 //! Prepared shared Earshot analysis, independent of radio or phone admission.
 
 use crate::session::{FRAME_COUNT_EXCEEDED, INVALID_ARGUMENT};
-use crate::vad::SpeechVad;
+use crate::vad::{PreprocessSettings, SpeechVad};
 use std::mem::size_of;
 use std::ptr::{self, NonNull};
 
@@ -24,6 +24,12 @@ pub struct AnalysisConfig {
     pub speech_threshold: f32,
     /// Positive consecutive complete 256-sample frames required for onset.
     pub speech_onset_frames: u32,
+    /// Selection bits: 1 overall preprocessing, 2 bandpass, 4 RNNoise; other bits invalid.
+    pub preprocess_flags: u32,
+    /// Lower bandpass edge in Hz; selected filters require 0 < low < high.
+    pub bandpass_low_hz: f32,
+    /// Upper edge, strictly below both source Nyquist and the 48 kHz processing Nyquist.
+    pub bandpass_high_hz: f32,
 }
 
 /// Sized C result; source positions use the input sample clock.
@@ -66,6 +72,9 @@ pub(crate) unsafe extern "C" fn create(
         maximum_source_frames,
         speech_threshold: 0.5,
         speech_onset_frames: 1,
+        preprocess_flags: 0,
+        bandpass_low_hz: 300.0,
+        bandpass_high_hz: 3000.0,
     };
     // SAFETY: Local configuration is complete; caller promises writable output storage.
     unsafe { create_configured(&config, output) }
@@ -90,13 +99,22 @@ pub(crate) unsafe extern "C" fn create_configured(
     }
     // SAFETY: The checked prefix covers this complete immutable configuration.
     let config = unsafe { &*config };
-    match SpeechVad::configured(
+    let preprocessing = match PreprocessSettings::from_flags(
+        config.preprocess_flags,
+        config.bandpass_low_hz,
+        config.bandpass_high_hz,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => return error,
+    };
+    match SpeechVad::preprocessed(
         config.source_rate_hz,
         2,
         0,
         config.maximum_source_frames as usize,
         config.speech_threshold,
         config.speech_onset_frames,
+        preprocessing,
     ) {
         Ok(vad) => {
             let handle = Box::new(SpeechAnalysis {
@@ -156,7 +174,9 @@ pub(crate) unsafe extern "C" fn process(
     }
 }
 
-/// Clear source history without allocation; serial use of a live handle is required.
+/// Retire source history without allocation; serial use of a live handle is required.
+/// Selected preprocessing returns UNSUPPORTED after closing admission and must be
+/// replaced by a newly prepared control-owned generation, not reset in place.
 pub(crate) unsafe extern "C" fn reset(handle: *mut SpeechAnalysis) -> i32 {
     let Some(mut handle) = NonNull::new(handle) else {
         return INVALID_ARGUMENT;
@@ -182,6 +202,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preprocessed_descriptor_checks_capability_configuration_and_retirement() {
+        let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
+        assert_eq!(descriptor.speech_analysis_capabilities & 1, 1);
+        let mut config = AnalysisConfig {
+            struct_size: size_of::<AnalysisConfig>() as u32,
+            source_rate_hz: 8000,
+            maximum_source_frames: 160,
+            speech_threshold: 0.75,
+            speech_onset_frames: 2,
+            preprocess_flags: 7,
+            bandpass_low_hz: 300.0,
+            bandpass_high_hz: 3000.0,
+        };
+        assert_eq!(size_of::<AnalysisConfig>(), 32);
+        let mut handle = ptr::null_mut();
+        // SAFETY: The complete local configuration and output storage are disjoint.
+        unsafe {
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(&config, &mut handle),
+                0
+            );
+            let samples = [0.0; 160];
+            let mut result = AnalysisResult::default();
+            for block in 0..8 {
+                assert_eq!(
+                    (descriptor.speech_analysis_process)(
+                        handle,
+                        samples.as_ptr(),
+                        160,
+                        block * 160,
+                        &mut result
+                    ),
+                    0
+                );
+                assert_eq!(result.voice_active, 0);
+            }
+            // A graph cannot be fully reset in place. Retire without admitting
+            // successor PCM; the caller prepares a replacement outside audio.
+            assert_eq!(
+                (descriptor.speech_analysis_reset)(handle),
+                crate::session::UNSUPPORTED
+            );
+            assert_ne!(
+                (descriptor.speech_analysis_process)(handle, samples.as_ptr(), 160, 0, &mut result),
+                0
+            );
+            assert_eq!(result.last_voice_source_sample, u64::MAX);
+            (descriptor.speech_analysis_destroy)(handle);
+            for flags in [8, u32::MAX] {
+                config.preprocess_flags = flags;
+                handle = ptr::dangling_mut();
+                assert_eq!(
+                    (descriptor.speech_analysis_create_configured)(&config, &mut handle),
+                    INVALID_ARGUMENT
+                );
+                assert!(handle.is_null());
+            }
+            config.preprocess_flags = 7;
+            config.bandpass_high_hz = 4000.0;
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(&config, &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert!(handle.is_null());
+            config.bandpass_high_hz = 3000.0;
+            config.struct_size = 20;
+            assert_eq!(
+                (descriptor.speech_analysis_create_configured)(&config, &mut handle),
+                INVALID_ARGUMENT
+            );
+            assert!(handle.is_null());
+        }
+    }
+
+    #[test]
     fn configured_descriptor_validates_sized_setup_and_clears_output() {
         let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
         let mut config = AnalysisConfig {
@@ -190,6 +285,9 @@ mod tests {
             maximum_source_frames: 128,
             speech_threshold: 0.75,
             speech_onset_frames: 4,
+            preprocess_flags: 0,
+            bandpass_low_hz: 300.0,
+            bandpass_high_hz: 3000.0,
         };
         let mut handle = ptr::null_mut();
         // SAFETY: Local records cover each advertised readable/writable prefix.

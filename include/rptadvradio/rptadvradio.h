@@ -451,7 +451,15 @@ struct rptadv_speech_analysis_config {
   uint32_t maximum_source_frames; /**< Maximum nonempty span, 1..4096 frames. */
   float speech_threshold; /**< Finite inclusive score threshold, 0..1. */
   uint32_t speech_onset_frames; /**< Positive consecutive 16-ms analysis frames. */
+  uint32_t preprocess_flags; /**< RPTADV_SPEECH_PREPROCESS_* selection bits; reject unknown bits. */
+  float bandpass_low_hz; /**< Lower edge; selected band requires 0 < low < high. */
+  float bandpass_high_hz; /**< Strictly below source Nyquist and 24000 Hz. */
 };
+
+#define RPTADV_SPEECH_PREPROCESS_ENABLED 1U /**< Select prepared preprocessing. */
+#define RPTADV_SPEECH_PREPROCESS_BANDPASS 2U /**< Apply the causal twentieth-order bandpass. */
+#define RPTADV_SPEECH_PREPROCESS_RNNOISE 4U /**< Apply the released default RNNoise model. */
+#define RPTADV_RADIO_SPEECH_PREPROCESSING_CAPABILITY UINT64_C(1) /**< Extended source configuration. */
 
 /** @brief Shared classifier output on the input source sample clock. */
 struct rptadv_speech_analysis_result {
@@ -553,7 +561,8 @@ struct rptadv_radio_descriptor {
       struct rptadv_speech_analysis **out_analysis);
   /** Analyze a nonempty bounded source span without allocation, locks or I/O.
    * Input and sized output are valid disjoint storage; one serialized owner
-   * retains the handle and library. Source discontinuity rearms analysis.
+   * retains the handle and library. Discontinuity rearms plain analysis; selected
+   * preprocessing is retired and requires a fresh control-prepared generation.
    * Complete frames use 256 analysis samples at 16 kHz; partial calls retain
    * the latest result. Hangtime and RF/phone admission are not applied here.
    * Errors clear a valid full output to inactive/zero/no last voice; a short
@@ -561,7 +570,9 @@ struct rptadv_radio_descriptor {
   enum rptadv_radio_result (*speech_analysis_process)(
       struct rptadv_speech_analysis *, const float *, uint32_t,
       uint64_t first_source_sample, struct rptadv_speech_analysis_result *);
-  /** Clear classifier/converter history without allocation, retaining setup. */
+  /** Clear plain classifier/converter history without allocation. A selected
+   * preprocessed chain instead closes admission and returns UNSUPPORTED until
+   * replaced off audio; the graph has no full in-place history reset. */
   enum rptadv_radio_result (*speech_analysis_reset)(struct rptadv_speech_analysis *);
   /** Destroy a stopped uniquely owned classifier off audio; null is accepted. */
   void (*speech_analysis_destroy)(struct rptadv_speech_analysis *);
@@ -575,6 +586,12 @@ struct rptadv_radio_descriptor {
   enum rptadv_radio_result (*speech_analysis_create_configured)(
       const struct rptadv_speech_analysis_config *,
       struct rptadv_speech_analysis **out_analysis);
+  /** Checked feature bits. Verify this readable tail and the requested bit before
+   * passing the extended configuration: older providers may ignore unknown bytes.
+   * Preprocessing uses 48 kHz/480-sample blocks before 16 kHz Earshot. Source
+   * positions account for SRC and nominal RNNoise delay, not frequency-dependent
+   * bandpass phase. Programme PCM and caller-owned retention remain unchanged. */
+  uint64_t speech_analysis_capabilities;
 };
 
 /** @brief Required readable prefix for optional shared speech-analysis operations. */
@@ -586,6 +603,11 @@ struct rptadv_radio_descriptor {
 #define RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE \
   (offsetof(struct rptadv_radio_descriptor, speech_analysis_create_configured) + \
    sizeof(((struct rptadv_radio_descriptor *)0)->speech_analysis_create_configured))
+
+/** @brief Required readable prefix before inspecting preprocessing capabilities. */
+#define RPTADV_RADIO_DESCRIPTOR_PREPROCESSED_SPEECH_MIN_SIZE \
+  (offsetof(struct rptadv_radio_descriptor, speech_analysis_capabilities) + \
+   sizeof(((struct rptadv_radio_descriptor *)0)->speech_analysis_capabilities))
 
 /**
  * @brief Return the process-lifetime ABI 5 descriptor.

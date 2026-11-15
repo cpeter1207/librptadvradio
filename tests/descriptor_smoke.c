@@ -30,11 +30,13 @@ _Static_assert(offsetof(struct rptadv_radio_descriptor, session_create_profiled)
 _Static_assert(offsetof(struct rptadv_radio_descriptor, speech_analysis_create_configured) ==
                RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE,
                "configured speech must preserve the complete released prefix");
-_Static_assert(sizeof(struct rptadv_speech_analysis_config) == 20,
-               "speech setup uses five scalar fields");
+_Static_assert(sizeof(struct rptadv_speech_analysis_config) == 32,
+               "speech setup preserves five fields and appends three preprocessing fields");
 _Static_assert(sizeof(void *) != 8 ||
                (RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE == 176 &&
-                sizeof(struct rptadv_radio_descriptor) == 184),
+                RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE == 184 &&
+                RPTADV_RADIO_DESCRIPTOR_PREPROCESSED_SPEECH_MIN_SIZE == 192 &&
+                sizeof(struct rptadv_radio_descriptor) == 192),
                "64-bit speech descriptor sizes changed");
 
 struct processor_context {
@@ -261,6 +263,19 @@ int main(void)
 	assert(descriptor->struct_size >= RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE);
 	assert(descriptor->speech_analysis_create_configured(&speech_config, &analysis) == RPTADV_RADIO_OK);
 	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) == RPTADV_RADIO_OK);
+	assert(speech.voice_active == 0 && speech.last_voice_source_sample == UINT64_MAX);
+	descriptor->speech_analysis_destroy(analysis);
+
+	assert(descriptor->struct_size >= RPTADV_RADIO_DESCRIPTOR_PREPROCESSED_SPEECH_MIN_SIZE);
+	assert((descriptor->speech_analysis_capabilities & RPTADV_RADIO_SPEECH_PREPROCESSING_CAPABILITY) != 0);
+	speech_config.preprocess_flags = RPTADV_SPEECH_PREPROCESS_ENABLED |
+		RPTADV_SPEECH_PREPROCESS_BANDPASS | RPTADV_SPEECH_PREPROCESS_RNNOISE;
+	speech_config.bandpass_low_hz = 300.0F;
+	speech_config.bandpass_high_hz = 3000.0F;
+	assert(descriptor->speech_analysis_create_configured(&speech_config, &analysis) == RPTADV_RADIO_OK);
+	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) == RPTADV_RADIO_OK);
+	assert(descriptor->speech_analysis_reset(analysis) == RPTADV_RADIO_UNSUPPORTED);
+	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) != RPTADV_RADIO_OK);
 	assert(speech.voice_active == 0 && speech.last_voice_source_sample == UINT64_MAX);
 	descriptor->speech_analysis_destroy(analysis);
 

@@ -150,6 +150,8 @@ pub struct RadioDescriptor {
         *const speech_analysis::AnalysisConfig,
         *mut *mut speech_analysis::SpeechAnalysis,
     ) -> c_int,
+    /// Bit zero advertises the extended source config and prepared preprocessing.
+    speech_analysis_capabilities: u64,
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -180,6 +182,7 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     speech_analysis_reset: speech_analysis::reset,
     speech_analysis_destroy: speech_analysis::destroy,
     speech_analysis_create_configured: speech_analysis::create_configured,
+    speech_analysis_capabilities: 1,
 };
 
 /// Return the immutable ABI 5 whole-session function table.
