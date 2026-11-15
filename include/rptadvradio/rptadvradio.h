@@ -588,7 +588,7 @@ struct rptadv_radio_descriptor {
       uint64_t first_source_sample, struct rptadv_speech_analysis_result *);
   /** Clear plain classifier/converter history without allocation. A selected
    * preprocessed chain instead closes admission and returns UNSUPPORTED until
-   * replaced off audio; the graph has no full in-place history reset. */
+   * replaced off audio; the complete frontend has no in-place history reset. */
   enum rptadv_radio_result (*speech_analysis_reset)(struct rptadv_speech_analysis *);
   /** Destroy a stopped uniquely owned classifier off audio; null is accepted. */
   void (*speech_analysis_destroy)(struct rptadv_speech_analysis *);
@@ -605,8 +605,9 @@ struct rptadv_radio_descriptor {
   /** Checked feature bits. Verify this readable tail and the requested bit before
    * passing the extended configuration: older providers may ignore unknown bytes.
    * Preprocessing uses 48 kHz/480-sample blocks before 16 kHz Earshot. Source
-   * positions account for SRC and nominal RNNoise delay, not frequency-dependent
-   * bandpass phase. Programme PCM and caller-owned retention remain unchanged. */
+   * positions account for SRC, the selected symmetric FIR group delay, and
+   * nominal RNNoise delay. Bandpass cutoff frequencies are half-amplitude
+   * edges. Programme PCM and caller-owned retention remain unchanged. */
   uint64_t speech_analysis_capabilities;
   /** Read-only, nonblocking level: 0 healthy/inactive, 1 needs fresh prepared
    * analysis, or INVALID_ARGUMENT for a null session. Does not extend or mutate

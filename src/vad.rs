@@ -323,7 +323,7 @@ impl SpeechVad {
     }
     /// Retire all source history. Plain analysis can rearm in place without allocation.
     /// A preprocessed generation requires control-prepared replacement: the released
-    /// graph API has no full history reset. Admission closes before reporting this.
+    /// frontend has no full history reset. Admission closes before reporting this.
     pub fn reset(&mut self) -> Result<(), i32> {
         if self.preprocessing_active() {
             self.needs_rearm = true;

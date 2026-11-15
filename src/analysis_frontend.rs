@@ -561,20 +561,32 @@ mod allocation_tests {
             rnnoise_enabled: false,
             ..PreprocessSettings::default()
         };
-        let mut vad = SpeechVad::preprocessed(8000, 2, 1000, 960, 0.75, 2, settings).unwrap();
+        // Explicitly compose both converters: the ordinary public constructor
+        // correctly bypasses the frontend when no preprocessing stage is selected.
+        let mut front = FrontEnd::new(8000, 960, settings).unwrap();
+        let mut classifier = SpeechVad::configured(48000, 2, 1000, FRAME, 0.75, 2).unwrap();
         let input = [0.0; 127];
-        eprintln!("matched SRC: preparation complete; arming processing only");
+        let mut frames_48k = 0;
+        eprintln!("matched8→48→16k SRC: preparation complete; arming processing only");
         no_callback_allocations(|| {
             for block in 0..20 {
-                assert!(
-                    !vad.process(&input, false, 500 + block * 127)
-                        .unwrap()
-                        .admitted
-                );
+                front
+                    .process(&input, 500 + block * 127, |frame, first, _| {
+                        assert_eq!(first, frames_48k);
+                        // Keep classifier admission open so its 48→16 kHz SRC runs;
+                        // plain closed-carrier handling intentionally skips that stage.
+                        classifier.process(frame, true, first)?;
+                        frames_48k += frame.len() as u64;
+                        Ok(())
+                    })
+                    .unwrap();
             }
         });
+        assert_eq!(front.accepted_source, 2540);
+        assert!(frames_48k > 2540);
         eprintln!("matched SRC: processing complete; control-owned destruction unarmed");
-        drop(vad);
+        drop(classifier);
+        drop(front);
     }
 
     #[test]
