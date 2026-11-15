@@ -81,9 +81,30 @@ impl Client {
             )
         }
     }
+    /// Prepare the analysis front end at RNNoise's fixed 48 kHz rate.
+    pub fn to_48k(source_rate: u32, maximum_frames: usize) -> Result<Self, i32> {
+        // SAFETY: The linked provider owns an immutable process-lifetime descriptor.
+        unsafe {
+            Self::from_descriptor_at_rate(
+                rptadv_samplerate_adapter_descriptor(),
+                source_rate,
+                48000,
+                maximum_frames,
+            )
+        }
+    }
     unsafe fn from_descriptor(
         pointer: *const Descriptor,
         source_rate: u32,
+        maximum_frames: usize,
+    ) -> Result<Self, i32> {
+        // SAFETY: This preserves the caller's descriptor contract and fixed classifier rate.
+        unsafe { Self::from_descriptor_at_rate(pointer, source_rate, 16000, maximum_frames) }
+    }
+    unsafe fn from_descriptor_at_rate(
+        pointer: *const Descriptor,
+        source_rate: u32,
+        output_rate: u32,
         maximum_frames: usize,
     ) -> Result<Self, i32> {
         if !(8000..=192000).contains(&source_rate) || !(1..=4096).contains(&maximum_frames) {
@@ -123,13 +144,13 @@ impl Client {
         };
         let mut raw = std::ptr::null_mut();
         // SAFETY: The checked callback receives valid setup bounds and an initialized output pointer.
-        if unsafe { create(source_rate, 16000, maximum_frames as u32, 1, &mut raw) } != 0 {
+        if unsafe { create(source_rate, output_rate, maximum_frames as u32, 1, &mut raw) } != 0 {
             return Err(PROVIDER_FAILED);
         }
         let handle = NonNull::new(raw).ok_or(PROVIDER_FAILED)?;
         Ok(Self {
             handle,
-            ratio: 16000.0 / f64::from(source_rate),
+            ratio: f64::from(output_rate) / f64::from(source_rate),
             maximum_frames,
             accepted: 0,
             reset,

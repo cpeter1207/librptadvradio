@@ -146,6 +146,7 @@ pub struct SpeechVad {
     mode: u32,
     hang_ms: u32,
     maximum_native_frames: usize,
+    preprocessing: PreprocessSettings,
     policy: Policy,
     active: Option<Active>,
     expected_next: Option<u64>,
@@ -177,6 +178,28 @@ impl SpeechVad {
         threshold: f32,
         onset_frames: u32,
     ) -> Result<Self, i32> {
+        Self::preprocessed(
+            source_rate,
+            mode,
+            hang_ms,
+            maximum_native_frames,
+            threshold,
+            onset_frames,
+            PreprocessSettings::default(),
+        )
+    }
+    /// Prepare the shared analysis chain without modifying programme processing.
+    /// Selected providers are allocated and warmed before this source is adopted.
+    pub fn preprocessed(
+        source_rate: u32,
+        mode: u32,
+        hang_ms: u32,
+        maximum_native_frames: usize,
+        threshold: f32,
+        onset_frames: u32,
+        preprocessing: PreprocessSettings,
+    ) -> Result<Self, i32> {
+        preprocessing.validate(source_rate)?;
         if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) || onset_frames == 0 {
             return Err(crate::session::INVALID_ARGUMENT);
         }
@@ -191,13 +214,18 @@ impl SpeechVad {
         let active = if mode == 0 {
             None
         } else {
-            Some(Active::new(source_rate, maximum_native_frames)?)
+            Some(Active::new(
+                source_rate,
+                maximum_native_frames,
+                preprocessing,
+            )?)
         };
         Ok(Self {
             source_rate,
             mode,
             hang_ms,
             maximum_native_frames,
+            preprocessing,
             policy: Policy::configured(
                 mode,
                 u64::from(hang_ms) * u64::from(source_rate) / 1000,
@@ -236,9 +264,18 @@ impl SpeechVad {
         }
         if !raw_qualified {
             if self.policy.raw {
-                self.reset()?;
+                self.rearm_admission()?;
             } else {
                 self.policy.set_raw(false);
+            }
+            if let Some(active) = &mut self.active {
+                if active
+                    .process_closed(native_mono, first_native_sample)
+                    .is_err()
+                {
+                    let _ = self.reset();
+                    return Err(PROVIDER_FAILED);
+                }
             }
             self.expected_next = Some(end);
             return Ok(self.policy.decision(end));
@@ -258,9 +295,24 @@ impl SpeechVad {
         self.expected_next = Some(end);
         Ok(self.policy.decision(end))
     }
-    /// Clear burst admission and rearm SRC/NN with three synthetic silent frames.
-    /// Priming advances no native sample clock; a failed reset is retried before input.
+    /// Retire all source history. Plain analysis can rearm in place without allocation.
+    /// A preprocessed generation requires control-prepared replacement: the released
+    /// graph API has no full history reset. Admission closes before reporting this.
     pub fn reset(&mut self) -> Result<(), i32> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.front.is_some())
+        {
+            self.needs_rearm = true;
+            self.expected_next = None;
+            self.policy.set_raw(false);
+            return Err(crate::session::UNSUPPORTED);
+        }
+        self.rearm_admission()
+    }
+    /// Clear carrier admission and classifier history while continuous DSP advances.
+    fn rearm_admission(&mut self) -> Result<(), i32> {
         self.needs_rearm = true;
         self.expected_next = None;
         self.policy.set_raw(false);
@@ -277,26 +329,32 @@ impl SpeechVad {
     }
     /// Whether an update can retain this exact live analysis instance and history.
     pub fn settings_equal(&self, other: &Self) -> bool {
-        (
-            self.source_rate,
-            self.mode,
-            self.hang_ms,
-            self.maximum_native_frames,
-            self.policy.threshold.to_bits(),
-            self.policy.onset_frames,
-        ) == (
-            other.source_rate,
-            other.mode,
-            other.hang_ms,
-            other.maximum_native_frames,
-            other.policy.threshold.to_bits(),
-            other.policy.onset_frames,
-        )
+        !self.needs_rearm
+            && !other.needs_rearm
+            && (
+                self.source_rate,
+                self.mode,
+                self.hang_ms,
+                self.maximum_native_frames,
+                self.policy.threshold.to_bits(),
+                self.policy.onset_frames,
+                self.preprocessing,
+            ) == (
+                other.source_rate,
+                other.mode,
+                other.hang_ms,
+                other.maximum_native_frames,
+                other.policy.threshold.to_bits(),
+                other.policy.onset_frames,
+                other.preprocessing,
+            )
     }
 }
 /// Setup-owned converter, fixed neural framer, and reusable clamped analysis copy.
 struct Active {
     client: crate::samplerate_client::Client,
+    front: Option<Box<crate::analysis_frontend::FrontEnd>>,
+    analysis_origin: Option<u64>,
     detector: earshot::Detector,
     frame: [f32; 256],
     used: usize,
@@ -304,13 +362,30 @@ struct Active {
     origin: u64,
 }
 impl Active {
-    fn new(source_rate: u32, maximum_frames: usize) -> Result<Self, i32> {
+    fn new(
+        source_rate: u32,
+        maximum_frames: usize,
+        settings: PreprocessSettings,
+    ) -> Result<Self, i32> {
+        let enabled = settings.enabled && (settings.bandpass_enabled || settings.rnnoise_enabled);
+        let analysis_rate = if enabled { 48000 } else { source_rate };
+        let analysis_maximum = if enabled { 480 } else { maximum_frames };
         let mut active = Self {
-            client: crate::samplerate_client::Client::new(source_rate, maximum_frames)?,
+            client: crate::samplerate_client::Client::new(analysis_rate, analysis_maximum)?,
+            front: if enabled {
+                Some(Box::new(crate::analysis_frontend::FrontEnd::new(
+                    source_rate,
+                    maximum_frames,
+                    settings,
+                )?))
+            } else {
+                None
+            },
+            analysis_origin: None,
             detector: earshot::Detector::default(),
             frame: [0.0; 256],
             used: 0,
-            input: vec![0.0; maximum_frames].into_boxed_slice(),
+            input: vec![0.0; analysis_maximum].into_boxed_slice(),
             origin: 0,
         };
         active.rearm()?;
@@ -320,6 +395,7 @@ impl Active {
         self.used = 0;
         self.frame.fill(0.0);
         self.origin = 0;
+        self.analysis_origin = None;
         self.client.reset()?;
         self.detector.reset();
         for _ in 0..3 {
@@ -327,7 +403,32 @@ impl Active {
         }
         Ok(())
     }
+    fn process_closed(&mut self, native: &[f32], first: u64) -> Result<(), i32> {
+        if let Some(front) = &mut self.front {
+            front.process(native, first, |_, _, _| Ok(()))?;
+        }
+        Ok(())
+    }
     fn process(&mut self, native: &[f32], policy: &mut Policy, end: u64) -> Result<(), i32> {
+        if let Some(mut front) = self.front.take() {
+            let result = front.process(native, end - native.len() as u64, |frame, start, map| {
+                let origin = *self.analysis_origin.get_or_insert(start);
+                self.analyze(frame, policy, end, Some((map, origin)))
+            });
+            // Return the prepared owner on every result; never destroy it on audio.
+            self.front = Some(front);
+            result
+        } else {
+            self.analyze(native, policy, end, None)
+        }
+    }
+    fn analyze(
+        &mut self,
+        native: &[f32],
+        policy: &mut Policy,
+        end: u64,
+        mapping: Option<(&crate::analysis_frontend::SourceMap, u64)>,
+    ) -> Result<(), i32> {
         use crate::session::PROVIDER_FAILED;
         for (output, input) in self.input[..native.len()].iter_mut().zip(native) {
             *output = input.clamp(-1.0, 1.0);
@@ -345,7 +446,13 @@ impl Active {
                 self.used += 1;
                 if self.used == 256 {
                     let score = self.detector.predict_f32(&self.frame);
-                    self.record_frame(score, step.native_position_billionths, policy, end)?;
+                    self.record_mapped_frame(
+                        score,
+                        step.native_position_billionths,
+                        policy,
+                        end,
+                        mapping,
+                    )?;
                 }
             } else if consumed == native.len() {
                 return Ok(());
@@ -357,6 +464,7 @@ impl Active {
     }
 
     /// Validate classifier/SRC observations before publishing their source position.
+    #[cfg(test)]
     fn record_frame(
         &mut self,
         score: f32,
@@ -364,17 +472,38 @@ impl Active {
         policy: &mut Policy,
         end: u64,
     ) -> Result<(), i32> {
+        self.record_mapped_frame(score, source_position_billionths, policy, end, None)
+    }
+    fn record_mapped_frame(
+        &mut self,
+        score: f32,
+        source_position_billionths: i128,
+        policy: &mut Policy,
+        end: u64,
+        mapping: Option<(&crate::analysis_frontend::SourceMap, u64)>,
+    ) -> Result<(), i32> {
         use crate::session::PROVIDER_FAILED;
         if !score.is_finite() || !(0.0..=1.0).contains(&score) {
             return Err(PROVIDER_FAILED);
         }
-        let position =
-            i128::from(self.origin) + source_position_billionths.div_euclid(1_000_000_000);
+        self.used = 0;
+        let position = if let Some((map, analysis_origin)) = mapping {
+            let analysis_position =
+                i128::from(analysis_origin) + source_position_billionths.div_euclid(1_000_000_000);
+            let Some(position) = map.source_position(analysis_position)? else {
+                return Ok(());
+            };
+            if position < self.origin {
+                return Ok(());
+            }
+            i128::from(position)
+        } else {
+            i128::from(self.origin) + source_position_billionths.div_euclid(1_000_000_000)
+        };
         if position < i128::from(self.origin) || position >= i128::from(end) {
             return Err(PROVIDER_FAILED);
         }
         policy.observe(score, position as u64);
-        self.used = 0;
         Ok(())
     }
 }
@@ -382,6 +511,68 @@ impl Active {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Policy, SpeechVad};
+
+    #[test]
+    fn prepared_chain_consumes_closed_carrier_without_changing_programme() {
+        let settings = super::PreprocessSettings {
+            enabled: true,
+            ..super::PreprocessSettings::default()
+        };
+        for rate in [8000, 16000, 48000] {
+            let mut vad = SpeechVad::preprocessed(rate, 2, 1000, 960, 0.75, 2, settings).unwrap();
+            let input = [0.0_f32; 127];
+            no_callback_allocations(|| {
+                for block in 0..20 {
+                    let decision = vad.process(&input, false, 500 + block * 127).unwrap();
+                    assert!(!decision.admitted && !decision.voice_active);
+                    assert_eq!(decision.last_voice_sample_index, None);
+                }
+            });
+            let front = vad.active.as_ref().unwrap().front.as_ref().unwrap();
+            assert_eq!(front.accepted_source, 20 * 127);
+            assert!(input.iter().all(|sample| sample.to_bits() == 0));
+        }
+    }
+
+    #[test]
+    fn prepared_chain_maps_speech_back_to_the_original_source_clock() {
+        let speech = pcm(include_bytes!("../tests/fixtures/vad/yes-48000-s16le.pcm"));
+        let settings = super::PreprocessSettings {
+            enabled: true,
+            ..super::PreprocessSettings::default()
+        };
+        for (rate, step) in [(8000, 6), (16000, 3), (48000, 1)] {
+            let source: Vec<f32> = speech.iter().step_by(step).copied().collect();
+            let original: Vec<u32> = source.iter().map(|sample| sample.to_bits()).collect();
+            let mut vad = SpeechVad::preprocessed(rate, 2, 1000, 960, 0.75, 2, settings).unwrap();
+            let mut cursor = 1234;
+            let mut voiced = false;
+            no_callback_allocations(|| {
+                for input in source.chunks(127) {
+                    let decision = vad.process(input, true, cursor).unwrap();
+                    cursor += input.len() as u64;
+                    assert!(decision.score.is_finite());
+                    if let Some(last) = decision.last_voice_sample_index {
+                        assert!((1234..cursor).contains(&last));
+                        voiced = true;
+                    }
+                }
+                let closed = vad.process(&[0.0; 127], false, cursor).unwrap();
+                assert!(!closed.admitted && !closed.voice_active);
+                assert_eq!(closed.last_voice_sample_index, None);
+            });
+            assert!(
+                voiced,
+                "prepared chain did not recognize the existing speech fixture at {rate} Hz"
+            );
+            assert!(
+                source
+                    .iter()
+                    .zip(original)
+                    .all(|(sample, bits)| sample.to_bits() == bits)
+            );
+        }
+    }
 
     #[test]
     fn preprocessing_settings_are_explicit_and_validate_source_band() {
@@ -1161,7 +1352,8 @@ mod tests {
     #[test]
     fn invalid_external_analysis_observations_do_not_grant_admission() {
         use crate::session::PROVIDER_FAILED;
-        let mut active = super::Active::new(48000, 960).unwrap();
+        let mut active =
+            super::Active::new(48000, 960, super::PreprocessSettings::default()).unwrap();
         active.origin = 100;
         let mut policy = Policy::new(1, 48000);
         policy.set_raw(true);

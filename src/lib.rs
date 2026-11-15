@@ -10,6 +10,7 @@
 use std::ffi::{c_char, c_int};
 use std::mem::size_of;
 
+mod analysis_frontend;
 mod audio_meter;
 mod calibrated_test_tone;
 mod center_slicer;
