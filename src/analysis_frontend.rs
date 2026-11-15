@@ -7,7 +7,7 @@
 use crate::samplerate_client::Client;
 use crate::session::{PROVIDER_FAILED, UNSUPPORTED};
 use crate::vad::PreprocessSettings;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, c_char, c_void};
 use std::mem::size_of;
 use std::ptr::{self, NonNull};
 
@@ -15,6 +15,8 @@ const FRAME: usize = 480;
 const MAP_CAPACITY: usize = 4096;
 const BILLION: i128 = 1_000_000_000;
 const RN_DELAY: i128 = 960;
+// Experimental smallest candidate; qualify against513 taps before release.
+const BANDPASS_TAPS: usize = 255;
 
 #[repr(C)]
 struct Prefix {
@@ -116,156 +118,113 @@ impl Drop for Denoiser {
     }
 }
 
-#[repr(C)]
-struct GraphConfig {
-    size: u32,
-    version: u32,
-    rate: u32,
-    maximum: u32,
-    description: *const c_char,
-}
-#[repr(C)]
-struct GraphCounters {
-    size: u32,
-    version: u32,
-    flags: u32,
-    reserved: u32,
-    accepted: u64,
-    delivered: u64,
-    queued: u64,
-    prefix: u32,
-    suffix: u32,
-}
-type GraphStream =
-    unsafe extern "C" fn(*mut c_void, *const f32, u32, *mut f32, u32, *mut u32, *mut u32) -> i32;
-type GraphBlock = unsafe extern "C" fn(*mut c_void, *const f32, u32, *mut f32) -> i32;
-type GraphCounts = unsafe extern "C" fn(*const c_void, *mut GraphCounters) -> i32;
-#[repr(C)]
-struct GraphDescriptor {
-    _prefix: Prefix,
-    create: Option<unsafe extern "C" fn(*const GraphConfig, *mut *mut c_void) -> i32>,
-    _stream: Option<GraphStream>,
-    destroy: Option<Destroy>,
-    block: Option<GraphBlock>,
-    counters: Option<GraphCounts>,
-}
-#[link(
-    name = "librptadv_ffmpeg_adapter.so.1",
-    kind = "dylib",
-    modifiers = "+verbatim"
-)]
-unsafe extern "C" {
-    fn rptadv_ffmpeg_adapter_descriptor() -> *const GraphDescriptor;
-}
+/// Prepared symmetric Q15 bandpass through the existing Radio FIR primitive.
+/// The nominal edges use the windowed-sinc half-amplitude (-6dB) convention.
 struct Bandpass {
-    handle: NonNull<c_void>,
-    process: GraphBlock,
-    counts: GraphCounts,
-    destroy: Destroy,
+    coefficients: Box<[i16]>,
+    history: Box<[i16]>,
 }
 impl Bandpass {
     fn new(settings: PreprocessSettings) -> Result<Self, i32> {
-        // SAFETY: The released adapter owns this immutable process-lifetime descriptor.
-        let pointer = unsafe { rptadv_ffmpeg_adapter_descriptor() };
-        // SAFETY: The linked provider supplies the descriptor prefix.
-        unsafe { check_descriptor(pointer, b"rptadv.ffmpeg") }?;
-        // SAFETY: The validated descriptor span includes exact-block accounting.
-        let api = unsafe { &*pointer };
-        let (Some(create), Some(process), Some(counts), Some(destroy)) =
-            (api.create, api.block, api.counters, api.destroy)
-        else {
-            return Err(UNSUPPORTED);
-        };
-        // Reuse the released local receive recipe, including its causal phase response.
-        let description = CString::new(format!(
-            "[in]acrossover=split={:.9}:order=20th[bplo][bppass];[bplo]anullsink;\
-             [bppass]acrossover=split={:.9}:order=20th[out][bphi];[bphi]anullsink",
-            settings.low_hz, settings.high_hz
-        ))
-        .map_err(|_| PROVIDER_FAILED)?;
-        let config = GraphConfig {
-            size: size_of::<GraphConfig>() as u32,
-            version: 1,
-            rate: 48000,
-            maximum: FRAME as u32,
-            description: description.as_ptr(),
-        };
-        let mut raw = ptr::null_mut();
-        // SAFETY: Setup records and copied graph description outlive the create call.
-        let result = unsafe { create(&config, &mut raw) };
-        if result != 0 {
-            if !raw.is_null() {
-                // SAFETY: A failed setup cannot transfer this unexpected owned handle.
-                unsafe { destroy(raw) };
+        Self::with_taps(settings, BANDPASS_TAPS)
+    }
+    /// Setup-only experimental recipes; no user-configurable unbounded tap count.
+    fn with_taps(settings: PreprocessSettings, taps: usize) -> Result<Self, i32> {
+        use crate::session::INVALID_ARGUMENT;
+        if !matches!(taps, 255 | 513) {
+            return Err(INVALID_ARGUMENT);
+        }
+        PreprocessSettings {
+            enabled: true,
+            bandpass_enabled: true,
+            ..settings
+        }
+        .validate(48000)?;
+        let low = f64::from(settings.low_hz) / 48000.0;
+        let high = f64::from(settings.high_hz) / 48000.0;
+        let middle = (taps - 1) / 2;
+        let sinc = |value: f64| {
+            if value == 0.0 {
+                1.0
+            } else {
+                (std::f64::consts::PI * value).sin() / (std::f64::consts::PI * value)
             }
-            return Err(PROVIDER_FAILED);
-        }
-        let mut filter = Self {
-            handle: NonNull::new(raw).ok_or(PROVIDER_FAILED)?,
-            process,
-            counts,
-            destroy,
         };
-        for _ in 0..2 {
-            filter.process(&[0.0; FRAME], &mut [0.0; FRAME])?;
+        let mut kernel: Vec<f64> = (0..taps)
+            .map(|index| {
+                let offset = index as f64 - middle as f64;
+                let window =
+                    0.54 - 0.46 * (std::f64::consts::TAU * index as f64 / (taps - 1) as f64).cos();
+                (2.0 * high * sinc(2.0 * high * offset) - 2.0 * low * sinc(2.0 * low * offset))
+                    * window
+            })
+            .collect();
+        // Preserve exact symmetry after floating-point calculation and Q15 rounding.
+        for index in 0..middle {
+            kernel[taps - 1 - index] = kernel[index];
         }
-        Ok(filter)
+        // Normalize in the passband at the geometric center, before quantization.
+        let center = (low * high).sqrt();
+        let gain: f64 = kernel
+            .iter()
+            .enumerate()
+            .map(|(index, tap)| {
+                tap * (std::f64::consts::TAU * center * (index as f64 - middle as f64)).cos()
+            })
+            .sum();
+        if !gain.is_finite() || gain <= f64::EPSILON {
+            return Err(INVALID_ARGUMENT);
+        }
+        let coefficients: Result<Vec<i16>, i32> = kernel
+            .iter()
+            .map(|tap| {
+                let value = (tap / gain * 32768.0).round();
+                if !value.is_finite() || value < f64::from(i16::MIN) || value > f64::from(i16::MAX)
+                {
+                    Err(INVALID_ARGUMENT)
+                } else {
+                    Ok(value as i16)
+                }
+            })
+            .collect();
+        Ok(Self {
+            coefficients: coefficients?.into_boxed_slice(),
+            history: vec![0; taps].into_boxed_slice(),
+        })
+    }
+    fn delay_48k(&self) -> usize {
+        (self.coefficients.len() - 1) / 2
     }
     fn process(&mut self, input: &[f32; FRAME], output: &mut [f32; FRAME]) -> Result<(), i32> {
-        // SAFETY: One prepared exact block is processed serially into disjoint storage.
-        let result = unsafe {
-            (self.process)(
-                self.handle.as_ptr(),
-                input.as_ptr(),
-                FRAME as u32,
-                output.as_mut_ptr(),
-            )
-        };
-        if result != 0 || output.iter().any(|sample| !sample.is_finite()) {
-            return Err(PROVIDER_FAILED);
+        // SAFETY: This serial owner retains fixed preallocated history/taps, and
+        // the exact caller PCM spans are disjoint from each other and that storage.
+        unsafe {
+            crate::fir::process(crate::fir::Request {
+                input: input.as_ptr(),
+                output: output.as_mut_ptr(),
+                sample_count: FRAME as u32,
+                history: self.history.as_mut_ptr(),
+                history_count: self.coefficients.len() as u32,
+                coefficients: self.coefficients.as_ptr(),
+                input_gain: 256,
+                output_gain: 256,
+                calc_adjust: 32768,
+            })
         }
-        let mut counts = GraphCounters {
-            size: size_of::<GraphCounters>() as u32,
-            version: 1,
-            flags: 0,
-            reserved: 0,
-            accepted: 0,
-            delivered: 0,
-            queued: 0,
-            prefix: 0,
-            suffix: 0,
-        };
-        // SAFETY: The immutable accounting snapshot has complete writable storage.
-        if unsafe { (self.counts)(self.handle.as_ptr(), &mut counts) } != 0
-            || counts.flags & 3 != 3
-            || counts.prefix != 0
-            || counts.suffix != 0
-            || counts.queued != 0
-            || counts.accepted != counts.delivered
-        {
-            return Err(PROVIDER_FAILED);
-        }
-        Ok(())
-    }
-}
-impl Drop for Bandpass {
-    fn drop(&mut self) {
-        // SAFETY: The stopped source generation returns its unique handle on control.
-        unsafe { (self.destroy)(self.handle.as_ptr()) };
     }
 }
 
-/// Tagged source coordinates; never infer a constant delay for the causal bandpass.
+/// Tagged source coordinates, with the symmetric FIR delay and nominal RNNoise delay.
 pub(crate) struct SourceMap {
     positions: Box<[i128]>,
     tags: Box<[u64]>,
-    rn_delay: i128,
+    processing_delay: i128,
 }
 impl SourceMap {
-    /// Map a 48 kHz analysis coordinate after removing only nominal RNNoise latency.
+    /// Map after the known symmetric FIR delay and nominal RNNoise latency.
     /// Initial output preceding this generation is unqualified, not a source sample.
     pub(crate) fn source_position(&self, position: i128) -> Result<Option<u64>, i32> {
-        let position = position - self.rn_delay;
+        let position = position - self.processing_delay;
         if position < 0 {
             return Ok(None);
         }
@@ -305,17 +264,26 @@ impl FrontEnd {
         settings: PreprocessSettings,
     ) -> Result<Self, i32> {
         settings.validate(source_rate)?;
+        let bandpass = if settings.bandpass_enabled {
+            Some(Bandpass::new(settings)?)
+        } else {
+            None
+        };
+        let processing_delay = bandpass
+            .as_ref()
+            .map_or(0, |filter| filter.delay_48k() as i128)
+            + if settings.rnnoise_enabled {
+                RN_DELAY
+            } else {
+                0
+            };
         Ok(Self {
             up: if source_rate == 48000 {
                 None
             } else {
                 Some(Client::to_48k(source_rate, maximum_frames)?)
             },
-            bandpass: if settings.bandpass_enabled {
-                Some(Bandpass::new(settings)?)
-            } else {
-                None
-            },
+            bandpass,
             rn: if settings.rnnoise_enabled {
                 Some(Denoiser::new()?)
             } else {
@@ -331,11 +299,7 @@ impl FrontEnd {
             map: SourceMap {
                 positions: vec![0; MAP_CAPACITY].into_boxed_slice(),
                 tags: vec![u64::MAX; MAP_CAPACITY].into_boxed_slice(),
-                rn_delay: if settings.rnnoise_enabled {
-                    RN_DELAY
-                } else {
-                    0
-                },
+                processing_delay,
             },
         })
     }
@@ -419,5 +383,222 @@ impl FrontEnd {
         }
         self.used = 0;
         output(&self.output, self.produced - FRAME as u64, &self.map)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod allocation_tests {
+    use super::*;
+    use crate::vad::{SpeechVad, tests::no_callback_allocations};
+
+    // These are modest experimental voice-analysis checks, not user-mandated
+    // rejection specifications or a claim that either recipe improves VAD.
+    fn response_db(coefficients: &[i16], frequency: f64) -> f64 {
+        let mut real = 0.0;
+        let mut imaginary = 0.0;
+        for (index, coefficient) in coefficients.iter().enumerate() {
+            let phase = std::f64::consts::TAU * frequency * index as f64 / 48000.0;
+            let gain = f64::from(*coefficient) / 32768.0;
+            real += gain * phase.cos();
+            imaginary -= gain * phase.sin();
+        }
+        20.0 * real.hypot(imaginary).log10()
+    }
+
+    #[test]
+    fn bounded_fir_bandpass_recipes_preserve_input_and_have_declared_response() {
+        for taps in [255, 513] {
+            let mut stage = Bandpass::with_taps(PreprocessSettings::default(), taps).unwrap();
+            assert_eq!(stage.coefficients.len(), taps);
+            assert_eq!(stage.delay_48k(), (taps - 1) / 2);
+            assert!(
+                stage
+                    .coefficients
+                    .iter()
+                    .eq(stage.coefficients.iter().rev())
+            );
+            for frequency in [300.0, 3000.0] {
+                assert!((response_db(&stage.coefficients, frequency) + 6.0).abs() < 0.2);
+            }
+            for frequency in [500.0, 1000.0, 2000.0, 2800.0] {
+                assert!(response_db(&stage.coefficients, frequency).abs() < 1.0);
+            }
+            for frequency in [100.0, 3300.0] {
+                assert!(response_db(&stage.coefficients, frequency) < -20.0);
+            }
+            let mut input = [0.0_f32; FRAME];
+            input[0] = 0.5;
+            let mut output = [0.0_f32; FRAME];
+            no_callback_allocations(|| stage.process(&input, &mut output).unwrap());
+            let peak = output
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .unwrap()
+                .0;
+            assert_eq!(peak, stage.delay_48k());
+            assert_eq!(input[0].to_bits(), 0.5_f32.to_bits());
+            assert!(input[1..].iter().all(|sample| sample.to_bits() == 0));
+        }
+    }
+
+    #[test]
+    fn bounded_fir_bandpass_mapping_accounts_for_linear_phase_without_old_samples() {
+        let settings = PreprocessSettings {
+            enabled: true,
+            rnnoise_enabled: false,
+            ..PreprocessSettings::default()
+        };
+        let delay = Bandpass::new(settings).unwrap().delay_48k();
+        let mut front = FrontEnd::new(48000, FRAME, settings).unwrap();
+        let mut input = [0.0_f32; FRAME];
+        input[0] = 0.5;
+        let mut frames = 0;
+        front
+            .process(&input, 500, |output, first, map| {
+                assert_eq!(first, 0);
+                for position in 0..delay {
+                    assert_eq!(map.source_position(position as i128)?, None);
+                }
+                assert_eq!(map.source_position(delay as i128)?, Some(500));
+                let peak = output
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                    .unwrap()
+                    .0;
+                assert_eq!(peak, delay);
+                frames += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(frames, 1);
+        assert_eq!(input[0], 0.5);
+    }
+
+    #[test]
+    fn bounded_fir_bandpass_rejects_invalid_setup_without_fallback() {
+        for (low, high) in [
+            (0.0, 3000.0),
+            (f32::NAN, 3000.0),
+            (300.0, 24000.0),
+            (3000.0, 300.0),
+        ] {
+            let settings = PreprocessSettings {
+                low_hz: low,
+                high_hz: high,
+                ..PreprocessSettings::default()
+            };
+            assert!(Bandpass::with_taps(settings, 255).is_err());
+        }
+        for taps in [0, 1, 254, 514] {
+            assert!(Bandpass::with_taps(PreprocessSettings::default(), taps).is_err());
+        }
+    }
+
+    fn current_thread_cpu_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+        let (_, fields) = stat.rsplit_once(')')?;
+        let mut fields = fields.split_whitespace();
+        let user: u64 = fields.nth(11)?.parse().ok()?;
+        let system: u64 = fields.next()?.parse().ok()?;
+        user.checked_add(system)
+    }
+
+    #[test]
+    #[ignore = "short optimized processing comparison; run explicitly with release profile"]
+    fn bounded_fir_optimized_processing_comparison() {
+        assert!(
+            !cfg!(debug_assertions),
+            "CPU comparison requires optimized code"
+        );
+        let input: [f32; FRAME] = std::array::from_fn(|index| {
+            (std::f64::consts::TAU * 1000.0 * index as f64 / 48000.0).sin() as f32 * 0.125
+        });
+        for taps in [255, 513] {
+            let mut stage = Bandpass::with_taps(PreprocessSettings::default(), taps).unwrap();
+            let mut output = [0.0_f32; FRAME];
+            for _ in 0..4 {
+                stage.process(&input, &mut output).unwrap();
+            }
+            let cpu_before = current_thread_cpu_ticks();
+            let start = std::time::Instant::now();
+            no_callback_allocations(|| {
+                for _ in 0..1000 {
+                    stage
+                        .process(std::hint::black_box(&input), &mut output)
+                        .unwrap();
+                    std::hint::black_box(&output);
+                }
+            });
+            let elapsed = start.elapsed().as_secs_f64();
+            let ticks = cpu_before
+                .zip(current_thread_cpu_ticks())
+                .map(|(start, end)| end.saturating_sub(start));
+            eprintln!(
+                "FIR_BENCH taps={taps} audio_seconds=10 wall_seconds={elapsed:.9} cpu_ticks={ticks:?} tap_history_bytes={} delay_samples_48k={}",
+                taps * 4,
+                stage.delay_48k()
+            );
+            for frequency in [
+                0.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 1000.0, 2000.0, 2800.0,
+                2900.0, 3000.0, 3100.0, 3300.0, 3500.0,
+            ] {
+                eprintln!(
+                    "FIR_RESPONSE taps={taps} frequency_hz={frequency} gain_db={:.6}",
+                    response_db(&stage.coefficients, frequency)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_allocation_matched_src_only() {
+        let settings = PreprocessSettings {
+            enabled: true,
+            bandpass_enabled: false,
+            rnnoise_enabled: false,
+            ..PreprocessSettings::default()
+        };
+        let mut vad = SpeechVad::preprocessed(8000, 2, 1000, 960, 0.75, 2, settings).unwrap();
+        let input = [0.0; 127];
+        eprintln!("matched SRC: preparation complete; arming processing only");
+        no_callback_allocations(|| {
+            for block in 0..20 {
+                assert!(
+                    !vad.process(&input, false, 500 + block * 127)
+                        .unwrap()
+                        .admitted
+                );
+            }
+        });
+        eprintln!("matched SRC: processing complete; control-owned destruction unarmed");
+        drop(vad);
+    }
+
+    #[test]
+    fn native_allocation_rnnoise_only() {
+        let mut stage = Denoiser::new().unwrap();
+        let input = [0.0; FRAME];
+        let mut output = [0.0_f32; FRAME];
+        for _ in 0..2 {
+            stage.process(&input, &mut output).unwrap();
+        }
+        eprintln!("RNNoise: preparation/warmup complete; arming one 480-frame process only");
+        no_callback_allocations(|| stage.process(&input, &mut output).unwrap());
+        eprintln!("RNNoise: processing complete; control-owned destruction unarmed");
+        drop(stage);
+    }
+
+    #[test]
+    fn native_allocation_bandpass_only() {
+        let mut stage = Bandpass::new(PreprocessSettings::default()).unwrap();
+        let input = [0.0; FRAME];
+        let mut output = [0.0_f32; FRAME];
+        eprintln!("bandpass: preparation/warmup complete; arming one 480-frame process only");
+        no_callback_allocations(|| stage.process(&input, &mut output).unwrap());
+        eprintln!("bandpass: processing complete; control-owned destruction unarmed");
+        drop(stage);
     }
 }

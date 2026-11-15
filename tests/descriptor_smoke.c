@@ -36,7 +36,8 @@ _Static_assert(sizeof(void *) != 8 ||
                (RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE == 176 &&
                 RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE == 184 &&
                 RPTADV_RADIO_DESCRIPTOR_PREPROCESSED_SPEECH_MIN_SIZE == 192 &&
-                sizeof(struct rptadv_radio_descriptor) == 192),
+                RPTADV_RADIO_DESCRIPTOR_LOCAL_SPEECH_MIN_SIZE == 200 &&
+                sizeof(struct rptadv_radio_descriptor) == 200),
                "64-bit speech descriptor sizes changed");
 
 struct processor_context {
@@ -110,6 +111,12 @@ static struct rptadv_radio_session_config valid_config(void)
 	config.receive.noise_filter_profile = RPTADV_RADIO_NOISE_FILTER_STANDARD;
 	config.receive.ctcss_decoder_gain = 1.0F;
 	config.receive.vad_hang_ms = 1000;
+	config.speech.speech_threshold = 0.5F;
+	config.speech.speech_onset_frames = 1;
+	config.speech.preprocess_flags = RPTADV_SPEECH_PREPROCESS_BANDPASS | RPTADV_SPEECH_PREPROCESS_RNNOISE;
+	config.speech.bandpass_low_hz = 300.0F;
+	config.speech.bandpass_high_hz = 3000.0F;
+	config.speech.retention_ms = 160;
 	config.qualification.carrier_source = RPTADV_RADIO_CARRIER_USB;
 	config.qualification.subaudible_source = RPTADV_RADIO_SUBAUDIBLE_DISABLED;
 	config.qualification.radio_duplex = 1;
@@ -122,6 +129,9 @@ int main(void)
 {
 	const struct rptadv_radio_descriptor *descriptor = rptadv_radio_descriptor();
 	struct rptadv_radio_session_config config = valid_config();
+	assert(descriptor->struct_size >= RPTADV_RADIO_DESCRIPTOR_LOCAL_SPEECH_MIN_SIZE);
+	assert((descriptor->speech_analysis_capabilities & RPTADV_RADIO_LOCAL_SPEECH_CAPABILITY) != 0);
+	assert(descriptor->session_analysis_replacement_needed(NULL) == RPTADV_RADIO_INVALID_ARGUMENT);
 	struct processor_context deemphasis = { .scale = 1.0F, .bias = 0.1F };
 	struct processor_context filter = { .scale = 2.0F };
 	struct processor_context notch = { .scale = 1.0F };

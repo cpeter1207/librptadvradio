@@ -30,7 +30,7 @@ pub(crate) const NOT_READY: c_int = -5;
 pub(crate) const BUSY: c_int = -6;
 
 const EVENT_CAPACITY: usize = 64;
-/// Minimum native speech lookback using the existing audible delay storage.
+/// Default native programme retention, independent of classifier history.
 const VAD_PREROLL_FRAMES: u32 = 7680;
 const MAX_SIGNED_PCM_LEVEL: u32 = i16::MAX as u32;
 const VALID_CTCSS_TONE_MASK: u64 = (1_u64 << ctcss_client::TONE_COUNT) - 1;
@@ -251,6 +251,31 @@ impl Default for TransmitConfig {
     }
 }
 
+/// Local analysis settings appended to the sized session record, never the embedded RX record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct LocalSpeechConfig {
+    pub(crate) speech_threshold: f32,
+    pub(crate) speech_onset_frames: u32,
+    pub(crate) preprocess_flags: u32,
+    pub(crate) bandpass_low_hz: f32,
+    pub(crate) bandpass_high_hz: f32,
+    pub(crate) retention_ms: u32,
+}
+
+impl Default for LocalSpeechConfig {
+    fn default() -> Self {
+        Self {
+            speech_threshold: 0.5,
+            speech_onset_frames: 1,
+            preprocess_flags: 6,
+            bandpass_low_hz: 300.0,
+            bandpass_high_hz: 3000.0,
+            retention_ms: VAD_PREROLL_FRAMES / 48,
+        }
+    }
+}
+
 /// Validated setup for a runtime or prepared owner update.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -268,6 +293,7 @@ pub(crate) struct SessionConfig {
     pub(crate) receive: ReceiveConfig,
     pub(crate) qualification: QualificationConfig,
     pub(crate) transmit: TransmitConfig,
+    pub(crate) speech: LocalSpeechConfig,
 }
 
 /// Borrowed prepared processing and ring objects for one session.
@@ -533,6 +559,7 @@ struct ReceiveWorker {
     delay_index: usize,
     delay_valid: usize,
     vad_mode: u32,
+    vad_retention_frames: u32,
     work_a: Vec<f32>,
     work_b: Vec<f32>,
     work_c: Vec<f32>,
@@ -640,6 +667,7 @@ struct AtomicSnapshot {
     vad_score: AtomicU32,
     vad_voice_sample_index: AtomicU64,
     vad_preroll_frames: AtomicU32,
+    analysis_replacement_needed: AtomicBool,
 }
 
 impl Default for AtomicSnapshot {
@@ -652,6 +680,7 @@ impl Default for AtomicSnapshot {
             vad_score: AtomicU32::new(0),
             vad_voice_sample_index: AtomicU64::new(u64::MAX),
             vad_preroll_frames: AtomicU32::new(0),
+            analysis_replacement_needed: AtomicBool::new(false),
             receive_frames: AtomicU64::new(0),
             transmit_frames: AtomicU64::new(0),
             receive_input_peak: AtomicU32::new(0),
@@ -840,17 +869,21 @@ pub(crate) unsafe extern "C" fn apply_receive_update(
     } else {
         std::mem::swap(&mut live.detector, &mut next.detector);
     }
-    if !live.vad.settings_equal(&next.vad) {
-        next.vad.inherit_burst_id(&live.vad);
-        std::mem::swap(&mut live.vad, &mut next.vad);
-        live.vad_needs_reset = false;
-        live.delay_valid = 0;
-        live.delay_index = 0;
-    } else if live.qualification != next.qualification
+    let reset_boundary = live.qualification != next.qualification
         || live.receive_channel != next.receive_channel
         || (live.input_gain == 0.0) != (next.input_gain == 0.0)
-        || live.config.vad_external_delay != next.config.vad_external_delay
-    {
+        || live.config.vad_external_delay != next.config.vad_external_delay;
+    if !live.vad.settings_equal(&next.vad) || (reset_boundary && live.vad.preprocessing_active()) {
+        next.vad.inherit_burst_id(&live.vad);
+        std::mem::swap(&mut live.vad, &mut next.vad);
+        live.vad_needs_reset = live.vad.needs_prepared_replacement();
+        session
+            .snapshot
+            .analysis_replacement_needed
+            .store(live.vad_needs_reset, Ordering::Release);
+        live.delay_valid = 0;
+        live.delay_index = 0;
+    } else if reset_boundary {
         live.vad_needs_reset = true;
     }
     if live.delay.len() != next.delay.len() || (old.vad_mode == 0) != (new.vad_mode == 0) {
@@ -859,6 +892,7 @@ pub(crate) unsafe extern "C" fn apply_receive_update(
         live.delay_valid = 0;
     }
     live.vad_mode = next.vad_mode;
+    live.vad_retention_frames = next.vad_retention_frames;
     live.ports = next.ports;
     live.config = new;
     live.qualification = next.qualification;
@@ -1269,13 +1303,15 @@ pub(crate) unsafe extern "C" fn create(
         return INVALID_ARGUMENT;
     }
     unsafe { output.write(ptr::null_mut()) };
+    if !unsafe { record_fits(config) && record_fits(ports) } {
+        return INVALID_ARGUMENT;
+    }
     let config = unsafe { &*config };
     let ports = unsafe { &*ports };
-    if config.struct_size < size_of::<SessionConfig>() as u32
-        || ports.struct_size < size_of::<SessionPorts>() as u32
-        || config.abi_version != ABI_VERSION
+    if config.abi_version != ABI_VERSION
         || config.maximum_receive_frame_count == 0
         || config.receive.vad_mode > 2
+        || config.speech.retention_ms > 300
         || config.receive.vad_hang_ms > 32767
         || config.receive.vad_external_delay > 1
         || (config.receive.vad_external_delay != 0
@@ -1327,15 +1363,32 @@ pub(crate) unsafe extern "C" fn create(
     let publication_frames = u64::from(config.publication_interval_ms) * 48;
     let rx_max = config.maximum_receive_frame_count as usize;
     let vad_mode = effective_vad_mode(&config.receive, &qualification);
+    let vad_retention_frames = config.speech.retention_ms * 48;
+    let preprocessing = match crate::vad::PreprocessSettings::from_flags(
+        config.speech.preprocess_flags,
+        config.speech.bandpass_low_hz,
+        config.speech.bandpass_high_hz,
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     let delay_frames = if vad_mode != 0 && config.receive.vad_external_delay == 0 {
         config
             .receive
             .native_squelch_delay_frames
-            .max(VAD_PREROLL_FRAMES)
+            .max(vad_retention_frames)
     } else {
         config.receive.native_squelch_delay_frames
     };
-    let vad = match crate::vad::SpeechVad::new(vad_mode, config.receive.vad_hang_ms, rx_max) {
+    let vad = match crate::vad::SpeechVad::preprocessed(
+        NATIVE_SAMPLE_RATE_HZ,
+        vad_mode,
+        config.receive.vad_hang_ms,
+        rx_max,
+        config.speech.speech_threshold,
+        config.speech.speech_onset_frames,
+        preprocessing,
+    ) {
         Ok(vad) => vad,
         Err(error) => return error,
     };
@@ -1402,6 +1455,7 @@ pub(crate) unsafe extern "C" fn create(
             delay_index: 0,
             delay_valid: 0,
             vad_mode,
+            vad_retention_frames,
             work_a: vec![0.0; rx_max],
             work_b: vec![0.0; rx_max],
             work_c: vec![0.0; rx_max],
@@ -1720,6 +1774,12 @@ fn receive_provider_failure(session: &Session, worker: &mut ReceiveWorker) -> c_
         worker.vad_needs_reset = true;
         worker.delay_valid = 0;
         worker.delay_index = 0;
+    }
+    if worker.vad.needs_prepared_replacement() {
+        session
+            .snapshot
+            .analysis_replacement_needed
+            .store(true, Ordering::Release);
     }
     provider_failure(session, true, worker.sample_index);
     PROVIDER_FAILED
@@ -2211,7 +2271,7 @@ unsafe fn receive_inner(
         if worker.vad_mode == 0 {
             0
         } else {
-            VAD_PREROLL_FRAMES
+            worker.vad_retention_frames
         },
         Ordering::Relaxed,
     );
@@ -2246,7 +2306,7 @@ unsafe fn receive_inner(
             vad_preroll_frames: if worker.vad_mode == 0 {
                 0
             } else {
-                VAD_PREROLL_FRAMES
+                worker.vad_retention_frames
             },
             generation_id: session.generation_id,
             first_sample_index: first_sample,
@@ -2730,6 +2790,20 @@ fn load_ring(snapshot: &AtomicSnapshot) -> RingObservation {
     }
 }
 
+/// Query a level-triggered replacement request without extending the unsized snapshot ABI.
+/// Only RX publishes retirement/adoption. Control must not clear this on preparation.
+pub(crate) unsafe extern "C" fn analysis_replacement_needed(session: *const Session) -> c_int {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return INVALID_ARGUMENT;
+    };
+    c_int::from(
+        session
+            .snapshot
+            .analysis_replacement_needed
+            .load(Ordering::Acquire),
+    )
+}
+
 /// Read the latest independently published RX/TX observations without locking.
 pub(crate) unsafe extern "C" fn snapshot(session: *const Session, output: *mut Snapshot) -> c_int {
     let Some(session) = (unsafe { session.as_ref() }) else {
@@ -2951,6 +3025,123 @@ mod tests {
             },
             ..SessionConfig::default()
         }
+    }
+
+    #[test]
+    fn local_preprocessing_rejects_short_setup_records_without_reading_the_tail() {
+        // An actual short allocation, not a full current record with a smaller size word.
+        let legacy_size = std::mem::offset_of!(SessionConfig, speech);
+        assert!(legacy_size < size_of::<SessionConfig>());
+        for advertised_size in [4, legacy_size, size_of::<SessionConfig>() - 4] {
+            let mut storage = vec![0_u64; advertised_size.div_ceil(size_of::<u64>())];
+            let pointer = storage.as_mut_ptr().cast::<SessionConfig>();
+            unsafe { pointer.cast::<u32>().write(advertised_size as u32) };
+            let mut output = ptr::dangling_mut();
+            assert_eq!(
+                unsafe { create(pointer, &SessionPorts::default(), &mut output) },
+                INVALID_ARGUMENT
+            );
+            assert!(output.is_null());
+        }
+    }
+
+    #[test]
+    fn local_preprocessing_settings_preserve_programme_and_configure_retention() {
+        assert_eq!(
+            unsafe { &*crate::rptadv_radio_descriptor() }.speech_analysis_capabilities & 2,
+            2
+        );
+        for retention_ms in [0, 80, 300] {
+            let mut config = valid_config();
+            config.receive.vad_mode = 2;
+            config.receive.vad_external_delay = 1;
+            config.speech = LocalSpeechConfig {
+                speech_threshold: 0.75,
+                speech_onset_frames: 2,
+                preprocess_flags: 7,
+                bandpass_low_hz: 300.0,
+                bandpass_high_hz: 3000.0,
+                retention_ms,
+            };
+            let session = TestSession::prepared(&config, &SessionPorts::default());
+            assert_eq!(unsafe { analysis_replacement_needed(session.0) }, 0);
+            let (status, output, result) = session.receive(true);
+            assert_eq!(status, OK);
+            // The external ring owns qualification; retain original programme while pending.
+            assert_eq!(output, [0.25; 4]);
+            assert_eq!(result.raw_receiver_keyed, 1);
+            assert_eq!(result.receiver_keyed, 0);
+            assert_eq!(result.vad_preroll_frames, retention_ms * 48);
+            let worker = unsafe { &*(*session.0).receive.get() };
+            assert_eq!(&worker.input_mono[..4], &[0.25; 4]);
+            assert_eq!(&worker.work_a[..4], &[0.25; 4]);
+            assert_eq!(worker.delay.len(), 0);
+        }
+        let invalid_cases: &[fn(&mut LocalSpeechConfig)] = &[
+            |c: &mut LocalSpeechConfig| c.preprocess_flags = 8,
+            |c: &mut LocalSpeechConfig| c.speech_onset_frames = 0,
+            |c: &mut LocalSpeechConfig| c.speech_threshold = f32::NAN,
+            |c: &mut LocalSpeechConfig| {
+                c.preprocess_flags = 7;
+                c.bandpass_high_hz = 24000.0;
+            },
+            |c: &mut LocalSpeechConfig| c.retention_ms = 301,
+        ];
+        for invalid in invalid_cases {
+            let mut config = valid_config();
+            invalid(&mut config.speech);
+            let mut handle = ptr::dangling_mut();
+            assert_eq!(
+                unsafe { create(&config, &SessionPorts::default(), &mut handle) },
+                INVALID_ARGUMENT
+            );
+            assert!(handle.is_null());
+        }
+        assert_eq!(
+            unsafe { analysis_replacement_needed(ptr::null()) },
+            INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn local_preprocessing_fault_is_replaced_through_existing_owner_update() {
+        let mut config = valid_config();
+        config.receive.vad_mode = 2;
+        config.receive.vad_external_delay = 1;
+        config.speech.preprocess_flags = 7;
+        let mut processor = TestProcessor::default();
+        let ports = SessionPorts {
+            receive_deemphasis: test_port(&mut processor),
+            ..SessionPorts::default()
+        };
+        let session = TestSession::prepared(&config, &ports);
+        assert_eq!(session.receive(true).0, OK);
+        processor.fail = true;
+        assert_eq!(session.receive(true).0, PROVIDER_FAILED);
+        // Existing next-callback full reset retires the selected front end.
+        crate::vad::tests::no_callback_allocations(|| {
+            assert_eq!(session.receive(true).0, PROVIDER_FAILED);
+            assert_eq!(unsafe { analysis_replacement_needed(session.0) }, 1);
+            assert_eq!(unsafe { analysis_replacement_needed(session.0) }, 1);
+        });
+        let generation = session.snapshot().generation_id;
+        let source_position = session.snapshot().receive_frames;
+        processor.fail = false;
+        let mut update = ptr::null_mut();
+        assert_eq!(unsafe { prepare_update(&config, &ports, &mut update) }, OK);
+        assert_eq!(unsafe { analysis_replacement_needed(session.0) }, 1);
+        crate::vad::tests::no_callback_allocations(|| {
+            assert_eq!(unsafe { apply_receive_update(session.0, update) }, OK);
+            assert_eq!(unsafe { analysis_replacement_needed(session.0) }, 0);
+            assert_eq!(unsafe { apply_transmit_update(session.0, update) }, OK);
+        });
+        // Source identity can be unchanged, so queued failure events are not a reset token.
+        assert_eq!(session.snapshot().generation_id, generation);
+        assert_eq!(session.snapshot().receive_frames, source_position);
+        assert_eq!(session.receive(false).0, OK);
+        assert_eq!(unsafe { analysis_replacement_needed(session.0) }, 0);
+        // Displaced graph ownership survives both callback swaps until control reclamation.
+        unsafe { destroy_update(update) };
     }
 
     #[test]

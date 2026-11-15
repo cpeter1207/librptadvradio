@@ -152,6 +152,8 @@ pub struct RadioDescriptor {
     ) -> c_int,
     /// Bit zero advertises the extended source config and prepared preprocessing.
     speech_analysis_capabilities: u64,
+    /// Level-triggered local analysis replacement request; snapshot layout is unchanged.
+    session_analysis_replacement_needed: unsafe extern "C" fn(*const session::Session) -> c_int,
 }
 
 // SAFETY: the descriptor and all addresses referenced by it are immutable.
@@ -182,7 +184,8 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     speech_analysis_reset: speech_analysis::reset,
     speech_analysis_destroy: speech_analysis::destroy,
     speech_analysis_create_configured: speech_analysis::create_configured,
-    speech_analysis_capabilities: 1,
+    speech_analysis_capabilities: 3,
+    session_analysis_replacement_needed: session::analysis_replacement_needed,
 };
 
 /// Return the immutable ABI 5 whole-session function table.

@@ -6,7 +6,7 @@
 pub struct PreprocessSettings {
     /// Explicitly select the prepared preprocessing path; false retains plain Earshot.
     pub enabled: bool,
-    /// Apply the existing twentieth-order crossover bandpass before noise reduction.
+    /// Apply the prepared symmetric FIR bandpass before noise reduction.
     pub bandpass_enabled: bool,
     /// Lower crossover frequency in Hz, strictly above zero when selected.
     pub low_hz: f32,
@@ -168,11 +168,13 @@ pub struct SpeechVad {
 impl SpeechVad {
     /// Prepare mode 0/1/2 and a 0..32767 ms hang outside the audio callback.
     /// Active analysis accepts at most 4096 native frames; Off retains positive bounds.
+    #[cfg(test)]
     pub fn new(mode: u32, hang_ms: u32, maximum_native_frames: usize) -> Result<Self, i32> {
         Self::new_source_rate(48000, mode, hang_ms, maximum_native_frames)
     }
     /// Prepare the shared classifier on a mono 8..192 kHz source sample clock.
     /// Only analysis is converted to 16 kHz; programme PCM remains untouched.
+    #[cfg(test)]
     pub fn new_source_rate(
         source_rate: u32,
         mode: u32,
@@ -183,6 +185,7 @@ impl SpeechVad {
     }
     /// Prepare per-source classification without changing native radio defaults.
     /// Positive frames count complete 16-ms classifier frames, not caller spans.
+    #[cfg(test)]
     pub fn configured(
         source_rate: u32,
         mode: u32,
@@ -308,15 +311,21 @@ impl SpeechVad {
         self.expected_next = Some(end);
         Ok(self.policy.decision(end))
     }
+    /// Whether this prepared owner has stateful analysis-front-end stages.
+    pub(crate) fn preprocessing_active(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.front.is_some())
+    }
+    /// A full reset of an active front end needs fresh control-prepared storage.
+    pub(crate) fn needs_prepared_replacement(&self) -> bool {
+        self.needs_rearm && self.preprocessing_active()
+    }
     /// Retire all source history. Plain analysis can rearm in place without allocation.
     /// A preprocessed generation requires control-prepared replacement: the released
     /// graph API has no full history reset. Admission closes before reporting this.
     pub fn reset(&mut self) -> Result<(), i32> {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.front.is_some())
-        {
+        if self.preprocessing_active() {
             self.needs_rearm = true;
             self.expected_next = None;
             self.policy.set_raw(false);
@@ -522,7 +531,7 @@ impl Active {
 }
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
-mod tests {
+pub(crate) mod tests {
     use super::{Policy, SpeechVad};
 
     #[test]
@@ -1028,7 +1037,7 @@ mod tests {
             name: *const std::ffi::c_char,
         ) -> *mut std::ffi::c_void;
     }
-    fn no_callback_allocations(action: impl FnOnce()) {
+    pub(crate) fn no_callback_allocations(action: impl FnOnce()) {
         // SAFETY: The test looks up a named interposer symbol without calling a null pointer.
         let begin = unsafe { dlsym(std::ptr::null_mut(), c"swr_test_realtime_begin".as_ptr()) };
         // SAFETY: The test looks up a named interposer symbol without calling a null pointer.

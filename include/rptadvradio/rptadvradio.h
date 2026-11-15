@@ -226,6 +226,20 @@ struct rptadv_radio_transmit_config {
   float output_b_tone_bias; /**< Output B tone bias. */
 };
 
+/** @brief Independent local speech analysis; fixed source geometry comes from the session.
+ * Check RPTADV_RADIO_LOCAL_SPEECH_CAPABILITY and its descriptor prefix first.
+ * Defaults are 0.5, one frame, flags 6 (overall disabled), 300/3000 Hz, 160 ms.
+ * Retention is programme storage, not classifier lookback. The existing local
+ * PLC-disabled programme ring admits zero through 300 milliseconds. */
+struct rptadv_radio_local_speech_config {
+  float speech_threshold; /**< Finite inclusive score threshold, 0..1. */
+  uint32_t speech_onset_frames; /**< Positive count of complete 16-ms frames. */
+  uint32_t preprocess_flags; /**< RPTADV_SPEECH_PREPROCESS_* bits only. */
+  float bandpass_low_hz; /**< Selected band requires 0 < low < high. */
+  float bandpass_high_hz; /**< Selected upper edge must be below 24000 Hz. */
+  uint32_t retention_ms; /**< Local programme retention, 0..300 ms. */
+};
+
 /** @brief Complete immutable setup for one runtime generation. */
 struct rptadv_radio_session_config {
   uint32_t struct_size; /**< Size supplied by caller. */
@@ -241,6 +255,7 @@ struct rptadv_radio_session_config {
   struct rptadv_radio_receive_config receive; /**< Detector policy. */
   struct rptadv_radio_qualification_config qualification; /**< RX gating. */
   struct rptadv_radio_transmit_config transmit; /**< TX policy. */
+  struct rptadv_radio_local_speech_config speech; /**< Sized-tail local analysis policy. */
 };
 
 /**
@@ -460,6 +475,7 @@ struct rptadv_speech_analysis_config {
 #define RPTADV_SPEECH_PREPROCESS_BANDPASS 2U /**< Apply the causal twentieth-order bandpass. */
 #define RPTADV_SPEECH_PREPROCESS_RNNOISE 4U /**< Apply the released default RNNoise model. */
 #define RPTADV_RADIO_SPEECH_PREPROCESSING_CAPABILITY UINT64_C(1) /**< Extended source configuration. */
+#define RPTADV_RADIO_LOCAL_SPEECH_CAPABILITY UINT64_C(2) /**< Local settings tail and retirement query. */
 
 /** @brief Shared classifier output on the input source sample clock. */
 struct rptadv_speech_analysis_result {
@@ -592,6 +608,13 @@ struct rptadv_radio_descriptor {
    * positions account for SRC and nominal RNNoise delay, not frequency-dependent
    * bandpass phase. Programme PCM and caller-owned retention remain unchanged. */
   uint64_t speech_analysis_capabilities;
+  /** Read-only, nonblocking level: 0 healthy/inactive, 1 needs fresh prepared
+   * analysis, or INVALID_ARGUMENT for a null session. Does not extend or mutate
+   * the unsized snapshot. Only RX retirement and actual prepared adoption change
+   * the level; querying, preparing or enqueueing must not clear it. The existing
+   * update retains displaced owners until both callbacks acknowledge and control
+   * destroys the update. Carrier loss alone is not a full frontend reset. */
+  int32_t (*session_analysis_replacement_needed)(const struct rptadv_radio_session *);
 };
 
 /** @brief Required readable prefix for optional shared speech-analysis operations. */
@@ -608,6 +631,11 @@ struct rptadv_radio_descriptor {
 #define RPTADV_RADIO_DESCRIPTOR_PREPROCESSED_SPEECH_MIN_SIZE \
   (offsetof(struct rptadv_radio_descriptor, speech_analysis_capabilities) + \
    sizeof(((struct rptadv_radio_descriptor *)0)->speech_analysis_capabilities))
+
+/** @brief Required readable prefix for local speech settings and replacement query. */
+#define RPTADV_RADIO_DESCRIPTOR_LOCAL_SPEECH_MIN_SIZE \
+  (offsetof(struct rptadv_radio_descriptor, session_analysis_replacement_needed) + \
+   sizeof(((struct rptadv_radio_descriptor *)0)->session_analysis_replacement_needed))
 
 /**
  * @brief Return the process-lifetime ABI 5 descriptor.
