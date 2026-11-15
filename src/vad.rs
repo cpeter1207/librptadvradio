@@ -1,5 +1,49 @@
 //! Local speech analysis and admission on the native receive sample clock.
 
+/// Optional analysis-only preprocessing, independent of programme processing.
+/// Enabling this chain never enables local speech admission or changes its mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreprocessSettings {
+    /// Explicitly select the prepared preprocessing path; false retains plain Earshot.
+    pub enabled: bool,
+    /// Apply the existing twentieth-order crossover bandpass before noise reduction.
+    pub bandpass_enabled: bool,
+    /// Lower crossover frequency in Hz, strictly above zero when selected.
+    pub low_hz: f32,
+    /// Upper crossover frequency in Hz, strictly below the source and processing Nyquist.
+    pub high_hz: f32,
+    /// Apply the released RNNoise default model; no strength control is exposed.
+    pub rnnoise_enabled: bool,
+}
+impl Default for PreprocessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bandpass_enabled: true,
+            low_hz: 300.0,
+            high_hz: 3000.0,
+            rnnoise_enabled: true,
+        }
+    }
+}
+impl PreprocessSettings {
+    /// Reject a selected band outside the actual decoded source bandwidth.
+    /// Upsampling for RNNoise does not create frequencies absent from that source.
+    pub fn validate(&self, source_rate: u32) -> Result<(), i32> {
+        if self.enabled
+            && self.bandpass_enabled
+            && (!self.low_hz.is_finite()
+                || !self.high_hz.is_finite()
+                || self.low_hz <= 0.0
+                || self.low_hz >= self.high_hz
+                || self.high_hz >= (source_rate.min(48_000) as f32 / 2.0))
+        {
+            return Err(crate::session::INVALID_ARGUMENT);
+        }
+        Ok(())
+    }
+}
+
 /// Speech classification and burst-qualified receive admission after one span.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Decision {
@@ -338,6 +382,47 @@ impl Active {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::{Policy, SpeechVad};
+
+    #[test]
+    fn preprocessing_settings_are_explicit_and_validate_source_band() {
+        let disabled = super::PreprocessSettings::default();
+        assert!(!disabled.enabled);
+        assert_eq!((disabled.low_hz, disabled.high_hz), (300.0, 3000.0));
+        assert!(disabled.bandpass_enabled && disabled.rnnoise_enabled);
+        let enabled = super::PreprocessSettings {
+            enabled: true,
+            ..disabled
+        };
+        for rate in [8000, 16000, 48000, 96000, 192000] {
+            assert_eq!(enabled.validate(rate), Ok(()));
+        }
+        for (low_hz, high_hz) in [
+            (0.0, 3000.0),
+            (3000.0, 300.0),
+            (300.0, 4000.0),
+            (f32::NAN, 3000.0),
+            (300.0, f32::INFINITY),
+        ] {
+            let invalid = super::PreprocessSettings {
+                low_hz,
+                high_hz,
+                ..enabled
+            };
+            assert!(invalid.validate(8000).is_err());
+        }
+        // Turning either stage off is a distinct, supported analysis configuration.
+        let no_filter = super::PreprocessSettings {
+            bandpass_enabled: false,
+            ..enabled
+        };
+        let no_denoiser = super::PreprocessSettings {
+            rnnoise_enabled: false,
+            ..enabled
+        };
+        assert_eq!(no_filter.validate(8000), Ok(()));
+        assert_eq!(no_denoiser.validate(8000), Ok(()));
+        assert_ne!(no_filter, no_denoiser);
+    }
 
     #[test]
     fn configured_onset_requires_four_consecutive_threshold_frames() {
