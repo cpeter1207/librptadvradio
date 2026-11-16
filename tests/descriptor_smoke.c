@@ -284,8 +284,9 @@ int main(void)
 	speech_config.bandpass_high_hz = 3000.0F;
 	assert(descriptor->speech_analysis_create_configured(&speech_config, &analysis) == RPTADV_RADIO_OK);
 	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) == RPTADV_RADIO_OK);
-	assert(descriptor->speech_analysis_reset(analysis) == RPTADV_RADIO_UNSUPPORTED);
-	assert(descriptor->speech_analysis_process(analysis, silence, 128, 0, &speech) != RPTADV_RADIO_OK);
+	assert((descriptor->speech_analysis_capabilities & RPTADV_RADIO_SPEECH_ANALYSIS_RESET_CAPABILITY) != 0);
+	assert(descriptor->speech_analysis_reset(analysis) == RPTADV_RADIO_OK);
+	assert(descriptor->speech_analysis_process(analysis, silence, 128, 1240, &speech) == RPTADV_RADIO_OK);
 	assert(speech.voice_active == 0 && speech.last_voice_source_sample == UINT64_MAX);
 	descriptor->speech_analysis_destroy(analysis);
 

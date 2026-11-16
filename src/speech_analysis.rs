@@ -174,9 +174,9 @@ pub(crate) unsafe extern "C" fn process(
     }
 }
 
-/// Retire source history without allocation; serial use of a live handle is required.
-/// Selected preprocessing returns UNSUPPORTED after closing admission and must be
-/// replaced by a newly prepared control-owned generation, not reset in place.
+/// Clear all standalone analysis history in place without observing synthetic PCM.
+/// Serial use of a live handle is required. Failure closes decisions and processing
+/// until a successful explicit retry; caller-owned programme state is untouched.
 pub(crate) unsafe extern "C" fn reset(handle: *mut SpeechAnalysis) -> i32 {
     let Some(mut handle) = NonNull::new(handle) else {
         return INVALID_ARGUMENT;
@@ -184,7 +184,7 @@ pub(crate) unsafe extern "C" fn reset(handle: *mut SpeechAnalysis) -> i32 {
     // SAFETY: The caller owns the live handle and has serialized processing.
     unsafe { handle.as_mut() }
         .vad
-        .reset()
+        .reset_analysis_history()
         .map_or_else(|error| error, |()| 0)
 }
 
@@ -201,8 +201,169 @@ pub(crate) unsafe extern "C" fn destroy(handle: *mut SpeechAnalysis) {
 mod tests {
     use super::*;
 
+    fn config(rate: u32, flags: u32) -> AnalysisConfig {
+        AnalysisConfig {
+            struct_size: size_of::<AnalysisConfig>() as u32,
+            source_rate_hz: rate,
+            maximum_source_frames: 4096,
+            speech_threshold: 0.5,
+            speech_onset_frames: 1,
+            preprocess_flags: flags,
+            bandpass_low_hz: 300.0,
+            bandpass_high_hz: 3000.0,
+        }
+    }
+
     #[test]
-    fn preprocessed_descriptor_checks_capability_configuration_and_retirement() {
+    fn explicit_analysis_reset_accepts_successor_origin() {
+        for rate in [8000, 16000, 48000, 11025] {
+            for flags in [0, 3, 5, 7] {
+                let mut handle = ptr::null_mut();
+                let mut result = AnalysisResult::default();
+                // SAFETY: Complete records and bounded samples are disjoint; this
+                // test serially owns and destroys the successfully created handle.
+                unsafe {
+                    assert_eq!(create_configured(&config(rate, flags), &mut handle), 0);
+                    assert_eq!(
+                        process(handle, [0.0; 80].as_ptr(), 80, 1000, &mut result),
+                        0
+                    );
+                    assert_eq!(reset(handle), 0, "rate={rate} flags={flags}");
+                    assert_eq!(
+                        process(handle, [0.0; 160].as_ptr(), 160, 1240, &mut result),
+                        0
+                    );
+                    assert_eq!(result.voice_active, 0);
+                    assert_eq!(result.last_voice_source_sample, u64::MAX);
+                    destroy(handle);
+                }
+            }
+        }
+    }
+
+    // Test-only rate conversion keeps the same real speech recording at each
+    // source rate. Production always uses the separately released converter.
+    fn speech_at_rate(rate: u32) -> Vec<f32> {
+        let speech: Vec<f32> = include_bytes!("../tests/fixtures/vad/yes-48000-s16le.pcm")
+            .chunks_exact(2)
+            .map(|p| f32::from(i16::from_le_bytes([p[0], p[1]])) / 32768.0)
+            .collect();
+        (0..speech.len() * rate as usize / 48000)
+            .map(|i| {
+                let position = i as f64 * 48000.0 / f64::from(rate);
+                let first = position as usize;
+                let fraction = (position - first as f64) as f32;
+                speech[first] * (1.0 - fraction)
+                    + speech[(first + 1).min(speech.len() - 1)] * fraction
+            })
+            .collect()
+    }
+
+    #[test]
+    fn explicit_analysis_reset_drops_partial_frames_and_old_speech() {
+        use crate::vad::tests::no_callback_allocations;
+        for rate in [8000, 16000, 48000, 11025] {
+            let speech = speech_at_rate(rate);
+            for flags in [0, 3, 5, 7] {
+                let mut handle = ptr::null_mut();
+                // SAFETY: Complete config and unique writable handle.
+                assert_eq!(
+                    unsafe { create_configured(&config(rate, flags), &mut handle) },
+                    0
+                );
+                let mut result = AnalysisResult::default();
+                let mut first = 5000;
+                // Dirty both recurrent histories using genuine speech.
+                for block in speech.chunks(127) {
+                    // SAFETY: Live serial handle, bounded PCM and complete result.
+                    assert_eq!(
+                        unsafe {
+                            process(
+                                handle,
+                                block.as_ptr(),
+                                block.len() as u32,
+                                first,
+                                &mut result,
+                            )
+                        },
+                        0
+                    );
+                    first += block.len() as u64;
+                }
+                assert_ne!(
+                    result.last_voice_source_sample,
+                    u64::MAX,
+                    "dirty rate={rate} flags={flags}"
+                );
+                // Repeated loss boundaries deliberately split both 480-sample
+                // preprocessing and 256-sample detector frames.
+                for partial in [1, 79, 257, 479] {
+                    let input = [0.25; 479];
+                    // SAFETY: Same unique handle with bounded disjoint buffers.
+                    assert_eq!(
+                        unsafe { process(handle, input.as_ptr(), partial, first, &mut result) },
+                        0
+                    );
+                    first += u64::from(partial) + 1003;
+                    let successor = first;
+                    no_callback_allocations(|| {
+                        // SAFETY: Reset and successor processing are serialized.
+                        unsafe {
+                            assert_eq!(reset(handle), 0);
+                            assert_eq!(
+                                process(handle, [0.0; 17].as_ptr(), 17, first, &mut result),
+                                0
+                            );
+                        }
+                    });
+                    first += 17;
+                    assert_eq!(result.voice_active, 0);
+                    assert_eq!(result.last_voice_source_sample, u64::MAX);
+                    for _ in 0..(rate / 127 + 1) {
+                        // SAFETY: Real caller silence, not a reset-time observation.
+                        assert_eq!(
+                            unsafe {
+                                process(handle, [0.0; 127].as_ptr(), 127, first, &mut result)
+                            },
+                            0
+                        );
+                        first += 127;
+                        assert_eq!(result.voice_active, 0, "silence rate={rate} flags={flags}");
+                        assert_eq!(result.last_voice_source_sample, u64::MAX);
+                    }
+                    let speech_start = first;
+                    let mut positive = false;
+                    for block in speech.chunks(127) {
+                        // SAFETY: Live serial handle, bounded PCM and complete result.
+                        assert_eq!(
+                            unsafe {
+                                process(
+                                    handle,
+                                    block.as_ptr(),
+                                    block.len() as u32,
+                                    first,
+                                    &mut result,
+                                )
+                            },
+                            0
+                        );
+                        first += block.len() as u64;
+                        positive |= result.voice_active != 0;
+                        if result.last_voice_source_sample != u64::MAX {
+                            assert!((successor..first).contains(&result.last_voice_source_sample));
+                            assert!(result.last_voice_source_sample >= speech_start);
+                        }
+                    }
+                    assert!(positive, "genuine recovery rate={rate} flags={flags}");
+                }
+                // SAFETY: All callback uses stopped; return ownership once.
+                unsafe { destroy(handle) };
+            }
+        }
+    }
+
+    #[test]
+    fn preprocessed_descriptor_checks_capability_configuration_and_explicit_reset() {
         let descriptor = unsafe { &*crate::rptadv_radio_descriptor() };
         assert_eq!(descriptor.speech_analysis_capabilities & 1, 1);
         let mut config = AnalysisConfig {
@@ -238,13 +399,10 @@ mod tests {
                 );
                 assert_eq!(result.voice_active, 0);
             }
-            // A graph cannot be fully reset in place. Retire without admitting
-            // successor PCM; the caller prepares a replacement outside audio.
+            // Explicit reset clears the complete graph; implicit source jumps
+            // retain their separate retirement contract.
+            assert_eq!((descriptor.speech_analysis_reset)(handle), 0);
             assert_eq!(
-                (descriptor.speech_analysis_reset)(handle),
-                crate::session::UNSUPPORTED
-            );
-            assert_ne!(
                 (descriptor.speech_analysis_process)(handle, samples.as_ptr(), 160, 0, &mut result),
                 0
             );

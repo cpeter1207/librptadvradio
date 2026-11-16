@@ -84,3 +84,23 @@ void swr_test_realtime_checkpoint(const char *phase)
 	swr_test_realtime_end();
 	swr_test_realtime_begin();
 }
+
+
+/** @brief Prove real allocation/free interception before relying on the guard. */
+int swr_test_realtime_control(void)
+{
+    allocations = 0;
+    frees = 0;
+    armed = 1;
+    void *(*volatile allocate)(size_t) = malloc;
+    void (*volatile release)(void *) = free;
+    volatile unsigned char *memory = allocate(16);
+    if (memory)
+        memory[0] = 1;
+    release((void *)memory);
+    armed = 0;
+    int passed = allocations != 0 && frees != 0;
+    allocations = 0;
+    frees = 0;
+    return passed;
+}

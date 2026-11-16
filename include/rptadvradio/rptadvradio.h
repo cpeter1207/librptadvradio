@@ -476,6 +476,7 @@ struct rptadv_speech_analysis_config {
 #define RPTADV_SPEECH_PREPROCESS_RNNOISE 4U /**< Apply the released default RNNoise model. */
 #define RPTADV_RADIO_SPEECH_PREPROCESSING_CAPABILITY UINT64_C(1) /**< Extended source configuration. */
 #define RPTADV_RADIO_LOCAL_SPEECH_CAPABILITY UINT64_C(2) /**< Local settings tail and retirement query. */
+#define RPTADV_RADIO_SPEECH_ANALYSIS_RESET_CAPABILITY UINT64_C(4) /**< Full explicit standalone reset. */
 
 /** @brief Shared classifier output on the input source sample clock. */
 struct rptadv_speech_analysis_result {
@@ -586,9 +587,13 @@ struct rptadv_radio_descriptor {
   enum rptadv_radio_result (*speech_analysis_process)(
       struct rptadv_speech_analysis *, const float *, uint32_t,
       uint64_t first_source_sample, struct rptadv_speech_analysis_result *);
-  /** Clear plain classifier/converter history without allocation. A selected
-   * preprocessed chain instead closes admission and returns UNSUPPORTED until
-   * replaced off audio; the complete frontend has no in-place history reset. */
+  /** With SPEECH_ANALYSIS_RESET_CAPABILITY, clear all accepted standalone
+   * classifier/converter/filter/RNNoise history in place without allocation,
+   * free, locks, I/O or synthetic observations. Serialized with process; the
+   * next genuine span establishes its actual source origin. Failure clears
+   * decisions and rejects processing until an explicit reset succeeds.
+   * Caller-owned programme ring, hold, admission and source age are unchanged.
+   * This operation does not change implicit discontinuity or carrier policy. */
   enum rptadv_radio_result (*speech_analysis_reset)(struct rptadv_speech_analysis *);
   /** Destroy a stopped uniquely owned classifier off audio; null is accepted. */
   void (*speech_analysis_destroy)(struct rptadv_speech_analysis *);

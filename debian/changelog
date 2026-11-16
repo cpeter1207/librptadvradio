@@ -3,6 +3,8 @@ librptadvradio (0.1.0~alpha12-1) UNRELEASED; urgency=medium
   * Append per-source score/onset setup to the existing ABI 5 descriptor.
   * Keep radio and legacy speech defaults at threshold 0.5 and one frame.
   * Preserve SONAME 5, dynamic providers and caller-owned programme retention.
+  * Local explicit analysis reset candidate; RNNoise reset release floor remains
+    unassigned. Do not publish until the qualified dependency floor is recorded.
 
  -- Chris Peterson <cpeter1207@users.noreply.github.com>  Sat, 14 Nov 2026 12:00:00 +0000
 

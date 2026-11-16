@@ -164,6 +164,8 @@ pub struct SpeechVad {
     active: Option<Active>,
     expected_next: Option<u64>,
     needs_rearm: bool,
+    /// Failed explicit history reset cannot recover via implicit burst rearm.
+    analysis_reset_failed: bool,
 }
 impl SpeechVad {
     /// Prepare mode 0/1/2 and a 0..32767 ms hang outside the audio callback.
@@ -251,6 +253,7 @@ impl SpeechVad {
             active,
             expected_next: None,
             needs_rearm: false,
+            analysis_reset_failed: false,
         })
     }
     /// Analyze an undelayed finite mono source span without changing programme PCM.
@@ -271,6 +274,9 @@ impl SpeechVad {
         let end = first_native_sample
             .checked_add(native_mono.len() as u64)
             .ok_or(INVALID_ARGUMENT)?;
+        if self.analysis_reset_failed {
+            return Err(PROVIDER_FAILED);
+        }
         if self
             .expected_next
             .is_some_and(|next| next != first_native_sample)
@@ -322,8 +328,9 @@ impl SpeechVad {
         self.needs_rearm && self.preprocessing_active()
     }
     /// Retire all source history. Plain analysis can rearm in place without allocation.
-    /// A preprocessed generation requires control-prepared replacement: the released
-    /// frontend has no full history reset. Admission closes before reporting this.
+    /// Session and implicit-discontinuity policy deliberately require a prepared
+    /// replacement for preprocessing. Standalone explicit reset is separate;
+    /// admission closes before reporting retirement here.
     pub fn reset(&mut self) -> Result<(), i32> {
         if self.preprocessing_active() {
             self.needs_rearm = true;
@@ -332,6 +339,21 @@ impl SpeechVad {
             return Err(crate::session::UNSUPPORTED);
         }
         self.rearm_admission()
+    }
+    /// Reset standalone analysis only, without predicting or consuming PCM.
+    /// Clear decisions and source expectation before fallible provider operations;
+    /// failure remains closed until this explicit operation succeeds on retry.
+    pub(crate) fn reset_analysis_history(&mut self) -> Result<(), i32> {
+        self.analysis_reset_failed = true;
+        self.needs_rearm = true;
+        self.expected_next = None;
+        self.policy.set_raw(false);
+        if let Some(active) = &mut self.active {
+            active.reset_analysis_history()?;
+        }
+        self.needs_rearm = false;
+        self.analysis_reset_failed = false;
+        Ok(())
     }
     /// Clear carrier admission and classifier history while continuous DSP advances.
     fn rearm_admission(&mut self) -> Result<(), i32> {
@@ -421,8 +443,24 @@ impl Active {
         self.client.reset()?;
         self.detector.reset();
         for _ in 0..3 {
+            #[cfg(test)]
+            tests::record_prediction();
             self.detector.predict_f32(&[0.0; 256]);
         }
+        Ok(())
+    }
+    /// Dedicated genuine-only reset; carrier rearm keeps its existing behavior.
+    fn reset_analysis_history(&mut self) -> Result<(), i32> {
+        if let Some(front) = &mut self.front {
+            front.reset()?;
+        }
+        self.client.reset()?;
+        self.detector.reset();
+        self.frame.fill(0.0);
+        self.used = 0;
+        self.origin = 0;
+        self.analysis_origin = None;
+        self.input.fill(0.0);
         Ok(())
     }
     fn process_closed(&mut self, native: &[f32], first: u64) -> Result<(), i32> {
@@ -481,6 +519,8 @@ impl Active {
                 self.frame[self.used] = sample.clamp(-1.0, 1.0);
                 self.used += 1;
                 if self.used == 256 {
+                    #[cfg(test)]
+                    tests::record_prediction();
                     let score = self.detector.predict_f32(&self.frame);
                     self.record_mapped_frame(
                         score,
@@ -1053,6 +1093,111 @@ pub(crate) mod tests {
             unsafe { (descriptor.speech_analysis_destroy)(handle) };
         }
     }
+    thread_local! {
+        static PREDICTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn record_prediction() {
+        PREDICTIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    #[test]
+    fn explicit_analysis_reset_has_no_synthetic_predictions() {
+        for rate in [8000, 16000, 48000, 11025] {
+            for flags in [0, 3, 5, 7] {
+                let settings = super::PreprocessSettings::from_flags(flags, 300.0, 3000.0).unwrap();
+                let mut vad = SpeechVad::preprocessed(rate, 2, 0, 4096, 0.5, 1, settings).unwrap();
+                vad.process(&[0.25; 4093], true, 1000).unwrap();
+                assert!(
+                    vad.active.as_ref().unwrap().used > 0,
+                    "partial neural frame rate={rate} flags={flags}"
+                );
+                let before = PREDICTIONS.with(|count| count.get());
+                let rn_before = crate::analysis_frontend::reset_tests::process_calls();
+                no_callback_allocations(|| vad.reset_analysis_history().unwrap());
+                assert_eq!(PREDICTIONS.with(|count| count.get()), before);
+                assert_eq!(
+                    crate::analysis_frontend::reset_tests::process_calls(),
+                    rn_before
+                );
+                let active = vad.active.as_ref().unwrap();
+                assert_eq!(active.used, 0);
+                assert!(
+                    active
+                        .frame
+                        .iter()
+                        .chain(active.input.iter())
+                        .all(|s| *s == 0.0)
+                );
+                assert_eq!(active.origin, 0);
+                assert_eq!(active.analysis_origin, None);
+                assert_eq!(vad.expected_next, None);
+                assert_eq!(vad.policy.score, 0.0);
+                assert_eq!(vad.policy.positive_frames, 0);
+                assert_eq!(vad.policy.last_voice, None);
+                // The instrumentation is live: genuine input really predicts.
+                no_callback_allocations(|| {
+                    vad.process(&[0.0; 4096], true, 9000).unwrap();
+                });
+                assert!(PREDICTIONS.with(|count| count.get()) > before);
+                if flags & 4 != 0 {
+                    assert!(crate::analysis_frontend::reset_tests::process_calls() > rn_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_analysis_reset_failure_requires_successful_retry() {
+        use crate::samplerate_client::{TestFailure, with_test_failure};
+        use crate::session::PROVIDER_FAILED;
+        // Plain downstream, frontend upconverter, frontend RNNoise, and
+        // downstream after a successfully reset frontend respectively.
+        for (rate, flags, rn_failure) in [
+            (8000, 0, false),
+            (8000, 7, false),
+            (8000, 7, true),
+            (48000, 7, false),
+        ] {
+            let settings = super::PreprocessSettings::from_flags(flags, 300.0, 3000.0).unwrap();
+            let mut vad = SpeechVad::preprocessed(rate, 2, 0, 4096, 0.5, 1, settings).unwrap();
+            vad.process(&[0.25; 1081], true, 1000).unwrap();
+            if rn_failure {
+                crate::analysis_frontend::reset_tests::set_reset_failure(
+                    vad.active.as_mut().unwrap().front.as_mut().unwrap(),
+                    true,
+                );
+            }
+            no_callback_allocations(|| {
+                let result = if rn_failure {
+                    vad.reset_analysis_history()
+                } else {
+                    with_test_failure(TestFailure::Reset, || vad.reset_analysis_history())
+                };
+                assert_eq!(result, Err(PROVIDER_FAILED));
+            });
+            assert_eq!(vad.expected_next, None);
+            assert_eq!(vad.policy.score, 0.0);
+            assert_eq!(vad.policy.last_voice, None);
+            // Removing the provider fault must NOT implicitly recover a failed
+            // explicit reset, even in plain mode.
+            if rn_failure {
+                crate::analysis_frontend::reset_tests::set_reset_failure(
+                    vad.active.as_mut().unwrap().front.as_mut().unwrap(),
+                    false,
+                );
+            }
+            no_callback_allocations(|| {
+                assert_eq!(vad.process(&[0.0; 160], true, 9000), Err(PROVIDER_FAILED));
+                assert_eq!(vad.process(&[0.0; 160], true, 9160), Err(PROVIDER_FAILED));
+                vad.reset_analysis_history().unwrap();
+                let result = vad.process(&[0.0; 160], true, 10000).unwrap();
+                assert!(!result.voice_active);
+                assert_eq!(result.last_voice_sample_index, None);
+            });
+        }
+    }
+
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     thread_local! {
@@ -1095,7 +1240,24 @@ pub(crate) mod tests {
         let begin = unsafe { dlsym(std::ptr::null_mut(), c"swr_test_realtime_begin".as_ptr()) };
         // SAFETY: The test looks up a named interposer symbol without calling a null pointer.
         let end = unsafe { dlsym(std::ptr::null_mut(), c"swr_test_realtime_end".as_ptr()) };
+        // SAFETY: Optional test interposer symbol has process lifetime.
+        let control = unsafe { dlsym(std::ptr::null_mut(), c"swr_test_realtime_control".as_ptr()) };
         let required = std::env::var_os("RPTADV_REQUIRE_ALLOC_GUARD").is_some();
+        if required {
+            assert!(!control.is_null(), "required C allocation control missing");
+        }
+        if !control.is_null() {
+            // SAFETY: The named test function has the known int(void) signature.
+            let control = unsafe {
+                std::mem::transmute::<*mut std::ffi::c_void, unsafe extern "C" fn() -> i32>(control)
+            };
+            // SAFETY: Control runs outside the guarded callback.
+            assert_eq!(
+                unsafe { control() },
+                1,
+                "C allocation control did not intercept"
+            );
+        }
         if required {
             assert!(
                 !begin.is_null() && !end.is_null(),

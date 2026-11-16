@@ -2,6 +2,8 @@ Source: librptadvradio
 Section: libs
 Priority: optional
 Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
+# Reset release floor UNASSIGNED: historical RNNoise build/runtime bounds below
+# do not promise reset. Publication blocked; see SPEECH_CONFIGURATION.md.
 Build-Depends: cargo (>= 1.87), debhelper-compat (= 13), librptadvctcss-dev (>= 0.1.0~alpha2-1), librptadvdcs-dev (>= 0.1.0~alpha1-1), librptadvsquelch-dev (>= 0.1.0~alpha2-1), librptadv-samplerate-adapter-dev (>= 0.2.0~alpha2-1), librptadv-rnnoise-adapter-dev (>= 0.1.0~alpha2-1), pkg-config, rustc (>= 1.87)
 Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/librptadvradio

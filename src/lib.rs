@@ -184,7 +184,7 @@ static DESCRIPTOR: RadioDescriptor = RadioDescriptor {
     speech_analysis_reset: speech_analysis::reset,
     speech_analysis_destroy: speech_analysis::destroy,
     speech_analysis_create_configured: speech_analysis::create_configured,
-    speech_analysis_capabilities: 3,
+    speech_analysis_capabilities: 7,
     session_analysis_replacement_needed: session::analysis_replacement_needed,
 };
 

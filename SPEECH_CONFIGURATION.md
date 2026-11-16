@@ -1,10 +1,11 @@
 # Configured source speech analysis
 
-Candidate alpha12 appends speech_analysis_create_configured to ABI 5 without
-changing any earlier field or callback offset. On native 64-bit platforms the
-old descriptor prefix is 176 bytes and the new descriptor is 184 bytes; its sized
-configuration is 20 bytes. SONAME 5 and the existing package names remain unchanged.
-Consumers must check the configured tail's minimum readable size before use.
+The local alpha12 candidate extends standalone speech configuration in ABI 5
+without moving existing callback offsets. The configured prefix ends at 184
+bytes on native 64-bit platforms; preprocessing extends the configuration to
+32 bytes and adds the capability word, followed by the local-session retirement
+query. SONAME 5 and existing package names remain unchanged. Consumers must check
+the appropriate descriptor prefix and capability bits before using extensions.
 An older provider cannot satisfy this opt-in capability; do not read past its
 published prefix. Existing radio sessions and speech_analysis_create retain
 the 0.5 threshold/one-frame behavior.
@@ -48,3 +49,48 @@ The failed hypothesis/log were retained separately; tests instead enforce
 actual frame counts, source coordinates, resets, unchanged defaults, callback
 storage behavior and caller-owned retained-window semantics. No delay buffer
 was enlarged to disguise the sensitivity tradeoff.
+
+
+## Explicit standalone history reset (local candidate)
+
+Check the readable capability word and
+`RPTADV_RADIO_SPEECH_ANALYSIS_RESET_CAPABILITY` (bit 4) before relying on full
+`speech_analysis_reset`. This bit promises in-place reset for every accepted
+standalone configuration: plain, bandpass, RNNoise, or both.
+
+Reset clears analysis converters, FIR/RNNoise history, partial 480/256-sample
+frames, classifier decisions, scratch and source-map tags. It retains prepared
+storage, coefficients, handles and processing delay. It performs no RNNoise
+processing or Earshot prediction, so reset creates no synthetic observation.
+The next genuine source span supplies the new origin. SRC fractional phase is
+retained by its provider; pre-origin startup positions remain unqualified and
+are excluded before classifier input, not treated as previous-source evidence.
+
+An error invalidates the decision and rejects further input until a successful
+explicit reset retry. This differs deliberately from the unchanged implicit
+source-jump retirement and local carrier/replacement policies. Caller-owned
+programme ring, hold, admission, source age and programme RNNoise bypass are
+untouched.
+
+RNNoise-selected setup now requires the checked appended reset operation on
+`librptadv_rnnoise_adapter.so.1`. A short descriptor or missing reset is rejected,
+without falling back to plain analysis or binding upstream RNNoise directly.
+
+### Dependency identity and publication block
+
+The isolated qualification candidate is RNNoise adapter source
+`b25f187d958c9866430bdf968c2b2bb579e5d667`, with adapter DSO SHA256
+`7ae93fc02b44f7c3f4d5ae7fab7e5f0cec716458e03cf7f275f7b95129ed4816`
+and upstream RNNoise DSO SHA256
+`4d869024a18d1c03b6a9dabac6780af0ae1ad5424322ad7204fe9448aace67c1`.
+It is dynamically selected through isolated library paths, not installed over
+host libraries.
+
+No qualified release version or package floor has been assigned to the reset
+contract. Existing alpha2 RNNoise and alpha12 radio metadata do not identify a
+released reset-capable pair. The historical Debian build/runtime lower bounds
+remain unchanged and are insufficient to claim reset support. Publication is
+blocked until the actual first qualified versions are assigned and synchronized
+in Cargo, Makefile, Debian build/runtime dependencies and package metadata.
+Native ARM64, complete package gates and production line/branch coverage remain
+required; local amd64 evidence is not a release or hardware qualification.

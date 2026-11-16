@@ -2,7 +2,8 @@
 //!
 //! A front end owns one continuous source generation. Carrier admission is a
 //! separate classifier policy: closed spans still advance this state. Creation
-//! and destruction belong to the control owner; no full graph reset is implied.
+//! and destruction belong to the control owner. Explicit standalone analysis
+//! reset clears owned histories in place; carrier transitions do not imply it.
 
 use crate::samplerate_client::Client;
 use crate::session::{PROVIDER_FAILED, UNSUPPORTED};
@@ -40,6 +41,7 @@ unsafe fn check_descriptor<T>(pointer: *const T, name: &[u8]) -> Result<(), i32>
 }
 
 type Destroy = unsafe extern "C" fn(*mut c_void);
+type RnReset = unsafe extern "C" fn(*mut c_void) -> i32;
 type RnProcess = unsafe extern "C" fn(*mut c_void, *const f32, u32, *mut f32, *mut f32) -> i32;
 #[repr(C)]
 struct RnDescriptor {
@@ -47,6 +49,7 @@ struct RnDescriptor {
     create: Option<unsafe extern "C" fn(u32, u32, u32, *mut *mut c_void) -> i32>,
     process: Option<RnProcess>,
     destroy: Option<Destroy>,
+    reset: Option<RnReset>,
 }
 #[link(
     name = "librptadv_rnnoise_adapter.so.1",
@@ -60,16 +63,23 @@ struct Denoiser {
     handle: NonNull<c_void>,
     process: RnProcess,
     destroy: Destroy,
+    reset: RnReset,
 }
 impl Denoiser {
     fn new() -> Result<Self, i32> {
         // SAFETY: The released adapter owns this immutable process-lifetime descriptor.
         let pointer = unsafe { rptadv_rnnoise_adapter_descriptor() };
         // SAFETY: The linked provider supplies the descriptor prefix.
+        unsafe { Self::from_descriptor(pointer) }
+    }
+    unsafe fn from_descriptor(pointer: *const RnDescriptor) -> Result<Self, i32> {
+        // SAFETY: Caller supplies a readable common prefix; check its declared
+        // size before reading the appended reset operation or any other tail.
         unsafe { check_descriptor(pointer, b"rptadv.rnnoise") }?;
         // SAFETY: The size and capability check covers this complete descriptor.
         let api = unsafe { &*pointer };
-        let (Some(create), Some(process), Some(destroy)) = (api.create, api.process, api.destroy)
+        let (Some(create), Some(process), Some(destroy), Some(reset)) =
+            (api.create, api.process, api.destroy, api.reset)
         else {
             return Err(UNSUPPORTED);
         };
@@ -87,9 +97,20 @@ impl Denoiser {
             handle: NonNull::new(raw).ok_or(PROVIDER_FAILED)?,
             process,
             destroy,
+            reset,
         })
     }
+    fn reset(&mut self) -> Result<(), i32> {
+        // SAFETY: Serial owner retains the live handle; the checked adapter reset
+        // preserves its prepared allocation and consumes no PCM.
+        if unsafe { (self.reset)(self.handle.as_ptr()) } != 0 {
+            return Err(PROVIDER_FAILED);
+        }
+        Ok(())
+    }
     fn process(&mut self, input: &[f32; FRAME], output: &mut [f32; FRAME]) -> Result<(), i32> {
+        #[cfg(test)]
+        reset_tests::record_process();
         let mut probability = 0.0;
         // SAFETY: A serial owner supplies disjoint fixed-size normalized mono frames.
         let result = unsafe {
@@ -302,6 +323,30 @@ impl FrontEnd {
                 processing_delay,
             },
         })
+    }
+    /// Clear owned analysis history without allocation or synthetic observations.
+    /// A failure requires a successful explicit retry before processing resumes.
+    /// Prepared coefficients, provider handles, storage and delay are retained.
+    pub(crate) fn reset(&mut self) -> Result<(), i32> {
+        if let Some(up) = &mut self.up {
+            up.reset()?;
+        }
+        if let Some(filter) = &mut self.bandpass {
+            filter.history.fill(0);
+        }
+        if let Some(rn) = &mut self.rn {
+            rn.reset()?;
+        }
+        self.frame.fill(0.0);
+        self.filtered.fill(0.0);
+        self.output.fill(0.0);
+        self.used = 0;
+        self.produced = 0;
+        self.source_origin = None;
+        self.accepted_source = 0;
+        self.map.positions.fill(0);
+        self.map.tags.fill(u64::MAX);
+        Ok(())
     }
     /// Consume one contiguous source span; emit complete 48 kHz analysis blocks.
     pub(crate) fn process(
@@ -612,5 +657,139 @@ mod allocation_tests {
         no_callback_allocations(|| stage.process(&input, &mut output).unwrap());
         eprintln!("bandpass: processing complete; control-owned destruction unarmed");
         drop(stage);
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+pub(crate) mod reset_tests {
+    use super::*;
+    thread_local! {
+        static PROCESS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(super) fn record_process() {
+        PROCESS_CALLS.with(|count| count.set(count.get() + 1));
+    }
+    pub(crate) fn process_calls() -> usize {
+        PROCESS_CALLS.with(|count| count.get())
+    }
+    unsafe extern "C" fn failed_reset(_: *mut c_void) -> i32 {
+        PROVIDER_FAILED
+    }
+    pub(crate) fn set_reset_failure(front: &mut FrontEnd, fail: bool) {
+        // SAFETY: Tests use the known complete candidate descriptor.
+        let real = unsafe { (*rptadv_rnnoise_adapter_descriptor()).reset.unwrap() };
+        front.rn.as_mut().unwrap().reset = if fail { failed_reset } else { real };
+    }
+
+    #[test]
+    fn explicit_analysis_reset_preserves_fractional_source_mapping() {
+        for rate in [8000, 16000, 48000, 11025] {
+            for flags in [3, 5, 7] {
+                let settings = PreprocessSettings::from_flags(flags, 300.0, 3000.0).unwrap();
+                let mut front = FrontEnd::new(rate, 4096, settings).unwrap();
+                let delay = front.map.processing_delay;
+                let mut origin = 1000;
+                for partial in [1, 79, 257, 479] {
+                    front
+                        .process(&[0.25; 479][..partial], origin, |_, _, _| Ok(()))
+                        .unwrap();
+                    front.reset().unwrap();
+                    assert_eq!(front.used, 0);
+                    assert_eq!(front.produced, 0);
+                    assert_eq!(front.accepted_source, 0);
+                    assert_eq!(front.source_origin, None);
+                    assert_eq!(front.map.processing_delay, delay);
+                    assert!(
+                        front
+                            .frame
+                            .iter()
+                            .chain(front.filtered.iter())
+                            .chain(front.output.iter())
+                            .all(|s| *s == 0.0)
+                    );
+                    assert!(front.map.positions.iter().all(|p| *p == 0));
+                    assert!(front.map.tags.iter().all(|p| *p == u64::MAX));
+                    if let Some(filter) = &front.bandpass {
+                        assert!(filter.history.iter().all(|s| *s == 0));
+                    }
+                    origin += 10003;
+                    let mut last = None;
+                    let mut mapped = 0;
+                    let mut emitted = 0;
+                    for block in 0..16 {
+                        front
+                            .process(&[0.0; 127], origin + block * 127, |output, first, map| {
+                                emitted += 1;
+                                // Reset must remove old sample/filter/RNNoise tail.
+                                assert!(output.iter().all(|s| s.abs() < 1.0e-12));
+                                for i in 0..output.len() {
+                                    if let Some(position) =
+                                        map.source_position(i128::from(first) + i as i128)?
+                                    {
+                                        // SRC reset retains phase and reports its real startup
+                                        // latency. Active excludes pre-origin coordinates before
+                                        // Earshot; they are not old source evidence.
+                                        if position < origin {
+                                            assert!(
+                                                last.is_none(),
+                                                "startup after qualified mapping"
+                                            );
+                                            continue;
+                                        }
+                                        assert!(position < origin + (block + 1) * 127);
+                                        assert!(last.is_none_or(|old| position >= old));
+                                        last = Some(position);
+                                        mapped += 1;
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                    assert!(emitted > 0 && mapped > 0);
+                    // Each cycle starts from a deliberately partial new frame.
+                    front.reset().unwrap();
+                    origin += 16 * 127 + 1009;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_analysis_reset_rejects_short_or_missing_rnnoise_tail() {
+        // SAFETY: Read the current linked candidate, then use complete local
+        // descriptors with deliberately short advertised readable prefixes.
+        let pointer = unsafe { rptadv_rnnoise_adapter_descriptor() };
+        let prefix_size = std::mem::offset_of!(RnDescriptor, reset);
+        let short = Prefix {
+            size: size_of::<Prefix>() as u32,
+            version: 1,
+            name: c"rptadv.rnnoise".as_ptr(),
+        };
+        // SAFETY: The readable prefix declares no tail; setup must reject it
+        // before constructing a full-descriptor reference.
+        assert!(matches!(
+            unsafe { Denoiser::from_descriptor((&short as *const Prefix).cast()) },
+            Err(UNSUPPORTED)
+        ));
+        for size in [prefix_size, size_of::<RnDescriptor>() - 1] {
+            let mut api = unsafe { std::ptr::read(pointer) };
+            api._prefix.size = size as u32;
+            assert!(matches!(
+                unsafe { Denoiser::from_descriptor(&api) },
+                Err(UNSUPPORTED)
+            ));
+        }
+        let mut api = unsafe { std::ptr::read(pointer) };
+        api.reset = None;
+        assert!(matches!(
+            unsafe { Denoiser::from_descriptor(&api) },
+            Err(UNSUPPORTED)
+        ));
+        assert!(matches!(
+            unsafe { Denoiser::from_descriptor(ptr::null()) },
+            Err(UNSUPPORTED)
+        ));
     }
 }
