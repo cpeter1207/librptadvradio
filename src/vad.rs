@@ -434,8 +434,22 @@ impl Active {
     fn process(&mut self, native: &[f32], policy: &mut Policy, end: u64) -> Result<(), i32> {
         if let Some(mut front) = self.front.take() {
             let result = front.process(native, end - native.len() as u64, |frame, start, map| {
-                let origin = *self.analysis_origin.get_or_insert(start);
-                self.analyze(frame, policy, end, Some((map, origin)))
+                // Continuous preprocessing may still emit the previous carrier's
+                // samples. Exclude those before the SRC and neural history, not
+                // merely after classification, so a new burst owns its onset.
+                let mut first = 0;
+                while first < frame.len()
+                    && map
+                        .source_position(i128::from(start) + first as i128)?
+                        .is_none_or(|position| position < self.origin)
+                {
+                    first += 1;
+                }
+                if first == frame.len() {
+                    return Ok(());
+                }
+                let origin = *self.analysis_origin.get_or_insert(start + first as u64);
+                self.analyze(&frame[first..], policy, end, Some((map, origin)))
             });
             // Return the prepared owner on every result; never destroy it on audio.
             self.front = Some(front);
@@ -553,6 +567,45 @@ pub(crate) mod tests {
             let front = vad.active.as_ref().unwrap().front.as_ref().unwrap();
             assert_eq!(front.accepted_source, 20 * 127);
             assert!(input.iter().all(|sample| sample.to_bits() == 0));
+        }
+    }
+
+    #[test]
+    fn closed_carrier_speech_cannot_qualify_reopened_silence() {
+        let speech = pcm(include_bytes!("../tests/fixtures/vad/yes-48000-s16le.pcm"));
+        for (rate, step) in [(8000, 6), (16000, 3), (48000, 1)] {
+            let source: Vec<f32> = speech.iter().step_by(step).copied().collect();
+            for (threshold, onset) in [(0.5, 1), (0.6125, 4), (0.75, 2)] {
+                for enabled in [false, true] {
+                    for boundary in (10560..19200).step_by(1440) {
+                        for offset in [0, 1, 127] {
+                            let cutoff = boundary / step + offset;
+                            let settings = super::PreprocessSettings {
+                                enabled,
+                                ..Default::default()
+                            };
+                            let mut vad = SpeechVad::preprocessed(
+                                rate, 2, 1000, 960, threshold, onset, settings,
+                            )
+                            .unwrap();
+                            let mut clock = 1234;
+                            for block in source[..cutoff].chunks(127) {
+                                let result = vad.process(block, false, clock).unwrap();
+                                assert!(!result.admitted);
+                                clock += block.len() as u64;
+                            }
+                            for _ in 0..120 {
+                                let result = vad.process(&[0.0; 127], true, clock).unwrap();
+                                clock += 127;
+                                assert!(
+                                    !result.admitted,
+                                    "closed speech admitted reopened silence: rate={rate} threshold={threshold} onset={onset} enabled={enabled} cutoff={cutoff} clock={clock} decision={result:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
