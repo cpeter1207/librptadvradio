@@ -18,6 +18,7 @@ their implementation or lifetime. Prepared per-tone CTCSS notch ports let the
 session select the decoded tone without rebuilding a graph in real time.
 Carrier sources include GPIO, parallel inputs, DSP noise squelch, VOX, and an
 independent external snapshot. External snapshots must be marked valid.
+A station with an external CTCSS indication can use `RPTADV_RADIO_SUBAUDIBLE_EXTERNAL` when the sized ABI-5 descriptor reaches `RPTADV_RADIO_DESCRIPTOR_QUALIFICATION_MIN_SIZE` and advertises `RPTADV_RADIO_FEATURE_EXTERNAL_TONE`. Pass the independent `RPTADV_RADIO_RECEIVE_EXTERNAL_TONE_VALID` and `RPTADV_RADIO_RECEIVE_EXTERNAL_TONE_PRESENT` receive bits for each block. Losing validity closes reception through this qualifier even when tone override is enabled. The control owner supplies the snapshot; the radio callback performs no device I/O.
 Open carrier keeps receive available while still requiring the selected CTCSS
 or DCS qualifier. CTCSS qualification follows the configured carrier source.
 Receive processing is returned to the adapter with qualification; ABI 5

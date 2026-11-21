@@ -74,6 +74,7 @@ enum rptadv_radio_subaudible_source {
   RPTADV_RADIO_SUBAUDIBLE_DSP = 3, /**< Native CTCSS or DCS decoder. */
   RPTADV_RADIO_SUBAUDIBLE_PARALLEL = 4, /**< Normal parallel input. */
   RPTADV_RADIO_SUBAUDIBLE_PARALLEL_INVERTED = 5, /**< Inverted parallel input. */
+  RPTADV_RADIO_SUBAUDIBLE_EXTERNAL = 6, /**< Independent normalized tone, validity required. */
 };
 
 /** @brief Transmit CTCSS/DCS turn-off policy. */
@@ -270,7 +271,9 @@ struct rptadv_radio_session_ports {
 enum rptadv_radio_receive_flags {
   RPTADV_RADIO_RECEIVE_TONE_OVERRIDE = 1, /**< Admit carrier without decoded tone. */
   RPTADV_RADIO_RECEIVE_EXTERNAL_COR_VALID = 2, /**< Independent COR snapshot is fresh. */
-  RPTADV_RADIO_RECEIVE_EXTERNAL_COR_PRESENT = 4 /**< Independent COR is asserted. */
+  RPTADV_RADIO_RECEIVE_EXTERNAL_COR_PRESENT = 4, /**< Independent COR is asserted. */
+  RPTADV_RADIO_RECEIVE_EXTERNAL_TONE_VALID = 8, /**< Selected external tone sample is fresh. */
+  RPTADV_RADIO_RECEIVE_EXTERNAL_TONE_PRESENT = 16 /**< External tone is asserted. Tone flags are ignored for other qualifiers. */
 };
 /** @brief Hardware snapshots supplied to one receive callback. */
 struct rptadv_radio_receive_input {
@@ -575,7 +578,14 @@ struct rptadv_radio_descriptor {
   enum rptadv_radio_result (*speech_analysis_create_configured)(
       const struct rptadv_speech_analysis_config *,
       struct rptadv_speech_analysis **out_analysis);
+  /** Optional qualification capabilities; inspect only after checking the field's size. */
+  uint32_t qualification_features;
 };
+
+/** @brief Size needed to read qualification_features. */
+#define RPTADV_RADIO_DESCRIPTOR_QUALIFICATION_MIN_SIZE (offsetof(struct rptadv_radio_descriptor, qualification_features) + sizeof(uint32_t))
+/** @brief Permits SUBAUDIBLE_EXTERNAL and its two independent receive flags. */
+#define RPTADV_RADIO_FEATURE_EXTERNAL_TONE UINT32_C(1)
 
 /** @brief Required readable prefix for optional shared speech-analysis operations. */
 #define RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE \
