@@ -34,7 +34,8 @@ _Static_assert(sizeof(struct rptadv_speech_analysis_config) == 20,
                "speech setup uses five scalar fields");
 _Static_assert(sizeof(void *) != 8 ||
                (RPTADV_RADIO_DESCRIPTOR_SPEECH_ANALYSIS_MIN_SIZE == 176 &&
-                sizeof(struct rptadv_radio_descriptor) == 184),
+                RPTADV_RADIO_DESCRIPTOR_CONFIGURED_SPEECH_MIN_SIZE == 184 &&
+                offsetof(struct rptadv_radio_descriptor, qualification_features) == 184),
                "64-bit speech descriptor sizes changed");
 
 struct processor_context {
@@ -119,6 +120,8 @@ static struct rptadv_radio_session_config valid_config(void)
 int main(void)
 {
 	const struct rptadv_radio_descriptor *descriptor = rptadv_radio_descriptor();
+    assert(descriptor->struct_size >= RPTADV_RADIO_DESCRIPTOR_QUALIFICATION_MIN_SIZE);
+    assert(descriptor->qualification_features & RPTADV_RADIO_FEATURE_EXTERNAL_TONE);
 	struct rptadv_radio_session_config config = valid_config();
 	struct processor_context deemphasis = { .scale = 1.0F, .bias = 0.1F };
 	struct processor_context filter = { .scale = 2.0F };

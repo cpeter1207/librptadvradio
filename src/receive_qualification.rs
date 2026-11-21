@@ -53,6 +53,8 @@ pub enum SubaudibleSource {
     Parallel,
     /// Use the inverted parallel input.
     ParallelInverted,
+    /// Normalized external tone snapshot with independent freshness.
+    External,
 }
 
 /// Signal mode relevant to CTCSS and DCS qualification.
@@ -91,6 +93,8 @@ pub struct Config {
 pub struct Inputs {
     /// Independent normalized carrier; `None` is unavailable/stale, never fallback.
     pub external_carrier: Option<bool>,
+    /// Independent external tone, absent on stale or failed acquisition.
+    pub external_subaudible: Option<bool>,
     /// Current normal-polarity CM119/HID carrier input.
     pub hardware_carrier: bool,
     /// Current normal-polarity parallel carrier input.
@@ -211,6 +215,7 @@ fn resolve_indications(config: &Config, inputs: &Inputs, state: &mut State) {
         SubaudibleSource::HardwareInverted => subaudible = !inputs.hardware_subaudible,
         SubaudibleSource::Parallel => subaudible = inputs.parallel_subaudible,
         SubaudibleSource::ParallelInverted => subaudible = !inputs.parallel_subaudible,
+        SubaudibleSource::External => subaudible = inputs.external_subaudible.unwrap_or(false),
     }
     if config.subaudible_override {
         subaudible = true;

@@ -310,6 +310,8 @@ impl Default for SessionPorts {
 const RECEIVE_TONE_OVERRIDE: u32 = 1;
 const RECEIVE_EXTERNAL_COR_VALID: u32 = 2;
 const RECEIVE_EXTERNAL_COR_PRESENT: u32 = 4;
+const RECEIVE_EXTERNAL_TONE_VALID: u32 = 8;
+const RECEIVE_EXTERNAL_TONE_PRESENT: u32 = 16;
 
 /// Hardware/control snapshots consumed by the receive worker.
 #[repr(C)]
@@ -991,6 +993,7 @@ fn subaudible_source(value: u32) -> Result<receive_qualification::SubaudibleSour
         3 => Ok(SubaudibleSource::Dsp),
         4 => Ok(SubaudibleSource::Parallel),
         5 => Ok(SubaudibleSource::ParallelInverted),
+        6 => Ok(SubaudibleSource::External),
         _ => Err(INVALID_ARGUMENT),
     }
 }
@@ -1842,15 +1845,24 @@ unsafe fn receive_inner(
     }
     let (input_peak, input_rms, input_rails) = measure_channel(input, worker.receive_channel);
     let controls = unsafe { *controls };
-    if controls.subaudible_override
-        & !(RECEIVE_TONE_OVERRIDE | RECEIVE_EXTERNAL_COR_VALID | RECEIVE_EXTERNAL_COR_PRESENT)
-        != 0
-    {
+    let external_tone_selected =
+        worker.qualification.subaudible_source == receive_qualification::SubaudibleSource::External;
+    // Inputs may remain wired across a live transition to DSP or disabled decode.
+    // Only the selected qualifier consumes their freshness; other defined flags stay independent.
+    let allowed = RECEIVE_TONE_OVERRIDE
+        | RECEIVE_EXTERNAL_COR_VALID
+        | RECEIVE_EXTERNAL_COR_PRESENT
+        | RECEIVE_EXTERNAL_TONE_VALID
+        | RECEIVE_EXTERNAL_TONE_PRESENT;
+    if controls.subaudible_override & !allowed != 0 {
         return INVALID_ARGUMENT;
     }
     let external_cor = (controls.subaudible_override & RECEIVE_EXTERNAL_COR_VALID != 0)
         .then_some(controls.subaudible_override & RECEIVE_EXTERNAL_COR_PRESENT != 0);
+    let external_tone = (controls.subaudible_override & RECEIVE_EXTERNAL_TONE_VALID != 0)
+        .then_some(controls.subaudible_override & RECEIVE_EXTERNAL_TONE_PRESENT != 0);
     let snapshots_valid = snapshots_valid
+        && (!external_tone_selected || external_tone.is_some())
         && (worker.qualification.carrier_source != receive_qualification::CarrierSource::External
             || external_cor.is_some());
     let duration = session
@@ -1899,6 +1911,7 @@ unsafe fn receive_inner(
         &qualification,
         &receive_qualification::Inputs {
             external_carrier: external_cor,
+            external_subaudible: external_tone,
             hardware_carrier: controls.hardware_carrier != 0,
             parallel_carrier: controls.parallel_carrier != 0,
             dsp_carrier: detected.carrier_detect,
@@ -3295,7 +3308,7 @@ mod tests {
             );
         }
         let invalid = ReceiveInput {
-            subaudible_override: 8,
+            subaudible_override: 32,
             ..ReceiveInput::default()
         };
         assert_eq!(
@@ -3312,6 +3325,67 @@ mod tests {
             INVALID_ARGUMENT
         );
         unsafe { destroy(session) };
+    }
+
+    #[test]
+    fn external_tone_requires_its_own_valid_snapshot_even_with_override() {
+        let mut config = valid_config();
+        config.qualification.carrier_source = 8;
+        config.qualification.subaudible_source = 6;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        for (flags, expected) in [(24, 1), (0, 0), (16, 0), (1, 0), (8, 0), (9, 1)] {
+            let controls = ReceiveInput {
+                hardware_subaudible: 1,
+                parallel_subaudible: 1,
+                subaudible_override: flags,
+                ..Default::default()
+            };
+            let mut result = ReceiveResult::default();
+            // SAFETY: all spans belong to this test and the session is warmed.
+            assert_eq!(
+                unsafe {
+                    receive(
+                        session.0,
+                        [0.0; 8].as_ptr(),
+                        [0.0; 4].as_mut_ptr(),
+                        4,
+                        &controls,
+                        &mut result,
+                    )
+                },
+                OK
+            );
+            assert_eq!(result.receiver_keyed, expected, "flags {flags}");
+        }
+    }
+
+    #[test]
+    fn dormant_external_tone_levels_do_not_change_usb_or_dsp_qualification() {
+        let mut config = valid_config();
+        config.qualification.carrier_source = 8;
+        config.qualification.subaudible_source = 1;
+        let session = TestSession::prepared(&config, &SessionPorts::default());
+        let controls = ReceiveInput {
+            subaudible_override: 24,
+            hardware_subaudible: 0,
+            ..Default::default()
+        };
+        let mut result = ReceiveResult::default();
+        // SAFETY: owned warmed session and disjoint complete buffers.
+        assert_eq!(
+            unsafe {
+                receive(
+                    session.0,
+                    [0.0; 8].as_ptr(),
+                    [0.0; 4].as_mut_ptr(),
+                    4,
+                    &controls,
+                    &mut result,
+                )
+            },
+            OK
+        );
+        assert_eq!(result.receiver_keyed, 0);
     }
 
     #[test]
@@ -4252,7 +4326,7 @@ mod tests {
             |c| c.receive.ctcss_decoder_gain = i32::MAX as f32,
             |c| c.receive.vox_threshold = i32::MAX,
             |c| c.qualification.carrier_source = 9,
-            |c| c.qualification.subaudible_source = 6,
+            |c| c.qualification.subaudible_source = 7,
             |c| c.qualification.subaudible_override = 2,
             |c| c.qualification.advanced_transport = 2,
             |c| c.qualification.radio_duplex = 2,
@@ -4296,7 +4370,7 @@ mod tests {
             destroy(ptr::null_mut());
         }
         for carrier in 0..=6 {
-            for subaudible in 0..=5 {
+            for subaudible in 0..=6 {
                 let mut config = valid_config();
                 config.qualification.carrier_source = carrier;
                 config.qualification.subaudible_source = subaudible;
